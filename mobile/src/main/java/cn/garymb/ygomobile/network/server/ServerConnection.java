@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.util.ArrayDeque;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
@@ -52,6 +53,31 @@ public final class ServerConnection {
     public int state = STATE_FREE;
     /** 是否房主（对齐 C++ host_player 判定，仅用于 STOC_TYPE_CHANGE 的 0x10 位）。 */
     public boolean host;
+    /**
+     * 撤回整局重放的答复欠账：重放期间服务端把人机已见过的每条询问又发了一遍，它对这些询问的答复
+     * 一律晚于撤回落地，不能当成对新挂出询问的应答喂进引擎。故重放每挂出一条询问在此计数，
+     * 它的 CTOS_RESPONSE 一律丢弃并递减（见 {@code GameRoom#handlePacket}），同时延后重挂直到欠账清零。
+     */
+    public int replayAnswerDebt;
+
+    /**
+     * 被压住的人机操作播报队列（等它的应答被引擎接受后再逐条中继）：WindBot 会在一个决策点把
+     * 整轮的行动说明一次发完（先发聊天、后发应答），立即中继会让台词早于实际卡片操作、
+     * 且一步步的计划会一股脑提前弹出。这里改为排队，每个被接受的应答只放行一条，
+     * 使台词与实际操作节点逐一对齐。只在人机席位使用。
+     */
+    public final ArrayDeque<PendingChat> pendingAiChats = new ArrayDeque<>();
+
+    /** 一条被压住的人机操作播报（载荷供中继，文本供录像帧）。 */
+    public static final class PendingChat {
+        public final byte[] payload;
+        public final String text;
+
+        PendingChat(byte[] payload, String text) {
+            this.payload = payload;
+            this.text = text;
+        }
+    }
 
     public ServerConnection(Socket socket, Sink sink) throws IOException {
         this.socket = socket;
@@ -96,7 +122,14 @@ public final class ServerConnection {
             }
         } finally {
             running = false;
-            sink.onDisconnect(this);
+            // 断开回调不得掀掉本 finally：它把任务投递到房间执行器，主机停止那一瞬执行器已 shutdown
+            // 会抛 RejectedExecutionException，穿出 finally 会使 closeQuietly 不执行（socket 泄漏）
+            // 并让读线程带异常终止；这里兜住一切异常，保证连接一定被关闭
+            try {
+                sink.onDisconnect(this);
+            } catch (Throwable t) {
+                Log.w(TAG, "断开回调投递失败: " + t);
+            }
             closeQuietly();
         }
     }

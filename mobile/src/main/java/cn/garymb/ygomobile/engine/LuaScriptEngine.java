@@ -20,7 +20,6 @@ import cn.garymb.ygomobile.utils.IOUtils;
 public class LuaScriptEngine {
     private static final String TAG = "LuaScriptEngine";
     private final Map<String, byte[]> scriptCache = new ConcurrentHashMap<>();
-    private ZipFile scriptsZip;
     private boolean initialized = false;
 
     private static LuaScriptEngine instance;
@@ -41,16 +40,7 @@ public class LuaScriptEngine {
 
     public void init() {
         if (initialized) return;
-        String resourcePath = AppsSettings.get().getResourcePath();
-        File zipFile = new File(resourcePath, Constants.CORE_SCRIPTS_ZIP);
-        if (zipFile.exists()) {
-            try {
-                scriptsZip = new ZipFile(zipFile);
-                Log.i(TAG, "scripts.zip loaded: " + zipFile.getAbsolutePath());
-            } catch (IOException e) {
-                Log.e(TAG, "Failed to open scripts.zip", e);
-            }
-        }
+        //主脚本由 native 侧（ygo_engine_jni.cpp）直读资源根目录的 scripts.zip，本引擎不读该档案
         initialized = true;
     }
 
@@ -66,12 +56,12 @@ public class LuaScriptEngine {
     /**
      * 按统一优先级加载脚本（高→低），与 JNI 侧 engineScriptReader、cdb/pics 保持一致：
      * <ol>
-     *   <li>{@code <root>/expansions/script/} 散文件——含 NativeScriptBootstrap 物化的卡包
-     *       cXXX.lua 与 expansions 调试散文件（最高，对齐 data_manager.cpp
-     *       prefer_expansion_script=1）；</li>
+     *   <li>{@code <root>/expansions/script/} 散文件——手工调试覆写的 lua（最高，对齐
+     *       data_manager.cpp prefer_expansion_script=1；卡包脚本已不再解压物化到此处）；</li>
      *   <li>expansions 目录内卡包 zip/ypk（按文件名倒序遍历，靠后名包优先）；</li>
-     *   <li>主资源 scripts.zip；</li>
-     *   <li>主散目录 {@code <root>/script/}、{@code <root>/single/}（最低）。</li>
+     *   <li>主散目录 {@code <root>/script/}、{@code <root>/single/}（最低；主脚本档案
+     *       {@code <root>/scripts.zip} 由 native 侧 engineScriptReader 直读，本 Java 侧引擎
+     *       只在实体文件还在时兜底）。</li>
      * </ol>
      */
     public byte[] loadScriptByName(String name) {
@@ -81,7 +71,7 @@ public class LuaScriptEngine {
 
         byte[] data;
 
-        //1.expansions/script 散文件（卡包脚本物化区，最高优先级）
+        //1.expansions/script 散调试文件（手工覆写档，最高优先级）
         data = loadFromExpansionsScriptDir(name);
         if (data != null) {
             scriptCache.put(name, data);
@@ -95,14 +85,7 @@ public class LuaScriptEngine {
             return data;
         }
 
-        //3.主资源 scripts.zip
-        data = loadFromZip(name);
-        if (data != null) {
-            scriptCache.put(name, data);
-            return data;
-        }
-
-        //4.主散目录 script/、single/
+        //3.主散目录 script/、single/
         data = loadFromFile(name);
         if (data != null) {
             scriptCache.put(name, data);
@@ -114,9 +97,9 @@ public class LuaScriptEngine {
     }
 
     /**
-     * 读取 {@code <root>/expansions/script/} 下的散 lua（由 {@link NativeScriptBootstrap}
-     * 把卡包 script/*.lua 与顶层散 lua 按包名升序覆写物化而来，已体现“靠后名包优先”，
-     * 此处只需直接查文件）。未物化时目录不存在，返回 null。
+     * 读取 {@code <root>/expansions/script/} 下的散 lua（手工调试覆写档；卡包脚本自
+     * 本版本起不再解压物化到此处，而是由下一级“包档案直读”就地取）。目录不存在时
+     * 返回 null。
      */
     private byte[] loadFromExpansionsScriptDir(String name) {
         String resourcePath = AppsSettings.get().getResourcePath();
@@ -201,26 +184,6 @@ public class LuaScriptEngine {
         return null;
     }
 
-    private byte[] loadFromZip(String name) {
-        if (scriptsZip == null) return null;
-        InputStream is = null;
-        try {
-            ZipEntry entry = scriptsZip.getEntry("script/" + name);
-            if (entry == null) {
-                entry = scriptsZip.getEntry(name);
-            }
-            if (entry != null) {
-                is = scriptsZip.getInputStream(entry);
-                return readStream(is);
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to read script from zip: " + name, e);
-        } finally {
-            IOUtils.close(is);
-        }
-        return null;
-    }
-
     private byte[] readStream(InputStream is) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         byte[] buffer = new byte[4096];
@@ -241,14 +204,6 @@ public class LuaScriptEngine {
 
     public void release() {
         clearCache();
-        if (scriptsZip != null) {
-            try {
-                scriptsZip.close();
-            } catch (IOException e) {
-                // ignore
-            }
-            scriptsZip = null;
-        }
         initialized = false;
     }
 }

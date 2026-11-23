@@ -4,6 +4,7 @@ import cn.garymb.ygomobile.render.card.CardDetailPanel;
 import android.view.View;
 
 import cn.garymb.ygomobile.game.deck.DeckEditorManager;
+import cn.garymb.ygomobile.game.engine.GameEngine;
 import cn.garymb.ygomobile.lite.R;
 import ocgcore.data.Card;
 
@@ -26,7 +27,17 @@ class DeckEditorViewHost {
     }
 
     void show() {
-        showInternal(false);
+        showInternal(false, false);
+    }
+
+    /**
+     * 换 side 专用重新显示：与 {@link #show()} 同一套显隐编排，但**不重载“上次卡组”**——
+     * 换侧编辑的是当前对局卡组，由 {@code applySidingScreen} 紧接着按席位快照载入；
+     * 并先置入换侧会话，防止视图重绑期间（historyPanel.setup → syncContentFromSession）
+     * 采纳卡组编辑页的未保存内容把编辑器刷成另一份卡组。
+     */
+    void showForSiding() {
+        showInternal(false, true);
     }
 
     /**
@@ -36,10 +47,10 @@ class DeckEditorViewHost {
      * 持久化设置重载卡组，导致丢失当前卡组/卡包与修改状态。
      */
     void showForRotation() {
-        showInternal(true);
+        showInternal(true, false);
     }
 
-    private void showInternal(boolean rotationRebind) {
+    private void showInternal(boolean rotationRebind, boolean siding) {
         // 旋转回显但管理器尚未建立（罕见：旋转前未进过编辑器）：无内存态可保留，
         // 退回完整 initialize 流程，避免 rebind 面对空卡组/未绑定视图
         boolean rebind = rotationRebind && activity.deckEditorManager != null;
@@ -101,21 +112,28 @@ class DeckEditorViewHost {
 
                 @Override
                 public void onSideDeckFinished(List<Integer> main, List<Integer> extra, List<Integer> side) {
+                    boolean solo = activity.engine != null && activity.engine.soloMode;
                     if (activity.engine != null) {
+                        // 先把换侧结果回写为该席位“当前对局卡组”：第 2/3 局之间再换 side 时
+                        // 编辑器以它为起点（磁盘 ydk 仍是原始卡组，换侧结果不落盘）
+                        int seat = solo ? Math.max(0, activity.engine.soloSideSession - 1) : 0;
+                        activity.engine.updateMatchDeck(seat, main, extra, side);
                         activity.engine.sendDeckUpdate(main, extra, side);
                     }
                     // Solo match 换 side：改由客户端本地逐席位驱动，不再依赖服务端每提交一份
                     // 回一条 CHANGE_SIDE 的跨端回环（该回环在共享连接上重入时序脆弱，导致点“完成”
                     // 后无响应、无法切到下一席位）。提交一份后，若仍有席位待换，直接延后重新载入
                     // 下一席位；required 与服务端一致：TAG 4 份、其余 2 份。
-                    boolean solo = activity.engine != null && activity.engine.soloMode;
                     if (solo) {
                         int required = activity.engine.gameMode == 2 ? 4 : 2;
                         if (activity.engine.soloSideSession < required) {
-                            // applySidingScreen 内含 showDeckEditorView → deckEditorManager.initialize，
-                            // 直接在点击回调栈内重入会破坏当前布局，故延后到本帧之后执行。
+                            // applySidingScreen 内含 showDeckEditorView → 编辑器重绑，
+                            // 直接在点击回调栈内重入会破坏当前布局，故延后到本帧之后执行；
+                            // 延后期间可能已断线/退出（状态离开 SIDING），不再重开编辑器
                             activity.engine.mainHandler.post(() -> {
-                                if (activity.engineCallback != null) {
+                                if (activity.engine != null
+                                        && activity.engine.getState() == GameEngine.GameState.SIDING
+                                        && activity.engineCallback != null) {
                                     activity.engineCallback.applySidingScreen();
                                 }
                             });
@@ -130,11 +148,22 @@ class DeckEditorViewHost {
                         activity.deckEditorManager.exitSideMode();
                     }
                     hide();
+                    // 与隐藏编辑器同一帧把决斗场区接回（用户规格）：否则换 side 提交后到下一局开始
+                    // 之间会剩一帧“编辑器已收、GL 决斗场视图与聊天输入行仍隐”的中间态——
+                    // 竖屏下顶部面板成为内容区唯一带权重的可见子 View 而被顶成整屏高
+                    activity.restoreDuelAreaAfterSideSwap();
                 }
             });
         }
         if (activity.layoutDeckEditor != null) {
+            if (siding && activity.deckEditorManager != null) {
+                // 视图重绑前先置换侧会话：historyPanel.setup 的补同步不得采纳共享历史内容
+                activity.deckEditorManager.beginSideSwapSession();
+            }
             if (rebind) {
+                activity.deckEditorManager.rebindAfterRotation(activity.layoutDeckEditor);
+            } else if (siding) {
+                // 换侧不重载 lastdeck：保留当前内存卡组（由 applySidingScreen 按席位快照覆盖）
                 activity.deckEditorManager.rebindAfterRotation(activity.layoutDeckEditor);
             } else {
                 activity.deckEditorManager.initialize(activity.layoutDeckEditor);
@@ -147,6 +176,15 @@ class DeckEditorViewHost {
     }
 
     void hide() {
+        // 退出卡组编辑：收口批量勾选模式（清空勾选与打勾图标，下次进入编辑器回到单卡语义），
+        // 并摘除对共享卡组历史的监听（下次 show 经 initialize/rebind 重新挂上）。
+        // 换 side 会话也在此收口：决斗中途断开/退出时不会有人再调 exitSideMode，
+        // 残留的换侧态会让下次编辑一直误以为还在换 side 而完全不落卡组修改历史（方法内幂等）
+        if (activity.deckEditorManager != null) {
+            activity.deckEditorManager.exitSideMode();
+            activity.deckEditorManager.exitBatchSelectionMode();
+            activity.deckEditorManager.releaseHistoryListener();
+        }
         if (activity.layoutDeckEditor != null) {
             activity.layoutDeckEditor.setVisibility(View.GONE);
         }

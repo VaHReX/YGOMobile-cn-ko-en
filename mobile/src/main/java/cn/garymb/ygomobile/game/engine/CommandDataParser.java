@@ -1,11 +1,17 @@
 package cn.garymb.ygomobile.game.engine;
+import android.util.Log;
+
 import cn.garymb.ygomobile.game.gamefield.ClientCard;
+import cn.garymb.ygomobile.game.gamefield.EffectActivatableHints;
+import cn.garymb.ygomobile.game.gamefield.GameField;
+import cn.garymb.ygomobile.render.card.CardDetailPanel;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
 
 import ocgcore.enums.CardLocation;
+import ocgcore.enums.CardPosition;
 import ocgcore.enums.CardType;
 
 /**
@@ -15,6 +21,9 @@ import ocgcore.enums.CardType;
  * 为多方共享状态，保留在 GameEngine 门面上，本类经 engine 读写。
  */
 public class CommandDataParser {
+
+    // 保持拆分前日志标识，便于与旧版日志比对
+    private static final String TAG = "GameEngine";
 
     private final GameEngine engine;
 
@@ -32,6 +41,10 @@ public class CommandDataParser {
         List<ClientCard> list = engine.field.players[player].getLocationList(location);
         if (list == null) return;
         boolean fixedSlots = (location == 0x04 || location == 0x08);
+        if (location == CardLocation.Hand.value()) {
+            // 手卡区先把张数对平再按位写入（观战补建占位卡与真实卡混排时不分先后必错位）
+            reconcileHandCount(player, list, data);
+        }
         for (int i = 0; i < list.size(); i++) {
             ClientCard card = list.get(i);
             if (card == null && !fixedSlots) continue;
@@ -42,15 +55,101 @@ public class CommandDataParser {
             if (len > 8 && card != null) {
                 ByteBuffer sub = data.slice().order(ByteOrder.LITTLE_ENDIAN);
                 sub.limit(Math.min(sub.limit(), len - 4));
-                card.updateQuery(sub);
+                applyQuery(card, sub);
             }
             data.position(next);
         }
     }
 
     /**
+     * 写入一条查询并同步堆叠区的姿态落点（对齐 client_card.cpp UpdateInfo L61-68 的 QUERY_POSITION 分支）：
+     * 除外区/额外卡组两区的正背面完全由姿态字节决定（getCardLocation 读 {@code position & POS_FACEUP}），
+     * 而渲染层取的是动画插值后的 curRotY，故姿态变化时必须像 C++ 那样再发一次 {@code MoveCard(1)} 重算落点：
+     * 否则卡片停在占位时算出的 rotY=π 上，拿着真实卡码仍被画成卡背（撤回重同步即此形态：
+     * MSG_RELOAD_FIELD 对堆叠区只给张数、姿态与卡码全靠随后的区域刷新补齐）。
+     * 手卡/场上区的姿态变化不经此路径：手卡走相机 billboard 不读 curRot*，场上区的翻开自有
+     * MSG_POS_CHANGE 的 moveCardAnimated 负责，与 C++ 的判定范围一致。
+     */
+    private void applyQuery(ClientCard card, ByteBuffer sub) {
+        int posBefore = card.position;
+        card.updateQuery(sub);
+        if (card.position != posBefore && (card.location & (0x20 | 0x40)) != 0) {
+            engine.field.moveCardAnimated(card, 1);
+        }
+    }
+
+    /**
+     * 手卡区的张数对平：MSG_UPDATE_DATA(LOCATION_HAND) 载荷里每个非空槽一个 len 前缀块，
+     * <b>块数就是服务端此刻该席位的手卡张数</b>（引擎按区域逐卡查询，遮蔽只清块内容不减块数），
+     * 所以它是本端唯一可用的手卡权威值。
+     * <p>
+     * 为何必须对平：观战端手卡是按 MSG_START 起手数补建的背面占位卡，占位数与真实张数
+     * 只要差一张（房间配置与引擎实际起手不同、遮蔽版 MSG_MOVE 来源序号在本端落空而
+     * 伪造卡片送墓、发动后离场的卡与占位卡彼此错位），本端手卡列表就长期多出一张；而下面
+     * 那个循环是“逐块对非空槽按位写入”，于是那张多出的占位卡会接到本应写给别人的卡码，
+     * 表现为用户反馈的「从手卡发动效果后那张卡一直留在手卡并保持公开」——真正该走的那张卡
+     * 反而被当成没走。这里先把张数拉平：多了就从尾部摘掉仍是背面（code==0）的卡，
+     * 少了就补背面占位，再把块按位写下去，码自然落在对的卡上。
+     * <p>
+     * 决斗位自己的手卡张数本来就与块数一致，本对平不产生任何增删；带真实卡码的卡也不强摘，
+     * 避免把已揭示的卡抹成不存在（宁可多显一张，不可谎报少一张）。
+     */
+    private void reconcileHandCount(int player, List<ClientCard> hand, ByteBuffer data) {
+        int blocks = 0;
+        ByteBuffer scan = data.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+        while (scan.remaining() >= 4) {
+            int len = scan.getInt();
+            int next = scan.position() + (len - 4);
+            if (len < 4 || next < scan.position() || next > scan.limit()) break;
+            scan.position(next);
+            blocks++;
+        }
+        if (blocks <= 0) return;
+        int owned = engine.field.getCardCount(player, CardLocation.Hand.value());
+        boolean changed = false;
+        while (owned > blocks) {
+            int victim = -1;
+            for (int i = hand.size() - 1; i >= 0; i--) {
+                ClientCard c = hand.get(i);
+                if (c != null && c.code == 0) { victim = i; break; }
+            }
+            if (victim < 0) break;
+            hand.set(victim, null);
+            owned--;
+            changed = true;
+        }
+        while (owned < blocks) {
+            int slot = -1;
+            for (int i = 0; i < hand.size(); i++) {
+                if (hand.get(i) == null) { slot = i; break; }
+            }
+            if (slot < 0) {
+                if (hand.size() >= GameField.MAX_HAND) break;//已到上限不再撑长
+                hand.add(null);
+                slot = hand.size() - 1;
+            }
+            ClientCard c = new ClientCard();
+            c.owner = player;
+            c.controler = player;
+            c.location = CardLocation.Hand.value();
+            c.position = CardPosition.FaceDownDefence.value();
+            hand.set(slot, c);
+            owned++;
+            changed = true;
+        }
+        if (!changed) return;
+        // 序号与列表下标对齐（getCard 与后续 MSG_MOVE 的来源序号都依赖它），并按新张数重排整行
+        engine.field.resetSequence(hand, false);
+        engine.field.updateHandLayout(player, 10);
+    }
+
+    /**
      * MSG_UPDATE_CARD（client_field.cpp UpdateCard 真值格式）：
-     * int32 len 前缀，len>8 时才解析 query（对现有卡对象更新，绝不整卡替换）
+     * int32 len 前缀，len>8 时才解析 query（对现有卡对象更新，绝不整卡替换）。
+     * <p>卡对象不存在时按 C++（client_field.cpp UpdateCard L300-306 的 {@code if (pcard && ...)}）
+     * 直接跳过：本方法只在既有卡上补写查询字段，从不建卡。旧写法在此 {@code new ClientCard()} 并
+     * {@code addCard} 落位，会在观战席位（中途接入、没有对方开局发牌）的除外区/场上凭空立出
+     * 一张卡码为 0、点不动也移不走的幽灵卡。
      */
     public void parseUpdateCard(int player, int location, int sequence, ByteBuffer data) {
         if (data.remaining() < 4) return;
@@ -58,15 +157,13 @@ public class CommandDataParser {
         if (len <= 8) return;
         ClientCard card = engine.field.getCard(player, location, sequence);
         if (card == null) {
-            card = new ClientCard();
-            card.controler = player;
-            card.location = location;
-            card.sequence = sequence;
-            engine.field.addCard(player, location, sequence, card);
+            Log.d(TAG, "update card skipped: no such card at " + player + "/0x"
+                    + Integer.toHexString(location) + "/" + sequence);
+            return;
         }
         ByteBuffer sub = data.slice().order(ByteOrder.LITTLE_ENDIAN);
         sub.limit(Math.min(sub.limit(), len - 4));
-        card.updateQuery(sub);
+        applyQuery(card, sub);
     }
 
     public void parseBattleCmd(ByteBuffer data) {
@@ -105,6 +202,7 @@ public class CommandDataParser {
                     }
                 }
                 engine.activatableCards.add(new GameEngine.CmdCardInfo(card, code, desc, flag, i));
+                registerCommandEffect(card, code, desc, flag);
             }
         }
         count = data.get() & 0xFF;
@@ -122,6 +220,9 @@ public class CommandDataParser {
         }
         engine.showM2 = data.remaining() >= 1 && (data.get() & 0xFF) != 0;
         engine.showEP = data.remaining() >= 1 && (data.get() & 0xFF) != 0;
+        // 用户新规格3：战斗指令登记完成，卡详正展示相关卡时即时刷新可发动背景呼吸段
+        //（与开段 clearCommandFlags 的刷新经 40ms 防抖合并，不会以中间态重绑）
+        CardDetailPanel.refreshCardDetailMarks();
     }
 
     public void parseIdleCmd(ByteBuffer data) {
@@ -250,11 +351,26 @@ public class CommandDataParser {
                     }
                 }
                 engine.activatableCards.add(new GameEngine.CmdCardInfo(card, code, desc, flag, i));
+                registerCommandEffect(card, code, desc, flag);
             }
         }
 
         engine.showBP = data.remaining() >= 1 && (data.get() & 0xFF) != 0;
         engine.showEP = data.remaining() >= 1 && (data.get() & 0xFF) != 0;
         engine.showShuffle = data.remaining() >= 1 && (data.get() & 0xFF) != 0;
+        // 用户新规格3：主阶指令登记完成，卡详正展示相关卡时即时刷新可发动背景呼吸段
+        CardDetailPanel.refreshCardDetailMarks();
+    }
+
+    /** 可发动选项入列（即卡片出现呼吸绿点/conti_act 动画的同一时刻）登记效果段落序号：
+     *  判据与 CardOverlayRenderer 角位呼吸点同源（COMMAND_ACTIVATE 置位或 conti 项），点击带点
+     *  的卡即由卡详对可发动效果段落做背景色呼吸，无需等命令菜单出现「发动」按钮；
+     *  conti 项（flag=EDESC_OPERATION）报文不 masking 卡码，用置入卡上的 chain_code 对齐卡详码 */
+    private static void registerCommandEffect(ClientCard card, int maskedCode, int desc, int flag) {
+        if ((flag & 0x1) != 0) {
+            EffectActivatableHints.register(card.chain_code, card.controler == 1 ? 1 : 0, desc);
+        } else {
+            EffectActivatableHints.register(maskedCode, card.controler == 1 ? 1 : 0, desc);
+        }
     }
 }

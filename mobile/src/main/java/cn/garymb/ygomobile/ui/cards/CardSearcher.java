@@ -164,10 +164,8 @@ public class CardSearcher extends CardSearcherExtraFilters implements View.OnCli
         chk_atkDef_or = findViewById(R.id.chk_atkDef_or);
         isOr = false;// 攻击力或守备力其中之一满足的逻辑开关
 
-        myFavButton = findViewById(R.id.btn_my_fav);
         searchButton = findViewById(R.id.btn_search);
         resetButton = findViewById(R.id.btn_reset);
-        myFavButton.setOnClickListener(this);
         searchButton.setOnClickListener(this);
         resetButton.setOnClickListener(this);
 
@@ -304,6 +302,22 @@ public class CardSearcher extends CardSearcherExtraFilters implements View.OnCli
     }
 
 
+    /**
+     * 绑定收藏星标按钮：收藏按钮已从筛选面板移到各页结果区顶行（与计数/宫格切换/排序同排），
+     * 页面在创建本类后把按钮交进来，点击分发与选中态仍由本类统一维护
+     *
+     * @param button 页面顶行的收藏星标按钮；为空时忽略
+     */
+    public void bindFavoriteButton(View button) {
+        if (button == null) {
+            return;
+        }
+        myFavButton = button;
+        myFavButton.setOnClickListener(this);
+        refreshFavoriteButton();
+    }
+
+
     public void onClick(View v) {
         if (v.getId() == R.id.btn_search) {
             search();
@@ -314,7 +328,7 @@ public class CardSearcher extends CardSearcherExtraFilters implements View.OnCli
             }
         } else if (v.getId() == R.id.btn_reset) {
             resetAll();
-        } else if (v.getId() == myFavButton.getId()) {
+        } else if (myFavButton != null && v.getId() == myFavButton.getId()) {
             if (isShowFavorite()) {
                 hideFavorites(true);
             } else {
@@ -443,11 +457,16 @@ public class CardSearcher extends CardSearcherExtraFilters implements View.OnCli
         if (genesysMode != genesys_Switch.isChecked()) {
             genesys_Switch.setChecked(genesysMode);
         }
-        // 禁限类型与禁卡表
+        // 禁限类型与禁卡表：历史条目若没带禁卡表（如卡片详情里点高亮词/关联卡片记下的纯关键词条目），
+        // 保留当前的禁卡表选择；否则会被选回“选择禁卡表”空档，卡上的禁限/起源点角标随之消失
         setSpinnerSelectByValue(limitSpinner, info.getLimitType());
-        setSpinnerSelectByText(limitListSpinner, info.getLimitName());
+        if (!TextUtils.isEmpty(info.getLimitName())) {
+            setSpinnerSelectByText(limitListSpinner, info.getLimitName());
+        }
         setSpinnerSelectByValue(genesys_limitSpinner, info.getLimitType());
-        setSpinnerSelectByText(genesys_limitListSpinner, info.getLimitName());
+        if (!TextUtils.isEmpty(info.getLimitName())) {
+            setSpinnerSelectByText(genesys_limitListSpinner, info.getLimitName());
+        }
         // OT
         if (info.getOt() != null) {
             for (int i = 0; i < otButtons.length; i++) {

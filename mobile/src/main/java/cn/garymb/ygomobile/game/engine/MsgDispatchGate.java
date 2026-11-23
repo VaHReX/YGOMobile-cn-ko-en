@@ -29,7 +29,7 @@ public class MsgDispatchGate {
         data.order(ByteOrder.LITTLE_ENDIAN);
         // 询问自愈：收到挂给本席位的询问或「等对方」提示即证明服务端仍在正常推进对局
         if (AskWatchdog.isAskOrWaitingMessage(msgType)) {
-            engine.askWatchdog.notifyAskReceived();
+            engine.askWatchdog.notifyAskReceived(msgType);
         }
         // 对齐 duelclient.cpp L1298-1303：除 MSG_RETRY 外每条消息均缓存一份快照，供 RETRY（无效应答）后重放重建选择 UI（服务端不会重发原 SELECT）
         if (msgType != GameMessage.Retry.value()) {
@@ -39,15 +39,24 @@ public class MsgDispatchGate {
             engine.lastGameMsgType = msgType;
             engine.lastGameMsgBody = body;
             engine.retryReplayCount = 0;
-            // 单独留存最近一条询问（MSG_SELECT_* = 10..26）快照：撤回被拒/超时时据此重派发询问
-            if (msgType >= GameMessage.SelectBattleCmd.value()
-                    && msgType <= GameMessage.SelectUnselectCard.value()) {
+            // 单独留存最近一条需本端应答的询问（MSG_SELECT_* = 10..26、宣言类
+            // MSG_ANNOUNCE_* = 140..143 与决斗中猜拳 MSG_ROCK_PAPER_SCISSORS = 132）快照：
+            // 撤回被拒/超时时据此重派发重建同一张待答弹窗（重派发走的仍是 parse 那一条链，
+            // 132 因此无需额外重建代码）。宣言类一并留存是因为它们同样只能靠弹窗应答，
+            // 撤回瞬间被收口后若无快照可重建就再也无法应答（与 AskWatchdog.isAnswerableQuestion 同一口径）
+            if (AskWatchdog.isAnswerableQuestion(msgType)) {
                 engine.undoCoord.lastQuestionType = msgType;
                 engine.undoCoord.lastQuestionBody = body;
             }
             engine.recordMsgFrame(msgType, body);
         }
         // 入队后由闸门串行派发：动画消息会关闭闸门，暂缓后续消息（对齐 C++ WaitFrameSignal 阻塞语义）
+        // 撤回重同步的 reload 入队即告知协调器挂起超时自愈（评审 Major②）：ACK 后紧接确认卡
+        // 对话框/长动画时，reload 可能被无时限的持闸压住超过常规窗口——那并非丢失，
+        // 过早复位会使迟到的 reload 因无 latch 只执行 capture+clear 就 return（半落地，标注被永久清掉）
+        if (msgType == GameMessage.ReloadField.value() && engine.undoCoord.undoResyncTurn >= 0) {
+            engine.undoCoord.noteUndoReloadQueued();
+        }
         engine.pendingMsgs.offer(() -> dispatchGameMsg(msgType, data));
         drainPendingMsgs();
     }
@@ -70,8 +79,18 @@ public class MsgDispatchGate {
         }
         ByteBuffer buf = ByteBuffer.wrap(engine.lastGameMsgBody);
         buf.order(ByteOrder.LITTLE_ENDIAN);
-        // 直接入队但不刷新缓存（保留原快照以便再次重放），故不经 enqueueGameMsg 的缓存分支
-        engine.pendingMsgs.offer(() -> dispatchGameMsg(engine.lastGameMsgType, buf));
+        // 直接入队但不刷新缓存（保留原快照以便再次重放），故不经 enqueueGameMsg 的缓存分支；
+        // 重放派发全程置抑制标志（评审 Minor①）：重放的 MSG_CHAINING 只重建 UI/动画，
+        // 不得再次登记发动账本——同一笔发动在原始派发已计数，重放再计会使客户端 LOG 条数
+        // 超过服务端保留前缀计数，撤回 dropBeyond 误清保留中的标记
+        engine.pendingMsgs.offer(() -> {
+            engine.suppressLedgerRecord = true;
+            try {
+                dispatchGameMsg(engine.lastGameMsgType, buf);
+            } finally {
+                engine.suppressLedgerRecord = false;
+            }
+        });
         drainPendingMsgs();
     }
 
@@ -93,6 +112,45 @@ public class MsgDispatchGate {
                     + (engine.replayMode ? " (replay step)" : " (live)"), e);
             throw e;
         }
+    }
+
+    /**
+     * 新一局开场的硬复位（对齐 C++ {@code duelclient.cpp} STOC_DUEL_START 的 {@code dField.Clear()}：
+     * 残留动画立即作废，不等上一局播完）：
+     * <ol>
+     *   <li>同步丢弃上一局遗留的全部待派发消息——本方法在通信读取线程上执行，而读取线程
+     *       「处理完本包才读下一包」，故此刻队列里的条目一定属于上一局，新一局的
+     *       MSG_START 尚未入队；</li>
+     *   <li>复位动画闸门/确认弹窗持闸/定时屏障并取消轮询与兜底，避免闸门仍闭把新一局的消息挂住；</li>
+     *   <li>把「清场」作为新一局的第一条串行动作重新入队再排空：它必定先于新一局的任何 MSG
+     *       执行（旧实现把清场排到队列尾部，局尾动画会先播完，且存在擦掉新局堆叠的竞态）。</li>
+     * </ol>
+     */
+    void prepareNewDuel() {
+        engine.pendingMsgs.clear();
+        engine.animGateClosed = false;
+        engine.dialogGateHeld = false;
+        engine.animHoldUntilMs = 0L;
+        // 不取消轮询/兜底回调：若上一局还有一条已取出的消息正在派发、又把闸门关上，
+        // 轮询器会照常把它缝完并重开闸门，保证下面这条清场动作一定能执行（避免永久挂起）
+        engine.pendingMsgs.offer(() -> {
+            engine.field.clear();
+            if (engine.listener != null) engine.listener.onFieldChanged();
+        });
+        drainPendingMsgs();
+    }
+
+    /**
+     * 把一个一次性动作排到待派发通讯队列的尾部执行：与 {@code MSG_*} 走同一条串行链，
+     * 因此它一定排在当前已入队（含被动画/确认弹窗闸门持住）的消息之后。用于会清空/重建场地的
+     * {@code STOC_*}（见 {@code DuelStocHandler}）——C++ 的 {@code duelclient.cpp ClientAnalyze}
+     * 对 STOC 与 MSG 只有单条按到达顺序的链（动画期用 WaitFrameSignal 阻塞消息线程），STOC 不可能
+     * 插到队列中间；本端 STOC 原先在主线程即时执行，观战积压时局间的 {@code field.clear()} 会插到
+     * 「下一局 MSG_START 已建好的卡组/额外堆叠」之后，把堆叠抹成空场且再不重建（用户反馈的 match 重置）。
+     */
+    void postSerialized(Runnable action) {
+        engine.pendingMsgs.offer(action);
+        drainPendingMsgs();
     }
 
     /** 串行派发待处理消息：闸门开启时逐条处理，某条触发动画（closeAnimGate）则停止循环 */

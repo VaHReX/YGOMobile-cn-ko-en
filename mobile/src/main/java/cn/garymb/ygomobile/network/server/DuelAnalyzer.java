@@ -5,6 +5,7 @@ import android.util.Log;
 import java.util.Arrays;
 
 import cn.garymb.ygomobile.engine.OcgDuelEngine;
+import ocgcore.DataManager;
 
 /**
  * 引擎消息解析器，移植 {@code gframe/single_duel.cpp}：逐条消费 ocgcore 消息流，按 is_host 遮蔽后广播 {@code STOC_GAME_MSG}；不持有决斗状态，均读写自宿主 {@link ServerDuel}。
@@ -29,6 +30,10 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
             int start = cursor;
             int engType = msg[cursor] & 0xFF;
             cursor++;
+            // 可见卡片动作计数：人机台词只在这一步真产生了看得见的动作后才放行（静默重放不计）
+            if (!silent && isVisibleActionMsg(engType)) {
+                actionMsgSeq++;
+            }
             int player;
             int count;
             switch (engType) {
@@ -45,6 +50,10 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     }
                     // 应答不合法（引擎重问）：它不构成可撤回的一步，弹出刚压入的快照
                     owner.discardPendingUndoStep();
+                    // 刚被拒的这席位刚发的操作播报同样作废：它描述的非法动作并未发生，不得稍后被放行
+                    if (room.lastResponse >= 0 && room.lastResponse <= 1) {
+                        room.clearPendingAiChat(room.duelPlayer(room.lastResponse));
+                    }
                     // 询问权威源在服务端：直接把当前询问重发给应答方使界面必定重挂可应答项；仅无留存询问时才退回 C++ 语义（1 字节 MSG_RETRY）。
                     // 须在 waitforResponse 之前取：它会推进代次，取晚了配对判断恒为否
                     byte[] ask = hasLiveAsk() ? liveQuestion : null;
@@ -57,8 +66,8 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     // 熔断：同一道题连续 RETRY_STREAK_LIMIT 次非法答复——只代非本方席位答「放弃也合法」的那几类询问，代答后引擎继续推进
                     if (retryStreak >= RETRY_STREAK_LIMIT && ask != null && !room.soloMode
                             && deadlockBreakGeneration != askGeneration
-                            && rseat > 0 && rseat < room.players.length
-                            && room.players[rseat] != null) {
+                            && rseat > 0 && rseat <= 1
+                            && room.duelPlayer(rseat) != null) {
                         byte[] pass = defaultPassAnswer(ask[0] & 0xFF);
                         if (pass != null) {
                             deadlockBreakGeneration = askGeneration;
@@ -74,10 +83,11 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     }
                     waitforResponse(rseat);
                     resendingAfterRetry = true;
+                    // 重发询问给该队当前行动席位（真 TAG 下 player 是队伍，不能直接当席位号用）
                     if (ask != null) {
-                        sendToPlayer(room.players[rseat], ask);
+                        sendToPlayer(room.duelPlayer(rseat), ask);
                     } else {
-                        sendToPlayer(room.players[rseat], range(msg, start, cursor));
+                        sendToPlayer(room.duelPlayer(rseat), range(msg, start, cursor));
                     }
                     return 1;
                 }
@@ -93,14 +103,18 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                         case 2:
                         case 3:
                         case 5:
-                            sendToPlayer(room.players[player], slice);
+                            // 事件/信息/选卡提示只给应当行动的那一席
+                            sendToPlayer(room.duelPlayer(player), slice);
                             break;
                         case 4:
                         case 6:
                         case 7:
                         case 8:
                         case 9:
-                            sendToPlayer(room.players[1 - player], slice);
+                            // 对方已选/属性/种族/卡码/数字：除应答席位以外的全部席位与观战（对齐 tag_duel.cpp L561-573）
+                            for (ServerConnection other : room.otherSeats(room.duelPlayer(player))) {
+                                sendToPlayer(other, slice);
+                            }
                             sendToObservers(slice);
                             break;
                         // HINT_ZONE(11)：掩码自带双方座位列位，标注须双方与观战同见；
@@ -109,8 +123,11 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                         // 服务端 constant.lua 缺 HINT_ZONE 常量时 lua_tointeger(nil) 降级
                         // 以 type=0 下发（旧规则落 default 被整体丢弃）。broadcastMsg 对
                         // solo 同连接按身份去重，并经 sendToPlayer(players[0]) 录入录像帧
+                        // HINT_OPPO_SELECT_PLACE(12)：对手代选特召位置的选中格回报，与 HINT_ZONE
+                        // 同为区域宣告，须双方与观战同见（不丢则选中格高亮对发起方/观战完全缺失）
                         case 0:
                         case 11:
+                        case 12:
                         case 10:
                             broadcastMsg(slice);
                             break;
@@ -133,7 +150,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     if (player > 1) {
                         room.matchResult[room.duelCount++] = 2;
                         room.tpPlayer = 1 - room.tpPlayer;
-                    } else if (room.players[player] == room.pplayer[player]) {
+                    } else if (room.duelPlayer(player) == room.pplayer[player]) {
                         room.matchResult[room.duelCount++] = player;
                         room.tpPlayer = 1 - player;
                     } else {
@@ -154,7 +171,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     if (isPhaseActivationAnchor(player, EngineMessage.MSG_SELECT_EFFECTYN)) {
                         pendingActionQuestion = EngineMessage.MSG_SELECT_EFFECTYN;
                     }
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_YESNO: {
@@ -162,7 +179,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += 4;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_OPTION: {
@@ -172,7 +189,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += count * 4;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_CARD:
@@ -184,7 +201,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor = maskCodesForOpponent(msg, cursor, count, player);
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_UNSELECT_CARD: {
@@ -198,7 +215,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor = maskCodesForOpponent(msg, cursor, count, player);
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_CHAIN: {
@@ -212,7 +229,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     if (isPhaseActivationAnchor(player, EngineMessage.MSG_SELECT_CHAIN)) {
                         pendingActionQuestion = EngineMessage.MSG_SELECT_CHAIN;
                     }
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_PLACE:
@@ -221,7 +238,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += 5;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_POSITION: {
@@ -229,7 +246,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += 5;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_COUNTER: {
@@ -240,7 +257,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += count * 9;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SELECT_SUM: {
@@ -255,7 +272,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += count * 11;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_SORT_CARD: {
@@ -265,7 +282,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += count * 7;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_CONFIRM_DECKTOP:
@@ -287,14 +304,14 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor += count * 7;
                     byte[] slice = range(msg, start, cursor);
                     if (locByte != OcgDuelEngine.LOCATION_DECK) {
-                        sendToPlayer(room.players[player], slice);
-                        // Solo dedupe: the two slots share one connection.
-                        if (room.players[1 - player] != room.players[player]) {
-                            sendToPlayer(room.players[1 - player], slice);
+                        // 非卡组确认（含手卡/墓地的公开确认）：全部席位与观战同收（对齐 tag_duel.cpp L786-790）
+                        for (ServerConnection other : room.otherSeats(null)) {
+                            sendToPlayer(other, slice);
                         }
                         sendToObservers(slice);
                     } else {
-                        sendToPlayer(room.players[player], slice);
+                        // 卡组顶确认属私有信息：只给该队当前行动席位（对齐 tag_duel.cpp L792）
+                        sendToPlayer(room.duelPlayer(player), slice);
                     }
                     break;
                 }
@@ -377,6 +394,16 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     break;
                 }
                 case EngineMessage.MSG_NEW_TURN: {
+                    // 回合边界：人机上一回合尚未放行的操作播报一律作废（多为未执行到的计划尾句，
+                    // 不得拖到下一回合的某个动作后面才冒出）。静默重放不涉队列（已被闸门丢弃）
+                    if (!silent) {
+                        for (int i = 0; i < room.seatCount(); i++) {
+                            room.clearPendingAiChat(room.players[i]);
+                        }
+                    }
+                    // TAG：先把本队行动席位轮转到下一位，再做区域刷新——手卡/额外区刷新
+                    // 必须落到即将行动的那一席（对齐 tag_duel.cpp L896-919 的 cur_player 轮转）
+                    rotateTagCurPlayer();
                     refreshMzone(0);
                     refreshMzone(1);
                     refreshSzone(0);
@@ -477,12 +504,12 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     writeInt32(msg, cursor, 0);
                     cursor += 8;
                     byte[] masked = range(msg, start, cursor);
-                    if (room.players[0] != null) {
-                        emit(room.players[0], masked);
-                    }
-                    // Solo dedupe: players[1] may be the same connection as players[0].
-                    if (room.players[1] != null && room.players[1] != room.players[0]) {
-                        emit(room.players[1], masked);
+                    ServerConnection p0 = room.players[0];
+                    for (int i = 0; i < room.seatCount(); i++) {
+                        // solo 下两席位同一连接，按身份去重（与旧实现 players[1] != players[0] 同一口径）
+                        if (room.players[i] != null && (i == 0 || room.players[i] != p0)) {
+                            emit(room.players[i], masked);
+                        }
                     }
                     emitObservers(masked);
                     break;
@@ -558,6 +585,18 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     break;
                 }
                 case EngineMessage.MSG_CHAINING: {
+                    // 静默重放同步统计「有效效果发动」条数（判据与客户端 EffectActivationLedger.record
+                    // 一致：code>0 且 desc>MAX_STRING_ID 才登记账本），撤回 ACK 携回供客户端把回退
+                    // 后缀之外的发动账本条目剪除——被撤回抹掉的「使用过的效果」即时恢复未使用态。
+                    // 体布局（GameMessageParser.Chaining）：code(4)@body，pcc/pcl/pcs/subs/cc/cl/cs(各1)，
+                    // desc(4)@body+11，ct(1)；body = start+1（msg[start] 为消息类型字节）
+                    if (silent) {
+                        int chCode = readInt32(msg, cursor);
+                        int chDesc = readInt32(msg, cursor + 11);
+                        if (chCode > 0 && (chDesc & 0xFFFFFFFFL) > DataManager.MAX_STRING_ID) {
+                            silentChainEvents++;
+                        }
+                    }
                     cursor += 16;
                     liveChainActive = true;
                     broadcastMsg(range(msg, start, cursor));
@@ -625,8 +664,12 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                         // Single connection: send once
                         sendToPlayer(room.players[player], slice);
                     } else {
-                        sendToPlayer(room.players[player], slice);
-                        sendToPlayer(room.players[1], slice);
+                        // 随机选出对所有席位公开（对齐 tag_duel.cpp L1198-1208：players[player] + 其余席位）
+                        ServerConnection first = room.duelPlayer(player);
+                        sendToPlayer(first, slice);
+                        for (ServerConnection other : room.otherSeats(first)) {
+                            sendToPlayer(other, slice);
+                        }
                     }
                     sendToObservers(slice);
                     break;
@@ -703,7 +746,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                 case EngineMessage.MSG_MISSED_EFFECT: {
                     player = msg[cursor] & 0xFF;
                     cursor += 8;
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     break;
                 }
                 case EngineMessage.MSG_TOSS_COIN:
@@ -719,7 +762,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     player = msg[cursor] & 0xFF;
                     cursor++;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_HAND_RES: {
@@ -733,7 +776,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += 5;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_ANNOUNCE_CARD:
@@ -744,7 +787,7 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     cursor++;
                     cursor += count * 4;
                     waitforResponse(player);
-                    sendToPlayer(room.players[player], range(msg, start, cursor));
+                    sendToPlayer(room.duelPlayer(player), range(msg, start, cursor));
                     return 1;
                 }
                 case EngineMessage.MSG_CARD_HINT: {
@@ -764,9 +807,18 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
                     int tsEcount = msg[cursor + 2] & 0xFF;
                     int tsHcount = msg[cursor + 4] & 0xFF;
                     cursor += 5 + 4 + tsHcount * 4 + tsEcount * 4;
-                    // solo：4 席位同一连接由房主一人操控，全量下发即无信息泄漏；
-                    // sendToPlayer 在 dp==players[0] 时录帧，players[1]==players[0] 故只发一条全量帧。
-                    sendToPlayer(room.players[swapPlayer & 1], range(msg, start, cursor));
+                    byte[] full = range(msg, start, cursor);
+                    if (soloMode) {
+                        // solo：4 席位同一连接由房主一人操控，全量下发即无信息泄漏；
+                        // sendToPlayer 在 dp==players[0] 时录帧，players[1]==players[0] 故只发一条全量帧。
+                        sendToPlayer(room.players[swapPlayer & 1], full);
+                    } else {
+                        // 真 4 席位 TAG：本队当前行动席位收全量，其余席位与观战收里侧卡码清零版
+                        //（对齐 tag_duel.cpp L1480-1505）。
+                        byte[] masked = Arrays.copyOf(full, full.length);
+                        maskTagSwapHiddenCodes(masked, tsHcount, tsEcount);
+                        sendDualViewAndRecord(swapPlayer & 1, full, masked);
+                    }
                     refreshExtra(swapPlayer & 1);
                     refreshMzone(0, 0x81fff, 0);
                     refreshMzone(1, 0x81fff, 0);
@@ -791,5 +843,49 @@ final class DuelAnalyzer extends DuelAnalyzerBase {
             }
         }
         return 0;
+    }
+
+    /**
+     * TAG 每回合把当前行动席位在本队两席位间轮转（对齐 tag_duel.cpp MSG_NEW_TURN）：
+     * 开局 cur_player[0]=players[0]、cur_player[1]=players[3]，之后偶数回合（本轮前的 turn_count）
+     * 翻 A 队、奇数回合翻 B 队，形成 A1→B1→A2→B2 的标准行动序。非真 4 席位 TAG 什么也不做。
+     * 静默重放（撤回重建）同样逐回合轮转：rebuildAndReplay 已把 turnCount/curPlayer 复位到开局，
+     * 重放里的 MSG_NEW_TURN 会把它们推到回退点，撤回后追问才能挂对席位。
+     */
+    private void rotateTagCurPlayer() {
+        GameRoom r = room;
+        if (!r.isMultiSeatTag()) {
+            return;
+        }
+        if (r.turnCount > 0) {
+            if (r.turnCount % 2 == 0) {
+                r.curPlayer[0] = r.players[0] == r.curPlayer[0] ? r.players[1] : r.players[0];
+            } else {
+                r.curPlayer[1] = r.players[2] == r.curPlayer[1] ? r.players[3] : r.players[2];
+            }
+        }
+        r.turnCount++;
+        Arrays.fill(r.surrender, false);
+    }
+
+    /**
+     * MSG_TAG_SWAP 遮蔽版：手卡与额外卡组逐张里侧（姿态字节无 0x80）的卡码清零，
+     * 牌顶那张（偏移 6..9）按 C++ 口径保留公开（对齐 tag_duel.cpp L1489-1500）。
+     */
+    private static void maskTagSwapHiddenCodes(byte[] slice, int handCount, int extraCount) {
+        final int handBase = 10; // [0]消息号 [1]player [2]mcount [3]ecount [4]pcount [5]hcount [6..9]牌顶
+        final int extraBase = handBase + handCount * 4;
+        for (int i = 0; i < handCount; i++) {
+            int off = handBase + i * 4;
+            if (off + 4 <= slice.length && (slice[off + 3] & 0x80) == 0) {
+                writeInt32(slice, off, 0);
+            }
+        }
+        for (int i = 0; i < extraCount; i++) {
+            int off = extraBase + i * 4;
+            if (off + 4 <= slice.length && (slice[off + 3] & 0x80) == 0) {
+                writeInt32(slice, off, 0);
+            }
+        }
     }
 }

@@ -4,6 +4,11 @@ import cn.garymb.ygomobile.game.gamefield.GameTopInfoManager;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.view.inputmethod.InputMethodManager;
 import android.view.inputmethod.EditorInfo;
 
@@ -15,6 +20,7 @@ import androidx.annotation.Nullable;
 
 import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.lite.R;
+import cn.garymb.ygomobile.utils.YGOUtil;
 
 
 /**
@@ -26,7 +32,16 @@ public class ChatInputUI {
     private final GameEngine engine;
     
     private EditText etChatInput;
-    private boolean isChatEnabled = true;
+    /** 停用聊天后的检索态：输入框就地转为卡片关键词检索（背景下横线与文字阴影、发送走检索） */
+    private boolean searchMode;
+    /** 聊天态 XML 文字色快照：检索态按所在背景明暗改色后，切回聊天态据此还原 */
+    private ColorStateList defaultTextColor;
+    /** 对比取样等待几何就绪的延后帧数 */
+    private int contrastRetry;
+    /** 取样延后上限：超过则维持 XML 观感（浅蓝下划线 + 白字），不再逐帧重试 */
+    private static final int CONTRAST_RETRY_MAX = 10;
+    /** 浅/深背景判定阈值（Rec.601 加权亮度 ×1000）：不低于它取黑色下划线与黑色文字 */
+    private static final int LIGHT_BACKDROP_LUMINANCE = 140 * 1000;
     /** 绑定时捕获的 XML 基准高度（px，<=0 表示 wrap/自适应），缩放不叠乘 */
     private int baseInputHeight = -2;
     /** 当前 HUD 等比缩放系数（与 gameTopInfo 同源，见 GameTopInfoManager.applyTopInfoSize） */
@@ -60,9 +75,19 @@ public class ChatInputUI {
     public interface OnChatMessageListener {
         void onSendChatMessage(String message);
     }
+
+    /**
+     * 关键词检索监听：停用聊天后输入框就地转为卡片检索框，输入法点发送时把查询词交由外部
+     * 按卡组编辑同源的规则检索，并用关键词卡片列表弹窗显示命中卡
+     */
+    public interface OnKeywordSearchListener {
+        void onKeywordSearch(String keywords);
+    }
     
     @Nullable
     private OnChatMessageListener chatMessageListener;
+    @Nullable
+    private OnKeywordSearchListener keywordSearchListener;
     
     public ChatInputUI(Context context, GameEngine engine) {
         this.context = context;
@@ -78,8 +103,11 @@ public class ChatInputUI {
         if (etChatInput != null) {
             android.view.ViewGroup.LayoutParams lp = etChatInput.getLayoutParams();
             baseInputHeight = (lp != null) ? lp.height : -2;
+            // 聊天态文字色快照：检索态按背景明暗改色后据此还原 XML 观感，须在首次贴样式前取
+            defaultTextColor = etChatInput.getTextColors();
         }
         setupChatInput();
+        applySearchStyle();
         applyChatInputScale(hudScaleFactor);
         // 输入法看门狗常驻：大厅与决斗期间抬键盘都要联动在显弹窗（登记由各 dialog 完成）。
         // 旋转重建后 etChatInput 换新实例，重挂到新视图根并把去抖状态复位，
@@ -137,6 +165,13 @@ public class ChatInputUI {
     }
 
     /**
+     * 设置关键词检索监听器（停用聊天后的检索态发送入口）
+     */
+    public void setOnKeywordSearchListener(@Nullable OnKeywordSearchListener listener) {
+        this.keywordSearchListener = listener;
+    }
+
+    /**
      * 注册输入法显隐监听（由 YGOProActivity 接线到 {@link cn.garymb.ygomobile.utils.ImePopupAdjuster}）。
      */
     public void setImeVisibilityListener(@Nullable ImeVisibilityListener listener) {
@@ -150,8 +185,11 @@ public class ChatInputUI {
         if (etChatInput == null) return;
         
         etChatInput.setOnEditorActionListener((v, actionId, event) -> {
+            // 聊天态动作键为「发送」、检索态为「搜索」（见 applySearchStyle），两者同走发送入口；
+            // 实体回车与完成(DONE)键一并保留原有响应路径
             boolean isSend = actionId == EditorInfo.IME_ACTION_SEND
                     || actionId == EditorInfo.IME_ACTION_DONE
+                    || actionId == EditorInfo.IME_ACTION_SEARCH
                     || (event != null && event.getKeyCode() == android.view.KeyEvent.KEYCODE_ENTER
                     && event.getAction() == android.view.KeyEvent.ACTION_DOWN);
             
@@ -242,13 +280,21 @@ public class ChatInputUI {
     }
     
     /**
-     * 发送聊天消息
+     * 发送聊天消息；检索态下把输入内容当关键词交由外部弹关键词卡片列表
      */
     private void sendChatMessage() {
         if (etChatInput == null) return;
         
         String message = etChatInput.getText().toString().trim();
         if (message.isEmpty()) return;
+
+        if (searchMode) {
+            // 检索态：不报通讯，查询词保留在输入框内便于改词重查
+            if (keywordSearchListener != null) {
+                keywordSearchListener.onKeywordSearch(message);
+            }
+            return;
+        }
         
         // 通过监听器回调发送消息
         if (chatMessageListener != null) {
@@ -366,9 +412,152 @@ public class ChatInputUI {
     }
     
     /**
-     * 切换聊天输入框的显示/隐藏状态
-     * 停用状态 → 启用：显示聊天输入框
-     * 启用状态 → 停用：隐藏聊天输入框并清空聊天消息
+     * 切换输入框的「停用聊天 → 卡片关键词检索」形态（由 YGOProActivity.updateChatUIVisibility
+     * 按停用聊天设置与场景集中核算后下发）。每次调用都重贴一次背景，使旋转重建后
+     * {@link #bindChatInput} 换新视图实例也能按当前形态复原。
+     */
+    public void setSearchMode(boolean search) {
+        boolean wasSearch = searchMode;
+        searchMode = search;
+        // 回到聊天态时清掉遗留的检索词，避免把关键词当聊天内容误发；
+        // 仅在检索→聊天的真实翻转时清，避免旋转/场景刷新误掉正在输入的聊天草稿
+        if (wasSearch && !search && etChatInput != null) {
+            etChatInput.setText("");
+        }
+        applySearchStyle();
+    }
+
+    /**
+     * 按当前形态贴底与动作键（聊天态四周描边 + 发送、检索态只留下横线 + 搜索）。
+     * 不动字号/边距/高度（尺寸只经 {@link #applyChatInputScale} 与 XML 决定），也不改
+     * inputType（仍是 text 单行），中文合成与空格输入不受影响。
+     */
+    private void applySearchStyle() {
+        if (etChatInput == null) return;
+        // 换背景会带出档案自带内边距（聊天底衬四周 1dp、检索下横线无），先记后还，
+        // 使两态只差在底衬外观，切换时输入框尺寸与文字位置不跳动（用户规格）
+        int pl = etChatInput.getPaddingLeft();
+        int pt = etChatInput.getPaddingTop();
+        int pr = etChatInput.getPaddingRight();
+        int pb = etChatInput.getPaddingBottom();
+        etChatInput.setBackgroundResource(searchMode
+                ? R.drawable.ygopro_search_underline : R.drawable.ygopro_base_background);
+        etChatInput.setPadding(pl, pt, pr, pb);
+        // 检索态只有下横线、无底衬，白字压在浅色场地贴图上会看不清，靠文字阴影描出边缘
+        // （用户规格：不加背景色，仅用阴影）；聊天态四周描边本身是深色底，阴影半径归 0 保持原观感
+        etChatInput.setShadowLayer(searchMode ? 2f : 0f, 1f, 1f, YGOUtil.c(R.color.black));
+        if (searchMode) {
+            // 下划线与文字按输入框所在位置的实际背景取反色（用户规格）：本方法可能在布局前被调，取色延后
+            refreshSearchContrast();
+        } else {
+            // 聊天态四周描边自带深色底衬：清掉检索态留下的 tint 并还原 XML 文字色
+            etChatInput.setBackgroundTintList(null);
+            if (defaultTextColor != null) etChatInput.setTextColor(defaultTextColor);
+        }
+        etChatInput.setImeOptions(searchMode
+                ? EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                : EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        // imeOptions 变更对已连接的输入法不会自动生效，持焦时补一次 restartInput 重报键名
+        if (etChatInput.hasFocus()) {
+            InputMethodManager imm = (InputMethodManager)
+                    context.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.restartInput(etChatInput);
+        }
+    }
+
+    /**
+     * 外部入口（形态切换、换肤、旋转重贴背景）：延到下一帧再按输入框所在位置的实际背景取色，
+     * 保证刚换上的背景 drawable 已完成 bounds 解算
+     */
+    public void refreshSearchContrast() {
+        if (etChatInput == null) return;
+        etChatInput.post(this::applySearchContrast);
+    }
+
+    /**
+     * 检索态按输入框所在位置的实际背景明暗取反色（用户规格：浅色背景=黑色下划线+黑色文字，
+     * 深色背景=白色下划线+白色文字）；ygopro_search_underline 只有一条实色横线，背景 tint 即改其色
+     */
+    private void applySearchContrast() {
+        if (etChatInput == null || !searchMode) {
+            contrastRetry = 0;
+            return;
+        }
+        if (etChatInput.getWidth() <= 0 || etChatInput.getHeight() <= 0) {
+            // bindChatInput 早于首次布局：延后重试；始终取不到几何则维持 XML 观感
+            if (contrastRetry++ < CONTRAST_RETRY_MAX) {
+                etChatInput.post(this::applySearchContrast);
+                return;
+            }
+            contrastRetry = 0;
+            etChatInput.setBackgroundTintList(null);
+            if (defaultTextColor != null) etChatInput.setTextColor(defaultTextColor);
+            return;
+        }
+        contrastRetry = 0;
+        int color = isBackdropLight(etChatInput) ? Color.BLACK : Color.WHITE;
+        etChatInput.setBackgroundTintList(ColorStateList.valueOf(color));
+        etChatInput.setTextColor(color);
+    }
+
+    /**
+     * 沿祖先链（直到承载窗口背景的 DecorView）把各级背景按屏幕位置绘进一张与 target 等大的探针位图，
+     * 抽样求平均亮度判定浅/深：决斗场底行所在横带由 FieldCamera 内缩留空、GL 曲面在此透明，
+     * 透出的是窗口/区域背景贴图，故以视图树背景为准（GL 已绘内容不参与取样）
+     */
+    private static boolean isBackdropLight(View target) {
+        int w = target.getWidth();
+        int h = target.getHeight();
+        Bitmap probe;
+        try {
+            probe = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        } catch (OutOfMemoryError e) {
+            return false; // 取不到探针位图时按深色底处理（白字白线，即原观感）
+        }
+        // 自顶向下绘，与屏幕上的叠放次序一致；末位是 target 自身，其底衬正是被判定对象，跳过
+        int depth = 0;
+        for (View v = target; v != null; v = parentOf(v)) depth++;
+        View[] chain = new View[depth];
+        int idx = depth - 1;
+        for (View v = target; v != null; v = parentOf(v)) chain[idx--] = v;
+        int[] self = new int[2];
+        int[] loc = new int[2];
+        target.getLocationInWindow(self);
+        Canvas canvas = new Canvas(probe);
+        for (int i = 0; i < depth - 1; i++) {
+            Drawable bg = chain[i].getBackground();
+            if (bg == null) continue;
+            chain[i].getLocationInWindow(loc);
+            int save = canvas.save();
+            canvas.translate(loc[0] - self[0], loc[1] - self[1]);
+            bg.draw(canvas);
+            canvas.restoreToCount(save);
+        }
+        long sum = 0;
+        int n = 0;
+        int stepX = Math.max(1, w / 24);
+        int stepY = Math.max(1, h / 12);
+        for (int y = 0; y < h; y += stepY) {
+            for (int x = 0; x < w; x += stepX) {
+                int c = probe.getPixel(x, y);
+                sum += (long) (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114)
+                        * Color.alpha(c) / 255;
+                n++;
+            }
+        }
+        probe.recycle();
+        return n > 0 && sum / n >= LIGHT_BACKDROP_LUMINANCE;
+    }
+
+    /** 父视图：沿 ViewParent 上溯到 DecorView 为止，非 View 的父层返回 null */
+    private static View parentOf(View v) {
+        return v.getParent() instanceof View ? (View) v.getParent() : null;
+    }
+
+    /**
+     * 切换聊天输入框的工作形态
+     * 停用状态 → 启用：恢复聊天态（四周描边背景、发送走聊天）
+     * 启用状态 → 停用：转卡片检索态并清空已显示的聊天消息（可见性交集中核算）
      */
     public void toggleChatInput(boolean enable, Runnable onClearChatMessages) {
         if (etChatInput == null) return;
@@ -381,21 +570,19 @@ public class ChatInputUI {
         if (enable) {
             // 启用聊天
             settings.saveIntSettings("chkDisableChatting", 0);
-            isChatEnabled = true;
             etChatInput.clearFocus();
             etChatInput.setVisibility(View.VISIBLE);
         } else {
             // 停用聊天
             settings.saveIntSettings("chkDisableChatting", 1);
-            isChatEnabled = false;
             if (imm != null && etChatInput.getWindowToken() != null) {
                 imm.hideSoftInputFromWindow(etChatInput.getWindowToken(), 0);
             }
             etChatInput.clearFocus();
-            // 停用聊天隐藏输入框用 INVISIBLE 而非 GONE（用户规格）：竖屏底部聊天输入框
-            // 为 weight 布局，GONE 会让左侧按钮组宽度跳变，INVISIBLE 保持占位稳定
-            etChatInput.setVisibility(View.INVISIBLE);
-            
+            // 停用聊天不再在此隐藏输入框：输入框就地转为卡片关键词检索框（检索态与可见性
+            // 统一由 YGOProActivity.updateChatUIVisibility 按抑制场景核算，隐藏一律用 INVISIBLE
+            // 以保持竖屏底部 weight 布局的占位稳定）
+
             if (onClearChatMessages != null) {
                 onClearChatMessages.run();
             }
@@ -403,10 +590,12 @@ public class ChatInputUI {
     }
     
     /**
-     * 获取当前聊天是否启用状态
+     * 聊天是否启用：以持久化的 chkDisableChatting 为唯一依据（图标、检索态、可见性核算同源）。
+     * 不再用运行时标志：重启后设置已是「停用」而标志停在默认 true，第一次点开关会被算成「再次停用」，
+     * 表现为点「开启聊天」反而把输入框藏掉（用户反馈）
      */
     public boolean isChatEnabled() {
-        return isChatEnabled;
+        return AppsSettings.get().getIntSettings("chkDisableChatting", 0) != 1;
     }
     
     /**
@@ -479,5 +668,6 @@ public class ChatInputUI {
         detachImeWatcher();
         etChatInput = null;
         chatMessageListener = null;
+        keywordSearchListener = null;
     }
 }

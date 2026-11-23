@@ -1,5 +1,6 @@
 package cn.garymb.ygomobile.game.engine;
 import cn.garymb.ygomobile.game.gamefield.ClientCard;
+import cn.garymb.ygomobile.game.gamefield.EffectActivatableHints;
 import cn.garymb.ygomobile.game.gamefield.GameField;
 import cn.garymb.ygomobile.game.replay.ReplayPlayer;
 
@@ -16,6 +17,7 @@ import cn.garymb.ygomobile.engine.LuaScriptEngine;
 import cn.garymb.ygomobile.network.DuelClient;
 import cn.garymb.ygomobile.network.DuelStocHandler;
 import cn.garymb.ygomobile.network.YGOProtocol;
+import cn.garymb.ygomobile.render.card.CardDetailPanel;
 
 /** 引擎统一门面：对外公共 API 不变；行为逻辑按 // === 分栏拆至同包协作类，构造注入并一行转发：DuelHintManager / SummonAnimationManager / DeckHandMotionManager / ConnectionManager / LobbyActions / GameActions / CommandDataParser / DuelEventHandler / GameMessageParser / ReplayPlayer / DuelStocHandler / UndoClientCoordinator / MsgFrameRecorder / AskWatchdog / MsgDispatchGate（消息串行闸门）/ DuelViewpointManager（对局视角）；本体仅留共享状态、状态机与命令状态。 */
 public class GameEngine {
@@ -92,6 +94,13 @@ public class GameEngine {
 
         /** 猜拳结果（STOC_HAND_RESULT），均为本方视角的手势常量（1=剪刀 2=石头 3=布） */
         void onHandResult(int myHand, int oppHand);
+
+        /**
+         * MSG_HAND_RES(133)：决斗中脚本猜拳（如「变则齿轮」）的双方手势结果，手势常量同上、
+         * 均已按本方视角换算。与握手层的 {@link #onHandResult} 分开：后者携带开局猜拳的状态机
+         *（rpsResultShown / handSelectDialog / 平局重挂），把对局内结果写进去会跨阶段串扰。
+         */
+        default void onDuelRpsResult(int myHand, int oppHand) {}
 
         /** 召唤居中动画（MSG_SUMMONING/SPSUMMONING/FLIPSUMMONING）：summonType 取 SUMMON_NORMAL/SPECIAL/FLIP */
         void onSummonAnimation(int code, int summonType);
@@ -180,7 +189,10 @@ public class GameEngine {
     public boolean serverCapsAskResend = false;
     /** 服务端确认存在可回退锚点（STOC_UNDO_STATE） */
     public boolean undoAvailable = false;
-    /** 撤回一次性锩锁：发出 CTOS_UNDO 置位，本方发出一条应答时清除；置位期间 isUndoPromptActive() 恒 false（服务端允许连续撤回，但连续点击会让 ACK/重同步/屏障布防叠加破坏派发链） */
+    /** 撤回一次性闩锁：发出 CTOS_UNDO 置位，「上一次撤回的全量重同步已落地」（UndoClientCoordinator
+     *  #applyUndoResync）或撤回被拒时清除；置位期间 isUndoPromptActive() 恒 false。
+     *  能不能再发下一条 CTOS_UNDO 的统一准入见 canSendUndo()：闩锁 + 无待消费重同步 + 应答屏障已放行
+     *  + 两次撤回最小间隔；服务端可撤状态（STOC_UNDO_STATE）仍是「有没有锚点」的唯一裁判 */
     public volatile boolean undoBlockedUntilNewAction = false;
 
     /** tag 模式本方是否已发起投降（等待队友回应）：防止对 STOC_TEAMMATE_SURRENDER 自我弹窗与重复发起 */
@@ -247,6 +259,12 @@ public class GameEngine {
     /** 录像回放播放器（唯一回放入口：消息投喂本引擎实况管线，与联机/观战同一渲染路径） */
     // 撤回/录制/看门狗协作类（同包，持 engine 反向引用）
     final UndoClientCoordinator undoCoord;
+    /** MSG_RETRY 重放置位（评审 Minor①）：replayLastGameMsg 重新派发缓存消息期间为 true，
+     *  于 DuelEventHandlerBase.onChaining 抑制发动账本登记与卡详刷新——重放只是重建选择 UI
+     *  的本地回显，不是新的发动事件，否则客户端 LOG 多于一行、与保留前缀的
+     *  silentChainEvents 条数口径偏移，dropBeyond 误清保留中的标记；
+     *  与派发链同在主线程，volatile 仅作跨线程可见性兜底 */
+    volatile boolean suppressLedgerRecord;
     final MsgFrameRecorder msgRecorder;
     final AskWatchdog askWatchdog;
     /** 消息串行闸门（入队派发/动画持闸/回放排空，实现在 MsgDispatchGate）与对局视角（显示名/切视角，实现在 DuelViewpointManager） */
@@ -339,6 +357,11 @@ public class GameEngine {
 
     public void clearCommandFlags() {
         activatableCards.clear();
+        // 可发动效果段落登记与命令列表同生命周期：新询问到达前清空，防上一询问的发动项发光残留
+        EffectActivatableHints.clear();
+        // EFFECT_YN 询问卡角呼吸绿点同样随询问/命令段清除（正常由询问窗 dismiss 自清，
+        // 此处为撤回重同步/决斗结束等不经 dismiss 路径的兜底）
+        field.effectYnAsking = null;
         attackableCards.clear();
         summonableCards.clear();
         spsummonableCards.clear();
@@ -372,9 +395,30 @@ public class GameEngine {
                 if (c != null) c.clearCmdFlag();
             }
         }
+        // 用户新规格3：登记簿清空后展示中的卡详即时收起过期的可发动背景呼吸段
+        //（解析型调用方随后登记完成会再触发一次，经 binder 40ms 防抖合并为一次重绑）
+        CardDetailPanel.refreshCardDetailMarks();
     }
 
-    /** 复位区域发动提示 / conti_act 标志（解析 idle/battle 前清空，防上一选择脏标志；连锁路径不经此方法） */
+    /**
+     * 攻击宣言进入结算后收掉卡上的「可攻击」提示：只清 COMMAND_ATTACK 位与 {@code attackableCards}。
+     * <p>对齐 C++：宣言攻击的应答一发出，{@code DuelClient::SendResponse} 就对 MSG_SELECT_BATTLECMD
+     * 调 {@code ClearCommandFlag()}（duelclient.cpp L4511-4515），全部可攻击标志在那一刻归零，因此
+     * 绿色攻击弧与其后的伤害步骤里没有任何卡还带着上下晃动的 attack.png；本端旧写法只在询问重发时
+     * 才重置标志，弧线播完到下一条战斗指令之间会重新亮出其余怪兽的攻击箭头（用户反馈与 C++ 不一致）。
+     * <p>不动发动/召唤/切阶段等其余命令集：那些属于其它询问集，由随后的 MSG_SELECT_BATTLECMD 经
+     * {@code CommandDataParser} 重新置位。
+     */
+    public void clearAttackCommands() {
+        attackableCards.clear();
+        for (int p = 0; p < 2; p++) {
+            for (ClientCard c : field.players[p].monsterZone) {
+                if (c != null) c.cmdFlag &= ~COMMAND_ATTACK;
+            }
+        }
+    }
+
+    /** 复位区域发动提示 / conti_act 标志（解析 idle/battle 前清空，防上一选择脏标志；连锁路径不经本方法） */
     void resetFieldCommandHints() {
         for (int p = 0; p < 2; p++) {
             field.deckAct[p] = false;
@@ -441,9 +485,10 @@ public class GameEngine {
         connection.startBotDuel(host, port, botCommand, deckFile);
     }
 
-    /** 启动 WindBot 加入指定主机（人机对战），实现见 ConnectionManager */
-    public void launchWindBot(String host, int port, String botCommand, String deckFile) {
-        connection.launchWindBot(host, port, botCommand, deckFile);
+    /** 启动 WindBot 加入指定主机（人机对战），实现见 ConnectionManager；
+     *  botCommands/deckFiles 按下标一一对应待拉起的人机席位（TAG 为 3 席） */
+    public void launchWindBot(String host, int port, List<String> botCommands, List<String> deckFiles) {
+        connection.launchWindBot(host, port, botCommands, deckFiles);
     }
 
     // ==== 录像回放控制（实现见 ConnectionManager） ====
@@ -501,9 +546,17 @@ public class GameEngine {
 
     public boolean canUndo() { return undoCoord.canUndo(); }
 
-    public void onUndoAck(int result, int turn, int currentPlayer, int phase) { undoCoord.onUndoAck(result, turn, currentPlayer, phase); }
+    /** 当前是否允许再发一条 CTOS_UNDO（实现见 UndoClientCoordinator）：连续撤回的客户端互斥闸门 */
+    public boolean canSendUndo() { return undoCoord.canSendUndo(); }
+
+    public void onUndoAck(int result, int turn, int currentPlayer, int phase, int chainEvents,
+                          int ackRound) { undoCoord.onUndoAck(result, turn, currentPlayer, phase, chainEvents, ackRound); }
 
     public boolean applyUndoResync(GameField field) { return undoCoord.applyUndoResync(field); }
+
+    /** 本次撤回重同步的「保留发动条数」（实现见 UndoClientCoordinator）：场地持续态标注（泡影类变色格/
+     *  无效徽记、封区白 X）按此剪除被抹掉那次发动所适用的位；-1 = 旧服务端不报，不回退 */
+    public int undoKeptChainEvents() { return undoCoord.undoKeptChainEvents; }
 
     public void clearUndoResync() { undoCoord.clearUndoResync(); }
 
@@ -521,6 +574,21 @@ public class GameEngine {
     public void resetAskWatchdog() { askWatchdog.resetAskWatchdog(); }
 
     public boolean isUndoPromptActive() { return undoCoord.isUndoPromptActive(); }
+
+    /** 撤回最小发出间隔（1s）的剩余 ms（≤0 = 已过）：UI 显示态评估为假且仍在计时时，
+     *  据此延时补算一次，保证 ic_undo 在间隔到期时自动重新点亮（显示态与发出闸门解耦配套） */
+    public long undoSendIntervalRemainingMs() { return undoCoord.undoSendIntervalRemainingMs(); }
+
+    /**
+     * 按留存的最近询问快照重派发待答询问（实现见 UndoClientCoordinator）：界面侧撤回被拒时，
+     * 点击撤回瞬间被收口的选择/宣言/选项类弹窗没有实例快照可原地恢复，只能靠本路重建。
+     *
+     * @return 是否真的重派发了（无快照时 false，调用方需改走恢复旧窗实例的路径）
+     */
+    public boolean restorePendingQuestionUi() { return undoCoord.restorePendingQuestionUi(); }
+
+    /** 本端是否仍有一条尚未应答的询问（实现见 AskWatchdog）：撤回被拒时据此判断可否重派发 */
+    public boolean isQuestionPending() { return askWatchdog.isQuestionPending(); }
 
     /** 是否 tag 双人模式（gameMode == MODE_TAG） */
     public boolean isTagMode() {
@@ -585,9 +653,12 @@ public class GameEngine {
         setState(newState);
     }
 
-    /** 强制重派状态回调（不去重）：solo 连续换 side 等「状态未变但需重建界面」场景 */
+    /** 强制重派状态回调（不去重）：solo 连续换 side 等「状态未变但需重建界面」场景。
+     *  与 setState 一致 post 到主线程：回调链会直接重开卡组编辑器等 UI，不得在通讯读取线程执行 */
     public void redispatchState(GameState state) {
-        if (listener != null) listener.onStateChanged(state);
+        mainHandler.post(() -> {
+            if (listener != null) listener.onStateChanged(state);
+        });
     }
 
     // === 游戏消息串行闸门（原 DuelClient.ClientListener.onGameMsg 投递口，实现见 StocHandler） ===
@@ -623,6 +694,16 @@ public class GameEngine {
 
     /** 串行派发待处理消息：闸门开启时逐条处理，某条触发动画则停止循环；实现见 MsgDispatchGate */
     void drainPendingMsgs() { gate.drainPendingMsgs(); }
+
+    /** 新一局开场硬复位：丢弃上一局遗留的待派发消息与动画/持闸状态，并把清场作为新一局第一条串行动作（实现见 MsgDispatchGate） */
+    public void prepareNewDuel() { gate.prepareNewDuel(); }
+
+    /**
+     * 把一次性动作排到通讯队列尾部执行，使其与 {@code MSG_*} 同序（对齐 C++ ClientAnalyze 的单条串行链）。
+     * 供会清空/重建场地的 {@code STOC_*}（STOC_DUEL_START / STOC_CHANGE_SIDE / STOC_WAITING_SIDE）使用，
+     * 避免观战积压时清场插到「下一局 MSG_START 已建好的堆叠」之后；实现见 MsgDispatchGate。
+     */
+    public void postOnMsgQueue(Runnable action) { gate.postSerialized(action); }
 
     /** 确认卡片对话框显示时持有消息闸门（对齐 C++ MSG_CONFIRM_CARDS 显示面板后 actionSignal.Wait()）；实现见 MsgDispatchGate */
     public void holdMsgGateForDialog() { gate.holdMsgGateForDialog(); }
@@ -674,6 +755,16 @@ public class GameEngine {
     public final String[] soloSeatDeckPaths = new String[]{"", "", "", ""};
     /** Solo match 换 side 会话内已弹出的换 side 界面计数：每次进入 SIDING 载入 soloSeatDeckPaths 的下一席位卡组并自增，新局开局（onDuelStart）复位为 0 */
     public int soloSideSession = 0;
+    /** 本场 match 各席位“当前对局卡组”快照（主/额外/副卡码，0..3）：大厅提交卡组时登记、
+     *  换 side 提交后按席位回写；换 side 编辑器据此载入，而不是从磁盘 ydk 重读（见 MatchDeckSnapshot） */
+    public final MatchDeckSnapshot[] matchDecks = new MatchDeckSnapshot[]{
+            new MatchDeckSnapshot(), new MatchDeckSnapshot(), new MatchDeckSnapshot(), new MatchDeckSnapshot()};
+
+    /** 登记某席位当前对局卡组（solo：0..required-1 按席位；非 solo：恒为我方 0） */
+    public void updateMatchDeck(int seat, List<Integer> main, List<Integer> extra, List<Integer> side) {
+        if (seat < 0 || seat >= matchDecks.length) return;
+        matchDecks[seat].update(main, extra, side);
+    }
     /** 回放快进重排中（undo/restart/跳回合）：drawspec 覆盖层与长动画派发丢弃，配合 GameField.instantPlace 即时落位与音效静默，令闸门不阻塞、队列单帧排空；置位/复位在投喂线程而判读在主线程派发链，volatile 保证跨线程立即可见、防 JIT 提升旧值使抑制形同虚设 */
     public volatile boolean replaySkip = false;
 
@@ -702,6 +793,17 @@ public class GameEngine {
     public boolean isSelfSide(int player) {
         if (soloMode) return player != 2;
         return player != 2 && localPlayer(player & 1) == 0;
+    }
+
+    /**
+     * 本端是否两侧手卡全公开（用户规格：只有录像回放与局域网纯单人这两类「观战自己」的场景）：
+     * 两种场景下双方手卡卡码都由全量消息流/本机引擎给出，手卡一直是正面公开态，因此「从卡组抽卡」
+     * （通常抽卡与卡的效果抽卡）应直接正面入手，不再走「里侧入手→翻到正面」的两步确认——那两步
+     * 只属于联机对局里向对手揭示私有入手的语义，在公开态下反而与桌面版 gframe 不一致（gframe 手卡
+     * 只按卡码贴图，卡码在手即正面）。正常决斗与观战不属本态：对方暗手卡到手仍须保持卡背遮蔽。
+     */
+    public boolean revealsBothHands() {
+        return replayMode || soloMode;
     }
 
     public void release() {

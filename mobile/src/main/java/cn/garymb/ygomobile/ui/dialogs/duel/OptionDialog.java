@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import cn.garymb.ygomobile.YGOProActivity;
+import cn.garymb.ygomobile.audio.SoundManager;
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.utils.DialogScale;
 import cn.garymb.ygomobile.utils.DraggablePopupHelper;
@@ -109,14 +110,16 @@ public class OptionDialog {
     }
 
     /**
-     * 决斗结束 / 退出对战时关闭可能残留的选项弹窗（由 ShowDialogUtil.dismissOpenGameDialogs 调用）：
+     * 决斗结束 / 退出对战 / 撤回瞬间关闭可能残留的选项弹窗（由 ShowDialogUtil.dismissOpenGameDialogs 调用）：
      * MSG_SELECT_OPTION 的弹窗不可取消，若结束时仍在显示会残留遮挡返回界面，故统一主动关闭。
+     *
+     * @return 本次是否真的关闭了一个在显弹窗（撤回路径据此判断需不需按询问快照重建）
      */
-    public static void dismissCurrent() {
-        if (current != null) {
-            current.dismiss();
-            current = null;
-        }
+    public static boolean dismissCurrent() {
+        if (current == null) return false;
+        current.dismiss();
+        current = null;
+        return true;
     }
 
     /**
@@ -226,6 +229,7 @@ public class OptionDialog {
             DraggablePopupHelper.centerPopupInRegion(popupWindow, null);
             draggableHelper.showPopup(popupWindow, decor);
             ImePopupAdjuster.attach(popupWindow);
+            playQuestionSound();
             showing = true;
         }
     }
@@ -290,6 +294,18 @@ public class OptionDialog {
         // 输入法抬升联动（用户规格）：抬键盘时本弹窗底边贴聊天输入框上沿，
         // 收起后回到 layout_game_right 中央，逻辑统一在 ImePopupAdjuster
         ImePopupAdjuster.attach(popupWindow);
+        playQuestionSound();
+    }
+
+    /**
+     * 弹窗出现提示音（对齐 C++ Game::PopupElement → SoundManager::PlayDialogSound：
+     * wOptions 与 wQuery、wSurrender、wAN 系列、wReplaySave、wFTSelect 同归 QUESTION）。
+     */
+    private void playQuestionSound() {
+        if (context instanceof YGOProActivity) {
+            SoundManager sm = ((YGOProActivity) context).getSoundManager();
+            if (sm != null) sm.playSoundEffect(SoundManager.SFX.QUESTION);
+        }
     }
 
     /**

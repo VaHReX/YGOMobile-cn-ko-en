@@ -1,4 +1,5 @@
 package cn.garymb.ygomobile.ui.dialogs.replay;
+import cn.garymb.ygomobile.ui.dialogs.common.EditTextDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.YesOrNoDialog;
 
 import android.app.Activity;
@@ -43,6 +44,7 @@ import cn.garymb.ygomobile.utils.DraggablePopupHelper;
 import cn.garymb.ygomobile.utils.YGOUtil;
 import cn.garymb.ygomobile.Constants;
 import ocgcore.DataManager;
+import ocgcore.StringManager;
 
 public class ReplayModeDialog {
 
@@ -233,7 +235,7 @@ public class ReplayModeDialog {
 
     /** 界面文字统一复用 gframe 既有系统字符串（对齐 game.cpp wReplay），XML 中的中文仅作兜底 */
     private void setupLabels(View root) {
-        ocgcore.StringManager sm = DataManager.get().getStringManager();
+        StringManager sm = DataManager.get().getStringManager();
         TextView tvInfoTitle = root.findViewById(R.id.tv_replay_info_title);
         if (tvInfoTitle != null) tvInfoTitle.setText(sm.getSystemString(1349, "录像信息："));
         TextView tvStartTurn = root.findViewById(R.id.tv_start_turn_label);
@@ -438,34 +440,33 @@ public class ReplayModeDialog {
         }
     }
 
+    /** 重命名录像：单行输入框预填去掉 .yrp 的当前名（整段选中，打字即覆盖）；
+     *  空名与重名不关窗，玩家就地改字重输 */
     private void showRenameDialog(File replayFile, ListView listView) {
-        EditText editText = new EditText(DialogScale.wrap(context));
-        editText.setText(replayFile.getName().replace(".yrp", ""));
-        editText.selectAll();
-        editText.setTextColor(YGOUtil.c(R.color.white));
-        editText.setHintTextColor(YGOUtil.c(R.color.white_88));
-
-        YesOrNoDialog dialog = new YesOrNoDialog(context);
-        dialog.setTitle("重命名录像")
-                .setContentView(editText)
-                .setType(YesOrNoDialog.TYPE_YES_NO)
-                .setPositiveButtonText("确定")
-                .setNegativeButtonText("取消")
-                .setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        EditTextDialog dialog = new EditTextDialog(context);
+        dialog.setTitle(DataManager.get().getStringManager().getSystemString(1362, "重命名"))
+                .setText(replayFile.getName().replace(".yrp", ""))
                 .setCenterInView(windowCenterRegion())
-                .setPositiveButton(v -> {
-                    String newName = editText.getText().toString().trim();
-                    if (newName.isEmpty()) {
-                        Toast.makeText(context, "名称不能为空", Toast.LENGTH_SHORT).show();
-                        return;
-                    }
-                    boolean success = ReplayReader.renameReplay(replayFile.getAbsolutePath(), newName);
-                    if (success) {
+                .setOnInputActionListener(new EditTextDialog.OnInputActionListener() {
+                    @Override
+                    public boolean onConfirm(String newName) {
+                        if (newName.isEmpty()) {
+                            Toast.makeText(context, "名称不能为空", Toast.LENGTH_SHORT).show();
+                            return false;
+                        }
+                        if (!ReplayReader.renameReplay(replayFile.getAbsolutePath(), newName)) {
+                            Toast.makeText(context, "重命名失败", Toast.LENGTH_SHORT).show();
+                            return false;
+                        }
                         Toast.makeText(context, "重命名成功", Toast.LENGTH_SHORT).show();
                         selectedReplayFile = null;
                         refreshReplayList();
-                    } else {
-                        Toast.makeText(context, "重命名失败", Toast.LENGTH_SHORT).show();
+                        return true;
+                    }
+
+                    @Override
+                    public void onCancel() {
+                        // 取消重命名：保留原录像名与当前选中
                     }
                 });
         dialog.show();
@@ -617,6 +618,19 @@ public class ReplayModeDialog {
     public static void startReplayPlayback(YGOProActivity activity, String replayPath, int startTurn) {
         final ReplayPlayer player = activity.getReplayPlayer();
         if (player == null) return;
+        /**
+         * 外部再次打开 yrp（singleTop 走 onNewIntent 直接起播，不经本窗的 loadReplay）时录像选择窗
+         * 可能仍在显示，且其 PopupWindow 挂着 dismiss → restoreMainMenu 回调：该回调会在焦点变化或
+         * 退场动画之后才补触发，restoreMainMenu 尾部的 hideGameUI() 把刚由 enterReplayUI 切过去的决斗场
+         * UI 整层收起（layout_game_right 与其内 GL 曲面一起 GONE），于是只剩窗口背景、场上没有卡片和
+         * 决斗场，卡片移动动画因渲染缺位不再推进，观感即「录像卡住」（用户反馈）。
+         * 按选择窗内点「播放」的内部跳转语义先摘回调再收窗（与本方法下方 loadReplay 的做法同构）。
+         */
+        ReplayModeDialog showing = activity.getReplayModeDialog();
+        if (showing != null && showing.isShowing()) {
+            showing.setOnDismissListener(null);
+            showing.dismiss();
+        }
         // 重复进入回放（外部再次打开 .yrp / 录像选择窗连续点播）：先摘掉旧回调，
         // loadAndPlay 内部会停掉旧投喂线程，剩余回调静默丢弃
         player.detachListener();
@@ -655,11 +669,15 @@ public class ReplayModeDialog {
                             // 再弹结束提示框（确认后才 quitReplay 回录像选择窗）
                             activity.getCardDetailPanel().hideReplayControls();
                             activity.getCardDetailPanel().closeGameButtons();
+                            // 播完即收口仍在显示的决斗内弹窗（堆叠区展示列表/确认窗等），
+                            // 不让它们盖在结束提示框或随后重开的录像选择界面上
+                            activity.dismissDuelDialogsForExit();
                             showReplayEndDialog(activity, player, endDlgShown, false);
                             break;
                         case ERROR:
                             // 同 PLAYING：阶段格不用“⏹”图标覆盖，保持当前阶段语义
                             // 对齐 MSG_RETRY 分支 L311-316："Error occurs." 提示后等待确认
+                            activity.dismissDuelDialogsForExit();
                             showReplayEndDialog(activity, player, endDlgShown, true);
                             break;
                         default:
@@ -677,17 +695,13 @@ public class ReplayModeDialog {
             @Override
             public void onReplayFinished(int winner, int reason) {
                 activity.runOnUiThread(() -> {
-                    // 取回放中胜者的名字，用于胜利说明 "[胜者名] 原因" 前缀（reason<0x10 时）
-                    String winnerName = null;
-                    if (winner == 0 || winner == 1) {
-                        ReplayReader.ReplayData rd = player.getReplayData();
-                        if (rd != null && winner < rd.playerNames.size()) {
-                            winnerName = rd.playerNames.get(winner);
-                        }
-                    }
                     // 不再在此处隐藏控制条：胜负文字先显示，结束提示弹窗由 FINISHED 状态统一弹出，
-                    // 用户确认后经 quitReplay 退出回放回录像选择窗（对齐 C++ EndDuel 流程）
-                    activity.showReplayResult(winner, reason, winnerName);
+                    // 用户确认后经 quitReplay 退出回放回录像选择窗（对齐 C++ EndDuel 流程）。
+                    // 胜负归属（YOU WIN / YOU LOSE / DRAW）与说明里的【败方】昵称不再在本处按录像头部的
+                    // 胜者名算：改由 showReplayResult 按当前视角换算（对齐 duelclient.cpp MSG_WIN 的
+                    // LocalPlayer(player)），旧写法按 winner==0 恒判 YOU WIN，切换视角后我方输了也说
+                    // 「YOU WIN」，即用户反馈的「录像里 YOU LOSE 经常不显示，总是只显示 YOU WIN」
+                    activity.showReplayResult(winner, reason);
                 });
             }
         });
@@ -746,6 +760,10 @@ public class ReplayModeDialog {
             player.detachListener();
             player.stop();
         }
+        // 与观战退出（returnToLanMain → dismissOpenGameDialogs）同口径：先把仍挂在窗口上的
+        // 决斗内弹窗收口，再收决斗场 UI——PopupWindow 不随 layout 隐藏而消失，否则会浮在
+        // 录像选择界面上
+        activity.dismissDuelDialogsForExit();
         hideReplayControls(activity);
         // 退出回放不再直接回主菜单，而是重新打开录像选择界面并还原上次选中的录像：
         // 先做与主菜单显示等价的界面清理（隐藏决斗场/恢复菜单背景/菜单 BGM），

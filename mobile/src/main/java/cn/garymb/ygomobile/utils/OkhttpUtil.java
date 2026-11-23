@@ -47,7 +47,8 @@ public class OkhttpUtil {
 
     public static void get(String address, Map<String, Object> map, String cookie, Callback callback) {
 
-        HttpUrl.Builder httpBuilder = HttpUrl.parse(address).newBuilder();
+        // TX 固定源站（cdntx / cdn02）换成查到的可用节点；其他地址原样，见 TxEndpoint
+        HttpUrl.Builder httpBuilder = HttpUrl.parse(TxEndpoint.resolve(address)).newBuilder();
         if (map != null) {
             for (Map.Entry<String, Object> param : map.entrySet()) {
                 httpBuilder.addQueryParameter(param.getKey(), param.getValue().toString());
@@ -65,7 +66,8 @@ public class OkhttpUtil {
 
     public static Response synchronousGet(String address, Map<String, Object> paramMap, Map<String, String> headers) throws IOException {
 
-        HttpUrl.Builder httpBuilder = HttpUrl.parse(address).newBuilder();
+        // 同 get：只对 cdntx / cdn02 固定源站做可用节点替换
+        HttpUrl.Builder httpBuilder = HttpUrl.parse(TxEndpoint.resolve(address)).newBuilder();
         if (paramMap != null) {
             for (Map.Entry<String, Object> param : paramMap.entrySet()) {
                 httpBuilder.addQueryParameter(param.getKey(), param.getValue().toString());
@@ -124,7 +126,7 @@ public class OkhttpUtil {
         RequestBody requestBody = FormBody.create(MediaType.parse("application/json; charset=utf-8"), json);
         Request.Builder request = new Request.Builder().url(url);//请求的url
         if (TextUtils.isEmpty(json))
-            request.post(okhttp3.internal.Util.EMPTY_REQUEST);
+            request.post(Util.EMPTY_REQUEST);
         else
             request.post(requestBody);
         if (!TextUtils.isEmpty(cookie)) {
@@ -234,7 +236,7 @@ public class OkhttpUtil {
 
         Request.Builder request = new Request.Builder().url(url);//请求的url
         if (json == null || TextUtils.isEmpty(json)) {
-            request.post(okhttp3.internal.Util.EMPTY_REQUEST);
+            request.post(Util.EMPTY_REQUEST);
         } else {
             RequestBody requestBody = FormBody.create(MediaType.parse("application/json; charset=utf-8"), json);
             request.post(requestBody);

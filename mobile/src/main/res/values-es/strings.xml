@@ -40,16 +40,15 @@
     <string name="fetch_online_deck">Obtener decks online</string>
     <string name="fetch_ex_card">Obtener cartas pre-lanzadas</string>
     <string name="ex_card_list_title">Servidor exclusivo de cartas pre-lanzadas</string>
-    <string name="ex_card_log_title">Registro de actualizaciones</string>
-    <string name="ex_card_report_title">Comentarios</string>
     <string name="ex_card_check_toast_message">Las cartas pre-lanzadas no están activadas. Puedes encontrar cartas desconocidas en este servidor. Se recomienda activarlas antes de entrar.</string>
     <string name="ex_card_check_toast_message_ii">Las cartas pre-lanzadas no están descargadas. Puedes encontrar cartas desconocidas en este servidor. Se recomienda descargarlas antes de entrar.</string>
-    <string name="ex_card_check_toast_message_iii">No se obtuvieron las cartas pre-lanzadas. Redirigiendo al sitio web oficial.</string>
+    <string name="ex_card_check_toast_message_iii">No se obtuvieron las cartas pre-lanzadas. Inténtelo de nuevo más tarde.</string>
     <!-- settings -->
     <string name="settings_about">Acerca de</string>
     <string name="settings_about_sub_about">Acerca de</string>
     <string name="settings_game_enable_sound_effect">Habilitar efectos de sonido</string>
     <string name="settings_game_screen_orientation">Bloquear pantalla horizontal</string>
+    <string name="settings_game_portrait_orientation">Bloquear pantalla vertical</string>
     <string name="settings_game_font_antialias">Suavizado de fuentes</string>
     <string name="settings_game_lab_pendulum_scale">Imágenes de escala de péndulo</string>
     <string name="settings_game_font_antialias_summary">Desactivar el suavizado puede mejorar el rendimiento</string>
@@ -175,6 +174,13 @@
     <string name="file_exist">El archivo ya existe</string>
     <string name="share_deck">Compartir</string>
     <string name="code_share">Compartir código del deck</string>
+    <string name="ask_idle_cmd_label">Confirmar antes de invocar, colocar o activar péndulos</string>
+    <string name="ask_cmd_summon_confirm" formatted="false">¿Quieres invocar [%s]?</string>
+    <string name="ask_cmd_set_confirm" formatted="false">¿Quieres colocar [%s] boca abajo?</string>
+    <string name="ask_cmd_pendulum_confirm" formatted="false">¿Quieres activar [%s] en la Zona de Péndulo?</string>
+    <string name="settings_pendulum_activate_btn">Botón independiente de activación de escala de péndulo</string>
+    <string name="cmd_pendulum_activate">Activar en la Zona de Péndulo</string>
+    <string name="cmd_activate_monster_effect">Activar efecto de monstruo</string>
     <string name="screenshoot">Compartir imagen</string>
     <string name="ydk_share">Compartir archivo</string>
     <string name="no_share_app">No se encontró la aplicación para compartir</string>
@@ -189,7 +195,12 @@
     <string name="refresh">Actualizar</string>
     <string name="select_deck">Elige un deck</string>
     <string name="solo_mode">Modo solo</string>
+    <string name="bot_p2_deck_label">Deck del P2:</string>
+    <string name="bot_tag_max_select">El modo TAG permite elegir hasta 3 IAs. Toca un elemento ya seleccionado para cancelarlo antes de cambiarlo.</string>
+    <string name="bot_favorite_added">%1$s añadido a favoritos, movido al principio de la lista</string>
+    <string name="bot_favorite_removed">%1$s eliminado de favoritos, ha vuelto a su posición original</string>
     <string name="quit_deck_tip">El deck no está guardado, ¿Salir de la aplicación?</string>
+    <string name="deck_discard_switch_tip">Se descartarán los cambios del deck actual, ¿continuar?</string>
     <string name="deck_delete_text">Arrastra aquí para eliminar</string>
     <string name="question_keep_cur_deck">¿Mantener las cartas actuales?</string>
     <string name="check_choose_file" formatted="false">¿Confirmar la selección de %s?</string>
@@ -256,9 +267,6 @@
     <string name="Join_QQ">Grupo de soporte</string>
     <string name="about_Join_QQ">Únete al grupo de soporte si tienes algún problema</string>
     <string name="donatefor">Tus donaciones se usarán para mantener actualizaciones, recopilar datos, editar imágenes y comprar dispositivos de prueba.</string>
-    <string name="coverSelect">Toca para elegir la cubierta de la carta</string>
-    <string name="bgSelect">Toca para elegir el fondo</string>
-    <string name="avatarSelect">Toca para elegir el ávatar</string>
     <string name="ClickLinkArrows">Activar flechas</string>
     <string name="tip_no_permission" formatted="false">El permiso %s está desactivado</string>
     <string name="Already_Lastest">No se ha encontrado ninguna nueva versión. ¿Por qué no revisas las actualizaciones del autor para más detalles?</string>
@@ -274,6 +282,23 @@
     <string name="Download_Precard_Failed">Error al descargar cartas pre-lanzadas</string>
     <string name="Pre_Server_Name">Servidor MyCard de cartas pre-lanzadas</string>
     <string name="Ask_to_Change_Other_Way">Error en la conexión principal, intentando con otra ruta...</string>
+    <string name="superpre_inc_checking">Consulta</string>
+    <string name="superpre_inc_comparing">Leyendo</string>
+    <string name="superpre_inc_requesting">Pidiendo</string>
+    <string name="superpre_inc_downloading">%1$d%%</string>
+    <string name="superpre_inc_retry_network">Sin red</string>
+    <string name="superpre_inc_retry_server">Servidor</string>
+    <string name="superpre_inc_merging">Uniendo</string>
+    <string name="superpre_inc_start">Actualización incremental: %1$d archivos (%2$s)</string>
+    <string name="superpre_inc_fallback">La actualización incremental no está disponible (problema del servidor o de los datos). ¿Descargar el paquete completo?</string>
+    <string name="superpre_inc_network_failed">Fallo de red. Se conservan los %1$s ya descargados; pulsa Descargar de nuevo cuando vuelva la conexión</string>
+    <string name="superpre_inc_network_failed_nothing_kept">Fallo de red. Pulsa Descargar de nuevo cuando vuelva la conexión</string>
+    <string name="superpre_inc_try_later">Se está publicando una nueva versión de las cartas pre-lanzadas. Inténtalo de nuevo en unos minutos</string>
+    <string name="superpre_inc_long_press_tip">Mantén pulsado el botón de descarga para elegir la descarga completa.</string>
+    <string name="superpre_inc_choose_title">Elige cómo descargar</string>
+    <string name="superpre_inc_choose_message">Incremental: descarga los archivos que cambiaron.\nCompleta: vuelve a descargar todo el paquete, como antes.</string>
+    <string name="superpre_inc_choose_incremental">Incremental</string>
+    <string name="superpre_inc_choose_full">Descarga completa</string>
     <string name="DuelAssistant">Asistente de duelo activado</string>
     <string name="masterrule">Aprender reglas avanzadas</string>
     <string name="tutorial">Ver tutorial</string>
@@ -291,6 +316,7 @@
     <string name="searchresult">Resultado</string>
     <string name="Pre_share">Preparando para compartir, espera...</string>
     <string name="category_pack">Paquetes</string>
+    <string name="label_release_date">Fecha de lanzamiento</string>
     <string name="category_windbot_deck">Decks I.A.</string>
     <string name="category_Uncategorized">Sin categoría</string>
     <string name="please_input_category_name">Ingresa el nombre de la nueva categoría</string>
@@ -333,7 +359,7 @@
     <string name="guide_search_result_count">Muestra el número de resultados</string>
     <string name="guide_button_search_result">Toca para ver resultados\nPor defecto muestra cartas favoritas</string>
     <string name="guide_view_deck_manager">Toca para cambiar decks\ny gestionar categorías</string>
-    <string name="guide_view_move_card">Arrastra cartas para moverlas\nMantén presionado para eliminar</string>
+    <string name="guide_view_move_card">Arrastra cartas para moverlas\nMantén pulsada una carta para entrar en modo por lotes: mover o eliminar en grupo</string>
     <string name="guide_view_banner">Noticias de MyCard, toca para ver detalles</string>
     <string name="title_delete_ex">Eliminar paquete de expansión</string>
     <string name="ask_delete_ex">Toca para confirmar</string>
@@ -390,6 +416,9 @@
     <string name="tip_drag_side_full" formatted="false">El side deck está lleno (máx. %d)</string>
     <string name="tip_drag_extra_in_main">Las cartas del mazo extra no pueden colocarse en el mazo principal</string>
     <string name="tip_drag_normal_in_extra">Las cartas normales no pueden colocarse en el mazo extra</string>
+    <string name="batch_delete_done" formatted="false">%d cartas eliminadas</string>
+    <string name="batch_delete_none">No hay cartas marcadas</string>
+    <string name="batch_mode_exit">Lote</string>
     <string name="point_cost">Consumo de puntos</string>
     <string name="credit_limit">Límite de puntos</string>
     <string name="switch_genesys_mode">GENESYS</string>
@@ -496,6 +525,7 @@
     <string name="resource_lflist">· Lista de prohibidas</string>
     <string name="resource_strings">· Configuración de textos</string>
     <string name="resource_pics">· Archivo de imágenes de cartas</string>
+    <string name="resource_scripts">· Archivo de scripts</string>
 
     <!-- ajustes de imagen y pantalla -->
     <string name="follow_bilibili">Seguir feed de Bilibili</string>
@@ -508,13 +538,37 @@
     <string name="quality_high">Alta</string>
     <string name="settings_opengl_version">Versión de OpenGL</string>
     <string name="settings_screen_padding_summary">Margen de pantalla</string>
-    <string name="settings_native_game_mode">Modo de juego UI nativa</string>
+    <string name="settings_native_game_mode">Laboratorio: Nueva UI de juego</string>
     <string name="settings_native_game_mode_summary">Más funciones que la versión original</string>
 
     <!-- System Strings for UI Localization (index 1740+) -->
     <string name="spectator_skip_to_current">Al actual</string>
     <string name="refresh_lan_button">Actualizar LAN</string>
     <string name="mode_single_duel_solo">Modo solo</string>
+
+    <!-- Aviso de efectos aplicados (insignia dorada de exclamación en el avatar y su lista desplegable) -->
+    <string name="applying_effects_title">Efectos aplicados</string>
+    <string name="applying_effects_self">Mis efectos aplicados</string>
+    <string name="applying_effects_opponent">Efectos aplicados del rival</string>
+    <string name="applying_effect_scope_turn">Este turno</string>
+    <string name="applying_effect_scope_duel">Todo el duelo</string>
+    <!-- /ai 人机召唤 UI -->
+    <string name="btn_ai_summon">/ai (Llamar Bot)</string>
+    <string name="ai_deck_select_title">Decks de IA para %1$s</string>
+    <string name="ai_deck_random">Aleatorio - Sin especificar</string>
+    <string name="ai_deck_empty">No hay decks de IA compatibles con la lista de prohibidas actual</string>
+    <string name="cancel">Cancelar</string>
+    <string name="sort_rule_time">Tiempo↓</string>
+    <!-- Títulos de sección de resultados -->
+    <string name="section_title_star">Nv%1$d</string>
+    <string name="section_title_link">LINK-%1$d</string>
+    <string name="section_title_spell">Mágica</string>
+    <string name="section_title_trap">Trampa</string>
+    <string name="section_title_other">Otro</string>
+    <string name="section_title_digits">Números</string>
+    <string name="section_title_year">%1$d</string>
+    <string name="section_title_unknown">Desconocido</string>
+    <string name="section_title_with_count">%1$s · %2$d cartas</string>
 </resources>
 
 

@@ -32,7 +32,6 @@ public final class FieldHudRenderer {
     private static final int STAT_CYAN_LIGHT = YGOUtil.c(R.color.stat_cyan_light);
     private static final int XYZ_PINK = YGOUtil.c(R.color.xyz_level_pink);
     private static final int STAT_DOWN_PINK = YGOUtil.c(R.color.stat_decrease_pink);
-    private static final int SHADOW_C0 = YGOUtil.c(R.color.black_c0);
     private static final int SHADOW_BLACK = YGOUtil.c(R.color.black);
 
     private final GameFieldView view;
@@ -40,6 +39,8 @@ public final class FieldHudRenderer {
     /** CardType.Xyz = 0x800000（阶级玫红）、CardType.Tuner = 0x1000（等级黄），对齐 drawing.cpp DrawStatus */
     private static final int TYPE_XYZ = 0x800000;
     private static final int TYPE_TUNER = 0x1000;
+    /** CardType.Pendulum = 0x1000000（灵摆怪才显示刻度数字） */
+    private static final int TYPE_PENDULUM = 0x1000000;
 
     // === 多色自适应宽度 HUD 文字（ATK/DEF、等级/阶级、灵摆刻度）===
     // 与 makeNumberBitmap 的区别：位图宽度随文本增长而非缩放字号，
@@ -55,13 +56,24 @@ public final class FieldHudRenderer {
     private static final int ALIGN_RIGHT = 2;
     /** 攻守/等级数字尺寸 */
     private static final float STAT_SIZE_SCALE = 0.85f;
-    private static final float STAT_SNUG_PX = 2f;
     /** 非当前表示侧数值缩小一号的字号系数（攻击表示下的守备力 / 守备表示下的攻击力） */
     private static final float SMALL_STAT_SCALE = 0.8f;
-    /** 灵摆刻度/怪兽等级数字抬升系数（×字高 hpx）：把文字从「竖中心坐在顶角」上移到「底边坐在顶角」，
-     *  使文字抬高到卡片矩形顶点外缘、与同角位的可发动绿点对齐。正交屏 y 向下，故沿顶角背离
-     *  卡片中心的一侧偏移。 */
-    private static final float SCALE_TOP_LIFT = 0.5f;
+    /** HUD 数字的纯黑描边宽度（64 高、{@link #STAT_TEXT_SIZE} 字号的位图空间像素）；
+     *  用户规格：攻守数字阴影改为黑色——旧的 3px 模糊黑阴影在浅色卡图上晕成一圈灰光，
+     *  白色数字反而发虚，故改为纯黑实描边垫底，边缘干净不晕灰。
+     *  堆叠区数量数字（{@link #makeNumberBitmap}）复用同一描边规格。 */
+    private static final float STAT_OUTLINE_W = 5f;
+    /**
+     * 灵摆刻度数字下沉系数（×字高 hpx）：正交屏 y 向下，把刻度数字中心从灵摆卡「屏幕顶角顶点」
+     * 往卡面内（屏幕下方）下沉 hpx×{@code SCALE_TOP_SINK}。
+     * <p>
+     * 用户规格：刻度数字下降，同列怪兽的攻守数字不再避让上抬、回到默认位置，两者改由灵摆卡自身
+     * 顶边分层。MR4 怪兽行 1.4 与魔陷行 2.6 相邻（卡片竖向 CARD_H/2 后两边正好接上），攻守数字
+     * 居中压在这条共边上，其可见下沿约到线下 0.05·hpx；刻度数字位图内可见半高≈0.24·hpx，故中心
+     * 需沉到线下 ≥0.29·hpx 才互不遮挡，取 0.5 留余量。落点约在卡顶往下 15% 卡高处，与 MR3 烘焙
+     * 进卡图的刻度（基线 0.13·卡高）同带。观感需微调只改本常量。
+     */
+    private static final float SCALE_TOP_SINK = 0.5f;
 
     /** 横屏 HUD 数字放大（用户真机反馈：横屏决斗场放大后对方（远端）卡片投影偏小，其 ATK/DEF /
      *  卡组数量统计等数字随之缩得很小难读）：把 clamp 后的字高向可读上限回拉——远端小数字增幅明显，
@@ -205,13 +217,13 @@ public final class FieldHudRenderer {
                 try { c = mz.get(seq); } catch (Throwable e) { continue; }
                 if (c == null || c.is_moving) continue;
                 if (c.isFaceUp()) {
-                    drawMonsterStatTexts(p, seq, c);
+                    drawMonsterStatTexts(f, p, seq, c);
                 } else if (c.displayCode() > 0 && hasStatText(c)) {
                     // 用户规格：里侧守备表示的怪兽若卡码已公开（POS_REVEAL 解遮蔽 / 泡影类
                     // MSG_POS_CHANGE 携真实码，经 displayCode() 取到），则同表侧一样显示那只怪兽
                     // 在通讯中的攻击力/守备力文本；里侧卡仍不显示等级等其它文本（见
                     // drawMonsterStatTexts 的 c.isFaceUp() 门控），且守备表示自然使攻击力缩小一号
-                    drawMonsterStatTexts(p, seq, c);
+                    drawMonsterStatTexts(f, p, seq, c);
                 }
             }
             drawPendulumScaleText(f, p, mr4 ? 0 : 6, true);
@@ -220,7 +232,7 @@ public final class FieldHudRenderer {
         GLES30.glEnable(GLES30.GL_DEPTH_TEST);
     }
 
-    private void drawMonsterStatTexts(int p, int seq, ClientCard c) {
+    private void drawMonsterStatTexts(GameField f, int p, int seq, ClientCard c) {
         float[] r = GameField.getZoneRect(p, 0x04, seq);
         if (r == null) return;
         float cx = r[0], cy = r[1];
@@ -271,6 +283,7 @@ public final class FieldHudRenderer {
                     ? new float[]{SMALL_STAT_SCALE, 1f, 1f}
                     : new float[]{1f, 1f, SMALL_STAT_SCALE};
         }
+        // 用户规格：攻守数字恒在默认位置（居中压在怪兽卡朝魔陷区的边线上），不再为同列刻度上抬避让
         drawScreenText(edgeX, edgeY, parts, colors, boldFlags, scales, hpx);
 
         // 等级(L*/调律黄/阶级玫红)锚定攻击表示卡片矩形的角顶点（不随守备旋转移动）：
@@ -295,15 +308,15 @@ public final class FieldHudRenderer {
         }
     }
 
-    /** 灵摆刻度数字：贴卡片矩形屏幕外侧顶角顶点（左侧卡=左上角、右侧卡=右上角），
-     *  与 {@link CardOverlayRenderer} 绿点角位互补（右侧卡绿点让位到左上角）。
+    /** 灵摆刻度数字：锚在卡片矩形屏幕顶角顶点并向卡面内下沉（左侧卡=左上角、右侧卡=右上角），
+     *  与 {@link cn.garymb.ygomobile.render.card.CardOverlayRenderer} 绿点角位互补（右侧卡绿点让位到左上角）。
      *  屏幕侧按格子中心 mirrorX 后与场地中轴比较；守备表示卡片足迹 hx/hy 对调；
      *  字号与攻守文字同源（CARD_H 竖向投影，不受守备旋转影响） */
     private void drawPendulumScaleText(GameField f, int p, int seq, boolean leftScale) {
         ClientCard c;
         try { c = f.players[p].spellZone.get(seq); } catch (Throwable e) { return; }
         if (c == null || !c.isFaceUp() || c.is_moving) return;
-        if ((c.type & 0x1000000) == 0) return;                // CardType.Pendulum
+        if ((c.type & TYPE_PENDULUM) == 0) return;
         if (c.equipTarget != null) return;                    // 对齐 drawing.cpp !equipTarget
         String txt = leftScale ? c.lscString : c.rscString;   // 左区左刻度 / 右区右刻度
         if (txt == null || txt.isEmpty()) return;
@@ -328,12 +341,12 @@ public final class FieldHudRenderer {
         float hpx = scaleHudText(Math.max(10f, Math.min(40f, cardHpx * 0.30f)));
         // 屏幕侧：格子中心 mirrorX 后 > 中轴 = 屏幕左（我方 seq0/5、对方 seq6/7 带），
         // < 中轴 = 屏幕右（我方 seq6/7 带、对方 seq0/5）；左侧卡贴左上角顶点左对齐、
-        // 右侧卡贴右上角顶点右对齐；再把文字上移 hpx×SCALE_TOP_LIFT，使其底边坐在顶角顶点上（抬高到顶点）
+        // 右侧卡贴右上角顶点右对齐；再把文字下移 hpx×SCALE_TOP_SINK 沉入卡面内，让开默认位的攻守数字
         boolean screenLeft = FieldGeometry.mirrorX(cx) > FieldGeometry.FIELD_CENTER_X;
         float[] corner = screenLeft ? screenTopLeft : screenTopRight;
         int align = screenLeft ? ALIGN_LEFT : ALIGN_RIGHT;
         // 刻度白色（对齐 drawing.cpp 灵摆刻度 0xffffffff）
-        drawScreenTextAligned(corner[0], corner[1] - hpx * SCALE_TOP_LIFT,
+        drawScreenTextAligned(corner[0], corner[1] + hpx * SCALE_TOP_SINK,
                 new String[]{txt}, new int[]{HUD_WHITE}, hpx, align);
     }
 
@@ -367,6 +380,12 @@ public final class FieldHudRenderer {
         return id != null ? id : -1;
     }
 
+    /**
+     * 单色数字位图（堆叠区数量 / 总攻击力数字共用）：与 {@link #makeColoredTextBitmap} 的攻守数字
+     * 同款纯黑描边。旧实现用 3px 模糊黑阴影，浅色卡背/浅色场地上会晕成一圈灰光、黄色数字发虚；
+     * 用户规格：卡组/额外/墓地/除外数量统计也需要与攻守数字一致的黑色描边，故改为整圈纯黑实描边
+     * 垫底、再填色，任意底色上都清晰。
+     */
     private static Bitmap makeNumberBitmap(String text, int color) {
         int w = 128, h = 64;
         Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
@@ -376,10 +395,17 @@ public final class FieldHudRenderer {
         p.setFakeBoldText(true);
         float tw = p.measureText(text);
         if (tw > w * 0.92f) p.setTextSize(44f * (w * 0.92f) / tw);
-        p.setColor(color | 0xFF000000);
         p.setTextAlign(Paint.Align.CENTER);
-        p.setShadowLayer(3f, 1f, 1f, SHADOW_C0);
-        cv.drawText(text, w / 2f, h / 2f - (p.ascent() + p.descent()) / 2f, p);
+        float baseline = h / 2f - (p.ascent() + p.descent()) / 2f;
+        // 先整圈纯黑描边垫底（与攻守数字同款纯黑硬边，不再发灰），再填数字颜色
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        p.setStrokeWidth(STAT_OUTLINE_W);
+        p.setColor(SHADOW_BLACK);
+        cv.drawText(text, w / 2f, baseline, p);
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(color | 0xFF000000);
+        cv.drawText(text, w / 2f, baseline, p);
         return bmp;
     }
 
@@ -452,18 +478,36 @@ public final class FieldHudRenderer {
         Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         Canvas cv = new Canvas(bmp);
         p.setTextAlign(Paint.Align.LEFT);
-        p.setShadowLayer(3f, 1f, 1f, SHADOW_BLACK);
         // 基线恒按满字号粗体求解，缩小段与正常段共用同一基线（底部对齐，缩小数字视觉上像下标）
         p.setTextSize(STAT_TEXT_SIZE);
         p.setFakeBoldText(true);
         float baseline = h / 2f - (p.ascent() + p.descent()) / 2f;
+        // 逐段位置预计算：描边与填色两遍共用（后段的描边不会压掉前段已画好的字面）
+        float[] xs = new float[parts.length];
         float x = (w - tw) / 2f;
+        for (int i = 0; i < parts.length; i++) {
+            xs[i] = x;
+            p.setTextSize(STAT_TEXT_SIZE * partScale(scales, i));
+            p.setFakeBoldText(boldFlags != null && i < boldFlags.length && boldFlags[i]);
+            x += p.measureText(parts[i]);
+        }
+        // 用户规格：攻守数字阴影改为纯黑。先整圈纯黑描边垫底、再逐段填色，取代原先的 3px 模糊阴影，
+        // 数字边缘为硬黑、不再有一圈发灰的光晕，浅色卡图/场地上白色数字也能看清
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        p.setStrokeWidth(STAT_OUTLINE_W);
+        p.setColor(SHADOW_BLACK);
+        for (int i = 0; i < parts.length; i++) {
+            p.setTextSize(STAT_TEXT_SIZE * partScale(scales, i));
+            p.setFakeBoldText(boldFlags != null && i < boldFlags.length && boldFlags[i]);
+            cv.drawText(parts[i], xs[i], baseline, p);
+        }
+        p.setStyle(Paint.Style.FILL);
         for (int i = 0; i < parts.length; i++) {
             p.setColor(colors[i] | 0xFF000000);
             p.setTextSize(STAT_TEXT_SIZE * partScale(scales, i));
             p.setFakeBoldText(boldFlags != null && i < boldFlags.length && boldFlags[i]);
-            cv.drawText(parts[i], x, baseline, p);
-            x += p.measureText(parts[i]);
+            cv.drawText(parts[i], xs[i], baseline, p);
         }
         return bmp;
     }

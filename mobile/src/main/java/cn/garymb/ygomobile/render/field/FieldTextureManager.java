@@ -18,6 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import ocgcore.CardManager;
+import ocgcore.data.Card;
+import ocgcore.DataManager;
 
 /**
  * 纹理管理（多线程：工作线程解码 → GL 线程上传），由 GameFieldView 的「纹理」分栏拆出。
@@ -42,6 +45,8 @@ public final class FieldTextureManager {
     private static final long COVER_OPP_KEY = -2L;
     /** unknown.jpg 纹理的专用缓存键（负数键与 COVER_* 同一命名空间，避开真实卡码） */
     private static final long UNKNOWN_KEY = -3L;
+    /** negated.png 无效徽记纹理的共享缓存键：场地标注格底（FieldBoardRenderer）与卡面无效角标（CardOverlayRenderer）为同一张贴图，须同键只上传一张纹理 */
+    public static final long NEGATED_TEX_KEY = -5L;
 
     public static class PendingUpload {
         final long key;
@@ -233,12 +238,12 @@ public final class FieldTextureManager {
      */
     private static boolean isUnknownToCardTable(int code) {
         try {
-            ocgcore.CardManager cm = ocgcore.DataManager.get().getCardManager();
+            CardManager cm = DataManager.get().getCardManager();
             if (cm == null || cm.getCount() == 0) return false;
-            android.util.SparseArray<ocgcore.data.Card> table = cm.getAllCards();
+            android.util.SparseArray<Card> table = cm.getAllCards();
             int idx = table.indexOfKey(code);
             if (idx < 0) return true;
-            ocgcore.data.Card c = table.valueAt(idx);
+            Card c = table.valueAt(idx);
             return c == null || c.Type == 0;
         } catch (Throwable t) {
             return false;

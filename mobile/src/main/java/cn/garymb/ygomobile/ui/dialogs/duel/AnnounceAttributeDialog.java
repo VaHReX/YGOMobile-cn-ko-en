@@ -69,12 +69,16 @@ public class AnnounceAttributeDialog {
         dialog.show();
     }
 
-    /** 退出对战时关闭可能残留的宣言属性弹窗（由 ShowDialogUtil.dismissAnnounceDialogs 调用） */
-    public static void dismissCurrent() {
-        if (current != null) {
-            current.dismiss();
-            current = null;
-        }
+    /**
+     * 退出对战/撤回瞬间关闭可能残留的宣言属性弹窗（由 ShowDialogUtil.dismissAnnounceDialogs 调用）。
+     *
+     * @return 本次是否真的关闭了一个在显弹窗（撤回路径据此判断需不需按询问快照重建）
+     */
+    public static boolean dismissCurrent() {
+        if (current == null) return false;
+        current.dismiss();
+        current = null;
+        return true;
     }
 
     /** 选择类标题：优先用 selectHint，消费后清零（链式访问，不导入 game 类）。 */
@@ -208,6 +212,14 @@ public class AnnounceAttributeDialog {
         }
     }
 
+    /** 弹窗出现提示音（对齐 C++ Game::PopupElement → SoundManager::PlayDialogSound：wANAttribute → QUESTION） */
+    private void playQuestionSound() {
+        if (context instanceof YGOProActivity) {
+            SoundManager sm = ((YGOProActivity) context).getSoundManager();
+            if (sm != null) sm.playSoundEffect(SoundManager.SFX.QUESTION);
+        }
+    }
+
     private void playButtonSound() {
         if (context instanceof YGOProActivity) {
             SoundManager sm = ((YGOProActivity) context).getSoundManager();
@@ -249,6 +261,7 @@ public class AnnounceAttributeDialog {
                 // 输入法抬升联动（用户规格）：抬键盘时本弹窗底边贴聊天输入框上沿，
                 // 收起后回到 layout_game_right 中央，逻辑统一在 ImePopupAdjuster
                 ImePopupAdjuster.attach(popupWindow);
+                playQuestionSound();   // 宣言窗弹出响 question 音（对齐 PlayDialogSound）
             } catch (Exception e) {
                 // Token expired or window already showing
             }

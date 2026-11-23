@@ -1,4 +1,5 @@
 package cn.garymb.ygomobile.game.gamefield;
+import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.game.engine.GameEngine;
 
 import android.animation.ValueAnimator;
@@ -21,10 +22,13 @@ import android.widget.PopupWindow;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.function.Consumer;
 
 import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.YGOProActivity;
 import cn.garymb.ygomobile.lite.R;
+import cn.garymb.ygomobile.render.card.CardDetailPanel;
 import cn.garymb.ygomobile.render.gamefieldview.GameFieldView;
 import cn.garymb.ygomobile.render.field.TextureLoader;
 import cn.garymb.ygomobile.utils.YGOUtil;
@@ -48,6 +52,111 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
      */
     public GameTopInfoManager(YGOProActivity activity, Handler mainHandler) {
         super(activity, mainHandler);
+        // 引擎派发线程在发动登记/回合轮转/开局胜负/撤回回退/换视角后只能拿到静态入口
+        //（同 CardDetailPanel.refreshCardDetailMarks 的约定）：经最新实例回到主线程刷徽标
+        sLive = this;
+    }
+
+    /** 当前活动的顶部信息条实例（旋转重建/重进决斗时由新构造覆盖） */
+    private static GameTopInfoManager sLive;
+
+    /**
+     * 持续适用中效果徽标的统一刷新入口（引擎派发线程与主线程均可调）：重新解算两侧条目并切徽标
+     * 闪动。调用点与卡详已发动标记完全同源（MSG_CHAINING 登记 / MSG_NEW_TURN / MSG_START / MSG_WIN /
+     * 撤回回退 / 视角互换），叠加召唤成功（*SUMMONED，召唤誓约不入连锁只能跟召唤事件走）与
+     * 链无效（MSG_CHAIN_NEGATED / MSG_CHAIN_DISABLED），
+     * 保证两处对「哪些效果还在适用」的口径不会分叉。
+     * <p>合批：一次事件可能连投多次请求，remove+post 只留最后一次真跑（与
+     * {@link ApplyingEffectsPopup#show} 的条目指纹短路同一目的，避免重复重解与重复刷窗）。
+     */
+    public static void refreshApplyingEffects() {
+        GameTopInfoManager m = sLive;
+        if (m == null) return;
+        m.mainHandler.removeCallbacks(m.applyingRefreshTask);
+        m.mainHandler.post(m.applyingRefreshTask);
+    }
+
+    /** {@link #refreshApplyingEffects()} 的实体（持有固定对象引用才能被 removeCallbacks 命中） */
+    private final Runnable applyingRefreshTask = this::refreshApplyingEffectsNow;
+
+    /**
+     * 主线程解算并落地：两侧条目缓存→徽标闪动→已展开的下拉列表同步。列表是两侧同展的两份面板，
+     * 故只要任一侧还有条目就原地刷新两份（条目为空的那侧自己收掉它的窗口），两侧都空才整体收起。
+     */
+    private void refreshApplyingEffectsNow() {
+        // 引擎权威来源（用户新规格）：解算前按各侧场上卡的 descHints（CHINT_DESC_ADD/REMOVE 维护）
+        // 采一份在场持续效果快照，连同两本账本一并交给解算器——黑点子效果只有引擎上报的 offset 能定位
+        // 到具体哪条在适用，纯文本无从区分；引擎未上报时该来源为空，行为回退到既有账本解算。
+        // 同时采一份该侧场上「效果被无效」的卡码（用户规律 6/7：『…召唤成功的回合』『…特殊召唤（成功）
+        // 过的回合』属在场上适用的效果，卡被无效期间不列，无效解除后下一次解算自行恢复）
+        GameField field = activity.getEngine() != null ? activity.getEngine().getField() : null;
+        applyingMe = ContinuousEffectApplier.forSide(0, field != null ? field.collectApplyingHints(0) : null,
+                field != null ? field.collectNegatedCodes(0) : null);
+        applyingOpp = ContinuousEffectApplier.forSide(1, field != null ? field.collectApplyingHints(1) : null,
+                field != null ? field.collectNegatedCodes(1) : null);
+        setApplyingPrompt(0, !applyingMe.isEmpty());
+        setApplyingPrompt(1, !applyingOpp.isEmpty());
+        if (applyingPopup == null || !applyingPopup.isShowing()) return;
+        // 用户新规格：两侧列表同时展开，只要有一侧还有条目就原地刷新两份面板；两侧都空才整体收起
+        if (applyingMe.isEmpty() && applyingOpp.isEmpty()) {
+            applyingPopup.dismiss();
+            return;
+        }
+        openApplyingPopup();
+    }
+
+    /**
+     * 徽标点击：展开态下再点任一侧徽标即两侧一并收起；否则同时展开我方与对方两份列表
+     *（用户新规格：点我方或对方头像下的感叹号都把双方列表一起显示，但各自贴本侧血条下方、
+     * 各自带本侧标题，不混排进被点击侧的单一列表）。两侧都无条目时先重算一次再判。
+     */
+    private void onApplyingBadgeClick() {
+        if (applyingPopup != null && applyingPopup.isShowing()) {
+            applyingPopup.dismiss();
+            return;
+        }
+        if (applyingMe.isEmpty() && applyingOpp.isEmpty()) {
+            // 解算缓存为空（如进决斗前首次点击）：先重算一次再判，避免徽标在而列表空
+            refreshApplyingEffectsNow();
+            if (applyingMe.isEmpty() && applyingOpp.isEmpty()) return;
+        }
+        openApplyingPopup();
+    }
+
+    /** 同时展开双方列表（我方贴我方血条面板、对方贴对方血条面板，均锚 layout_top_info 下缘；
+     *  已在展示的一侧只原地刷新行，条目为空的一侧不建窗口） */
+    private void openApplyingPopup() {
+        if (applyingPopup == null) {
+            applyingPopup = new ApplyingEffectsPopup(activity, activity.getImageLoader());
+            // 行点击→卡详面板（用户新规格）：列表只给时长语子句，完整效果文本与已打勾的
+            // 序号段落回卡详看（与点场上卡/点询问窗卡图同一展示态路径）
+            applyingPopup.setOnCardClick(this::showApplyingEffectCardDetail);
+        }
+        applyingPopup.show(layoutTopInfo, layoutPlayerPanel, layoutOpponentPanel,
+                applyingMe, applyingOpp, hudScaleFactor);
+    }
+
+    /**
+     * 列表行点击→在 carddetailpanel 展示该卡详情与已标记的序号效果文本（用户新规格）：
+     * 账本只记 卡码×半场×段落序，不带坐标，故按卡码合成携带归属半场的临时 ClientCard
+     * （同 CardSelectController.showCardInfoFromItem / YesOrNoDialog.bindCardDetailClick 口径）：
+     * 走 ClientCard 路径才能让 binder 按 displayedSide 取账本标记（我方绿勾/对方红勾）
+     * 与可发动呼吸条目；改传 Card 则按双方合并展示（side=-1）并丢掉半场归属。
+     */
+    private void showApplyingEffectCardDetail(int code, int side) {
+        if (code <= 0) return;
+        CardDetailPanel panel = activity.getCardDetailPanel();
+        if (panel == null) return;
+        ClientCard cc = new ClientCard();
+        cc.code = code & 0x7fffffff;
+        // side 已是本地索引（0=我方），binder 直接据此定 displayedSide，不再经 localPlayer 换算
+        cc.controler = side == 1 ? 1 : 0;
+        // 账本不带区域坐标：location/sequence 置 0 即可，详情面板全按卡表原值渲染，
+        // 且 showCard(ClientCard) 不读这两个字段（仅 displayCode/controler 参与绑定）
+        cc.location = 0;
+        cc.sequence = 0;
+        cc.position = 0x1;
+        panel.showCard(cc);
     }
 
     /** 统一初始化 layout_top_info 全部视图（由 YGOProActivity.initViews 调用） */
@@ -62,6 +171,8 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
         ivOpponentAvatar = activity.findViewById(R.id.iv_opponent_avatar);
         layoutPlayerAvatarBox = activity.findViewById(R.id.layout_player_avatar_box);
         layoutOpponentAvatarBox = activity.findViewById(R.id.layout_opponent_avatar_box);
+        layoutPlayerBarBox = activity.findViewById(R.id.layout_player_bar_box);
+        layoutOpponentBarBox = activity.findViewById(R.id.layout_opponent_bar_box);
         ivPlayerAvatarFrame = activity.findViewById(R.id.iv_player_avatar_frame);
         ivPlayerBarFrame = activity.findViewById(R.id.iv_player_bar_frame);
         ivOpponentAvatarFrame = activity.findViewById(R.id.iv_opponent_avatar_frame);
@@ -86,6 +197,16 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
         }
         ivPlayerCardBack = activity.findViewById(R.id.iv_player_card_back);
         ivOpponentCardBack = activity.findViewById(R.id.iv_opponent_card_back);
+        ivPlayerApplying = activity.findViewById(R.id.iv_player_applying);
+        ivOpponentApplying = activity.findViewById(R.id.iv_opponent_applying);
+        // 徽标点击同时展开两侧持续适用中效果列表（initViews 可随旋转重建重入，故需重新挂监听）
+        if (ivPlayerApplying != null) ivPlayerApplying.setOnClickListener(v -> onApplyingBadgeClick());
+        if (ivOpponentApplying != null) ivOpponentApplying.setOnClickListener(v -> onApplyingBadgeClick());
+        // 重绑视图树后旧实例的呼吸动画会按字段引用驱动新视图（旋转重建场景）：先整体收口，
+        // 再由 prepareForDisplay 的 refreshApplyingEffects 按当前账本重新点亮
+        resetApplyingHints();
+        applyingMe = Collections.emptyList();
+        applyingOpp = Collections.emptyList();
 
         setupAvatarImages();
         setupCardBackImages();
@@ -106,7 +227,7 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
     }
 
     /** 注册 HUD 缩放系数变化监听；当前值由调用方自行 getHudScaleFactor 取用 */
-    public void addHudScaleObserver(java.util.function.Consumer<Float> observer) {
+    public void addHudScaleObserver(Consumer<Float> observer) {
         if (observer != null) hudScaleObservers.add(observer);
     }
 
@@ -114,7 +235,13 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
     public void reset() {
         stopTimer();
         stopUndoPulse();
-        setPlayerDisplay(0, cn.garymb.ygomobile.Constants.PlayerName, DEFAULT_LP_TEXT);
+        // 新一局/重进决斗：上一局的持续适用条目不再成立，徽标与下拉列表一并收口
+        resetApplyingHints();
+        ContinuousEffectApplier.clearCache();
+        // 卡码→段落模型缓存同步收口：卡包热更/切换语言后按 Card.Desc 引用自动失效，
+        // 这里再于新一局/重进决斗清一次，防长期驻留
+        EffectParagraphLookup.clearCache();
+        setPlayerDisplay(0, Constants.PlayerName, DEFAULT_LP_TEXT);
         setPlayerDisplay(1, "Opponent", DEFAULT_LP_TEXT);
         setTurnText(DEFAULT_TURN_TEXT);
         if (tvPlayerTime != null) tvPlayerTime.setVisibility(View.GONE);
@@ -144,7 +271,7 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
         GameEngine engine = activity.getEngine();
         int startLp = engine != null ? engine.getGameStartLp() : 0;
         if (startLp <= 0) startLp = DEFAULT_MAX_LP;
-        String myName = cn.garymb.ygomobile.Constants.PlayerName;
+        String myName = Constants.PlayerName;
         String oppName = "Opponent";
         if (engine != null) {
             // 统一取视角绑定显示名（对战方 STOC_DUEL_START bindViewNames、回放/残局由各自 runner
@@ -159,11 +286,14 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
         setPlayerDisplay(1, oppName, String.valueOf(startLp));
         updateLpBar(startLp, startLp, ivPlayerLpBar, ivPlayerLpBarLayer, Gravity.START);
         updateLpBar(startLp, startLp, ivOpponentLpBar, ivOpponentLpBarLayer, Gravity.END);
+        // 进决斗 UI 即按当前账本点亮持续适用中效果徽标（旋转/回前台后不等到下一次发动才亮）
+        refreshApplyingEffects();
     }
 
     public void hide() {
         stopTimer();
         stopUndoPulse();
+        resetApplyingHints();
         if (layoutTopInfo != null) layoutTopInfo.setVisibility(View.GONE);
     }
 
@@ -273,8 +403,32 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
      * @param isMyTurn 本地视角：是否为我方回合
      */
     public void updateTurn(int turn, boolean isMyTurn) {
-        setTurnText(String.valueOf(turn));
+        // 与 syncTurnCounter 共用同一个 0 态口径：MSG_RELOAD_FIELD 不带回合数，非撤回触发的 reload
+        // 会把 turnCount 留在 0（只有撤回重同步分支才回填），此时写“0”会顶出一个「第0回合」，
+        // 与新一局开局的同 0 态一样落回默认值
+        setTurnText(turn > 0 ? String.valueOf(turn) : DEFAULT_TURN_TEXT);
         applyTurnHighlight(isMyTurn ? TURN_PLAYER_ME : TURN_PLAYER_OPP);
+    }
+
+    /**
+     * 回合数随场面变更直接重取（观战防漏刷）：原先只有 MSG_NEW_TURN / MSG_NEW_PHASE 两条回调会写
+     * {@code tv_turn_counter}，观战端整条消息链被动画闸门一段段持住时，这两条链路只要有一次没走到
+     * UI，数字就会长时间停在上一处写下的值上（用户反馈的「好几个回合都是第一回合」）。
+     * 本方法在任何一次场面变更后按 {@code field.turnCount} 重取一次，使显示恒与屏幕上真正呈现的局面同源；
+     * 文本未变时不写，避免每帧重绘。
+     * <p>turnCount 为 0（新一局 field.clear() 之后、首个 MSG_NEW_TURN 之前：猜拳、开牌、建堆叠）
+     * 时显式落回 {@link #DEFAULT_TURN_TEXT}：不能“不写”——match 局间不会重走 prepareForDisplay/reset，
+     * 否则顶部会一直挂着上一局的回合数（如第 1 局打到 12 回合，第 2 局开局到首个 NEW_TURN 之间
+     * 就显示 12）；也不写“0”，避免「第0回合」。回合方高亮仍由 {@link #updateTurn} 负责。</p>
+     */
+    public void syncTurnCounter(GameField field) {
+        if (tvTurnCounter == null || field == null) {
+            return;
+        }
+        final String text = field.turnCount > 0 ? String.valueOf(field.turnCount) : DEFAULT_TURN_TEXT;
+        if (!text.contentEquals(tvTurnCounter.getText())) {
+            tvTurnCounter.setText(text);
+        }
     }
 
     // === LP 血条与 LPBarFrame（drawing.cpp L936-973、L996-1003） ===
@@ -338,5 +492,7 @@ public class GameTopInfoManager extends GameTopInfoManagerBase {
         if (tvPlayerLpFloat != null) tvPlayerLpFloat.setVisibility(View.GONE);
         if (tvOpponentLpFloat != null) tvOpponentLpFloat.setVisibility(View.GONE);
         dismissFloatWindow();
+        // 同属 PopupWindow 层的持续适用效果列表一并收起，徽标呼吸动画停掉
+        resetApplyingHints();
     }
 }

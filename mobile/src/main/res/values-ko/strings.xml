@@ -46,16 +46,15 @@
 	    설정 - 권한 - 필요한 권한 얻기를 터치하십시오.</string>
     <string name="fetch_ex_card">웹에서 프리릴리즈 카드 팩 가져오기</string>
     <string name="ex_card_list_title">카드 목록</string>
-    <string name="ex_card_log_title">업데이트 기록</string>
-    <string name="ex_card_report_title">보고</string>
     <string name="ex_card_check_toast_message">이 서버에 들어가기 전에 먼저 설정에서 "프리릴리즈 카드 활성화"을 클릭하십시오.</string>
     <string name="ex_card_check_toast_message_ii">이 서버에 들어가기 전에 먼저 프리릴리즈 카드 팩을 다운로드하십시오.</string>
-    <string name="ex_card_check_toast_message_iii">프리릴리즈 카드를 가져오지 못했습니다. YGO233 사이트에 들어가서 다운로드하십시오.</string>
+    <string name="ex_card_check_toast_message_iii">프리릴리즈 카드를 가져오지 못했습니다. 잠시 후 다시 시도해 주십시오.</string>
     <!-- settings -->
     <string name="settings_about">정보</string>
     <string name="settings_about_sub_about">정보</string>
     <string name="settings_game_enable_sound_effect">게임 사운드 활성화</string>
     <string name="settings_game_screen_orientation">듀얼에서 화면 잠금</string>
+    <string name="settings_game_portrait_orientation">세로 화면 잠금</string>
     <string name="settings_game_font_antialias">폰트 안티 앨리어싱</string>
     <string name="settings_game_lab_pendulum_scale">펜듈럼 스캐일 이미지</string>
     <string name="settings_game_font_antialias_summary">폰트 안트 앨리어싱을 비활성화하면 FPS가 증가할 수 있습니다</string>
@@ -84,6 +83,9 @@
     <string name="tip_drag_side_full" formatted="false">사이드 덱이 가득 찼습니다 (상한 %d)</string>
     <string name="tip_drag_extra_in_main">엑스트라 덱 카드는 메인 덱에 넣을 수 없습니다</string>
     <string name="tip_drag_normal_in_extra">일반 카드는 엑스트라 덱에 넣을 수 없습니다</string>
+    <string name="batch_delete_done" formatted="false">%d장의 카드를 삭제했습니다</string>
+    <string name="batch_delete_none">선택된 카드가 없습니다</string>
+    <string name="batch_mode_exit">다중</string>
     <string name="mycard_server_load_failed">MyCard 환경 불러오기 실패:</string>
     <string name="mycard_join_private_room">비밀 방 입장</string>
     <string name="mycard_private_room">비밀 방</string>
@@ -174,8 +176,8 @@
     <string name="card_result">카드 목록</string>
     <string name="unsort">무작위</string>
     <string name="sort">정렬</string>
-    <string name="loading">로딩 중..."</string>
-    <string name="loading_failed">"로딩 실패"</string>
+    <string name="loading">로딩 중...</string>
+    <string name="loading_failed">로딩 실패</string>
     <string name="question">질문</string>
     <string name="question_delete_deck">덱을 삭제하겠습니까?</string>
     <string name="noname">이름 없음</string>
@@ -199,7 +201,12 @@
     <string name="refresh">새로 고침</string>
     <string name="select_deck">덱을 선택하세요</string>
     <string name="solo_mode">순수 싱글 모드</string>
+    <string name="bot_p2_deck_label">P2 덱:</string>
+    <string name="bot_tag_max_select">TAG 모드에서는 AI를 최대 3개까지 선택할 수 있습니다. 교체하려면 선택된 항목을 눌러 취소하세요.</string>
+    <string name="bot_favorite_added">%1$s 즐겨찾기 추가됨, 목록 맨 위로 이동했습니다</string>
+    <string name="bot_favorite_removed">%1$s 즐겨찾기 해제됨, 원래 위치로 돌아갔습니다</string>
     <string name="quit_deck_tip">덱 저장하지 않고 앱을 종료하겠습니까?</string>
+    <string name="deck_discard_switch_tip">현재 덱의 수정 내용을 폐기하고 계속하겠습니까?</string>
     <string name="deck_delete_text">삭제하려면 여기로 드래그하십시오</string>
     <string name="question_keep_cur_deck">현재 카드를 유지하겠습니까?</string>
     <string name="check_choose_file" formatted="false">%s을(를) 선택하시겠습니까?</string>
@@ -267,9 +274,6 @@
     <string name="Join_QQ">QQ 그룹</string>
     <string name="about_Join_QQ">QQ 그룹에 가입하여 문제 보고</string>
     <string name="donatefor">기부를 통해 자동갱신 서버 비용을 지출하고 업데이트된 자료와 이미지를 정리하고 최신 디바이스에 대한 호환성있는 제작을 위해 디바이스들을 구입하는 것에 도움을 주실 수 있습니다.</string>
-    <string name="coverSelect">카드 커버로 사용할 이미지를 선택하세요</string>
-    <string name="bgSelect">배경화면으로 사용할 이미지를 선택하세요</string>
-    <string name="avatarSelect">아바타로 사용할 이미지를 선택하세요</string>
     <string name="ClickLinkArrows">링크 마커 클릭</string>
     <string name="Already_Lastest">새 버전이 발견되지 않았어요. 작가의 활동 기록을 확인해볼래요? 최근 소식이 있을 수 있어요</string>
     <string name="tip_no_permission" formatted="false">%s 권한은 사용자가 금지했습니다</string>
@@ -285,6 +289,23 @@
     <string name="Download_Precard_Failed">프리릴리즈 카드 팩 다운로드 실패</string>
     <string name="Pre_Server_Name">Mycard 프리릴리즈 카드 서버</string>
     <string name="Ask_to_Change_Other_Way">다른 방식을 시도해 봐...</string>
+    <string name="superpre_inc_checking">확인 중...</string>
+    <string name="superpre_inc_comparing">비교 중...</string>
+    <string name="superpre_inc_requesting">요청 중...</string>
+    <string name="superpre_inc_downloading">%1$d%%</string>
+    <string name="superpre_inc_retry_network">재연결 중</string>
+    <string name="superpre_inc_retry_server">서버 혼잡</string>
+    <string name="superpre_inc_merging">합치는 중</string>
+    <string name="superpre_inc_start">증분 업데이트: 파일 %1$d개(%2$s)를 받습니다</string>
+    <string name="superpre_inc_fallback">증분 업데이트를 사용할 수 없습니다(서버 또는 데이터 문제). 전체 패키지를 다운로드할까요?</string>
+    <string name="superpre_inc_network_failed">네트워크 연결 실패. 받은 %1$s는 보관되며, 네트워크가 복구되면 다운로드를 다시 누르세요</string>
+    <string name="superpre_inc_network_failed_nothing_kept">네트워크 연결 실패. 네트워크가 복구되면 다운로드를 다시 누르세요</string>
+    <string name="superpre_inc_try_later">프리릴리즈 새 버전을 배포하는 중입니다. 몇 분 후에 다시 시도하세요</string>
+    <string name="superpre_inc_long_press_tip">다운로드 버튼을 길게 누르면 전체 다운로드를 선택할 수 있습니다.</string>
+    <string name="superpre_inc_choose_title">다운로드 방식 선택</string>
+    <string name="superpre_inc_choose_message">증분 업데이트: 바뀐 파일을 받습니다.\n전체 다운로드: 프리릴리즈 패키지 전체를 다시 받습니다. 기존 방식입니다.</string>
+    <string name="superpre_inc_choose_incremental">증분 업데이트</string>
+    <string name="superpre_inc_choose_full">전체 다운로드</string>
     <string name="DuelAssistant">듀얼 어시스턴트가 활성화되었습니다</string>
     <string name="masterrule">마스터 룰</string>
     <string name="tutorial">튜토리얼 알아보기</string>
@@ -303,6 +324,7 @@
     <string name="searchresult">결과</string>
     <string name="Pre_share">공유 준비가 되었습니다. 잠시만 기다려주십시오...</string>
     <string name="category_pack">카드 팩</string>
+    <string name="label_release_date">발매일</string>
     <string name="category_windbot_deck">AI 덱</string>
     <string name="category_Uncategorized">미분류 덱</string>
     <string name="please_input_category_name">카테고리를 입력하세요</string>
@@ -313,6 +335,13 @@
     <string name="done">완료\！</string>
     <string name="donot_edit_Deck">이 분류의 카드 그룹을 변경하지 마십시오</string>
     <string name="code_share">코드 공유</string>
+    <string name="ask_idle_cmd_label">소환·세트·펜듈럼 발동 전 확인</string>
+    <string name="ask_cmd_summon_confirm" formatted="false">[%s](을)를 소환할까요?</string>
+    <string name="ask_cmd_set_confirm" formatted="false">[%s](을)를 덮어서 세트할까요?</string>
+    <string name="ask_cmd_pendulum_confirm" formatted="false">[%s](을)를 펜듈럼 존에서 발동할까요?</string>
+    <string name="settings_pendulum_activate_btn">펜듈럼 스케일 발동 버튼 분리</string>
+    <string name="cmd_pendulum_activate">펜듈럼 존에서 발동</string>
+    <string name="cmd_activate_monster_effect">몬스터 효과 발동</string>
     <string name="screenshoot">아트 공유</string>
     <string name="ydk_share">파일 공유</string>
     <string name="unable_to_edit_empty_deck">비어있는 덱을 사용할 수 없습니다</string>
@@ -353,7 +382,7 @@
     <string name="guide_search_result_count">여기에 검색 결과를 표시합니다</string>
     <string name="guide_button_search_result">검색 결과를 보려면 여기를 클릭하세요. 즐겨찾는 카드도 표시됩니다.</string>
     <string name="guide_view_deck_manager">덱 관리에서 덱 카테고리와 덱을 클릭하여 관리할 수 있습니다.</string>
-    <string name="guide_view_move_card">원하는 카드를 길게 누르거나 다른 위치로 이동할 수 있고, 제거할 수 있습니다.</string>
+    <string name="guide_view_move_card">카드를 길게 눌러 다른 위치로 이동할 수 있습니다\n카드를 길게 누르면 일괄 선택 모드: 전체 이동 또는 삭제</string>
     <string name="guide_view_banner">MyCard 뉴스 : 클릭해서 볼 수 있으나 중국어만 있습니다. 죄송합니다.</string>
     <string name="title_delete_ex">프리릴리즈 카드 팩 삭제</string>
     <string name="about_delete_ex">만약 프리릴리즈 카드를 사용하면서 문제가 발생했을 경우, 삭제하는 것도 좋은 선택입니다.</string>
@@ -515,6 +544,7 @@
     <string name="resource_lflist">· 금지리스트</string>
     <string name="resource_strings">· 텍스트 및 설정</string>
     <string name="resource_pics">· 카드 이미지 압축 파일</string>
+    <string name="resource_scripts">· 스크립트 압축 파일</string>
 
     <!-- 이미지 및 화면 설정 -->
     <string name="follow_bilibili">Bilibili 피드 팔로우</string>
@@ -527,11 +557,35 @@
     <string name="quality_high">높음</string>
     <string name="settings_opengl_version">OpenGL 버전</string>
     <string name="settings_screen_padding_summary">화면 여백</string>
-    <string name="settings_native_game_mode">네이티브 UI 게임 모드</string>
+    <string name="settings_native_game_mode">실험실: 새로운 게임 UI</string>
     <string name="settings_native_game_mode_summary">원본보다 더 많은 새로운 기능</string>
 
     <!-- System Strings for UI Localization (index 1740+) -->
     <string name="spectator_skip_to_current">현재로 이동</string>
     <string name="refresh_lan_button">LAN 새로고침</string>
     <string name="mode_single_duel_solo">솔로 모드</string>
+
+    <!-- 지속 적용 효과 힌트 (어바타 모서리의 금색 느낌표 배지와 드롭다운 목록) -->
+    <string name="applying_effects_title">적용 중인 효과</string>
+    <string name="applying_effects_self">나의 적용 중인 효과</string>
+    <string name="applying_effects_opponent">상대의 적용 중인 효과</string>
+    <string name="applying_effect_scope_turn">이번 턴</string>
+    <string name="applying_effect_scope_duel">듀얼 동안</string>
+    <!-- /ai 人机召唤 UI -->
+    <string name="btn_ai_summon">/ai (Bot 호출)</string>
+    <string name="ai_deck_select_title">%1$s 금제에 맞는 AI 덱 목록</string>
+    <string name="ai_deck_random">랜덤-지정 안 함</string>
+    <string name="ai_deck_empty">현재 금제에 맞는 AI 덱이 없습니다</string>
+    <string name="cancel">취소</string>
+    <string name="sort_rule_time">시간↓</string>
+    <!-- 검색 결과 구간 표시 -->
+    <string name="section_title_star">%1$d성</string>
+    <string name="section_title_link">LINK-%1$d</string>
+    <string name="section_title_spell">마법</string>
+    <string name="section_title_trap">함정</string>
+    <string name="section_title_other">기타</string>
+    <string name="section_title_digits">숫자</string>
+    <string name="section_title_year">%1$d년</string>
+    <string name="section_title_unknown">알 수 없음</string>
+    <string name="section_title_with_count">%1$s · %2$d장</string>
 </resources>

@@ -4,6 +4,7 @@ import cn.garymb.ygomobile.game.gamefield.GameField;
 import cn.garymb.ygomobile.game.gamefield.MoveEventApplier;
 import cn.garymb.ygomobile.game.gamefield.ReloadFieldBuilder;
 import cn.garymb.ygomobile.game.gamefield.TagSwapApplier;
+import cn.garymb.ygomobile.game.gamefield.GameTopInfoManager;
 
 import android.util.Log;
 
@@ -70,26 +71,63 @@ public class DuelEventHandler extends DuelEventHandlerBase {
 
     @Override
     public void onAddCounter(int type, int ctrl, int loc, int seq, int count) {
-        ClientCard card = engine.field.getCard(ctrl, loc, seq);
-        if (card != null) {
-            card.counters.put(type, count);
-        }
-        engine.soundManager.playSoundEffect(SoundManager.SFX.COUNTER_ADD);
-        engine.mainHandler.post(() -> {
-            if (engine.listener != null) engine.listener.onFieldChanged();
-        });
+        // duelclient.cpp MSG_ADD_COUNTER L3774-3795：控制方先经 LocalPlayer 转本地视角索引（旧实现
+        // 直用协议索引，后攻方与观战切视角后指示物会落到对面半场），同类型计数为累加而非覆盖
+        int localCtrl = engine.localPlayer(ctrl & 1);
+        ClientCard card = engine.field.getCard(localCtrl, loc, seq);
+        if (card == null)
+            return;
+        Integer cur = card.counters.get(type);
+        card.counters.put(type, (cur == null ? 0 : cur) + count);
+        counterAction(type, card, 1617, "[%s]获得了%d个指示物[%s]", count);
     }
 
     @Override
     public void onRemoveCounter(int type, int ctrl, int loc, int seq, int count) {
-        ClientCard card = engine.field.getCard(ctrl, loc, seq);
-        if (card != null) {
+        // duelclient.cpp MSG_REMOVE_COUNTER L3797-3818：同样先转本地视角索引，并按本次取除量
+        // 递减（旧实现直接 remove 整个类型，部分取除会把剩下的指示物一并抹掉）
+        int localCtrl = engine.localPlayer(ctrl & 1);
+        ClientCard card = engine.field.getCard(localCtrl, loc, seq);
+        if (card == null)
+            return;
+        Integer cur = card.counters.get(type);
+        int left = (cur == null ? 0 : cur) - count;
+        if (left <= 0)
             card.counters.remove(type);
+        else
+            card.counters.put(type, left);
+        counterAction(type, card, 1618, "[%s]失去了%d个指示物[%s]", count);
+    }
+
+    /**
+     * 指示物增减的同步表现（对齐 duelclient.cpp L3784-3794 / L3807-3817）：音效 +
+     * 居中动作文本（GetSysString(1617/1618)，携带卡名与指示物名）+ 该卡 is_highlighting 青框
+     * 持续 WaitFrameSignal(40) 后自动清除；回放快进（instantPlace）与纯消息回放只落数据不跑动画。
+     */
+    private void counterAction(int type, ClientCard card, int sysIndex, String defText, int count) {
+        // 回放快进/上一步重算（instantPlace）：与 duelclient.cpp 的 isReplaySkiping 分支同构，
+        // 只落计数不跑音效/居中文本/青框，避免每次重算刷一叠指示物动画
+        if (engine.field.instantPlace) {
+            engine.mainHandler.post(() -> {
+                if (engine.listener != null) engine.listener.onFieldChanged();
+            });
+            return;
         }
-        engine.soundManager.playSoundEffect(SoundManager.SFX.COUNTER_REMOVE);
+        engine.soundManager.playSoundEffect(sysIndex == 1617
+                ? SoundManager.SFX.COUNTER_ADD : SoundManager.SFX.COUNTER_REMOVE);
+        String name = DataManager.get().getName(card.code);
+        engine.messageParser.showActionMessage(DataManager.get().formatSystemString(sysIndex, defText,
+                name, count, DataManager.get().getCounterName(type)));
+        card.is_highlighting = true;
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });
+        // 与 showActionMessage 的 40 帧屏障同时长，到点收青框（高亮不参与闸门判定，必须自带收尾）
+        final ClientCard lit = card;
+        engine.mainHandler.postDelayed(() -> {
+            lit.is_highlighting = false;
+            if (engine.listener != null) engine.listener.onFieldChanged();
+        }, 40L * 17L);
     }
 
     @Override
@@ -108,6 +146,11 @@ public class DuelEventHandler extends DuelEventHandlerBase {
         /** 战斗阶段点击「攻击宣言」选中的怪兽：cmdFlag 已清空但尚未进入 arcAttacker 前需隐藏其 attack 箭头；
          *   该卡通讯中还有剩余攻击次数时会重新显示（见 CardOverlayRenderer.drawFieldCardOverlays 对 selectAttacking 的判断）。 */
         engine.field.selectAttacking = atkCard;
+        // 本端已走到攻击结算：按 C++ 口径收掉卡上的「可攻击」标志（duelclient.cpp SendResponse 对
+        // BATTLECMD 应答调 ClearCommandFlag），否则绿色弧播完到下一条战斗指令之间，其余仍可攻击
+        // 怪兽的 attack.png 上下浮动箭头会重新出现（用户反馈：弧动画开始时浮动攻击贴图应立刻消失）。
+        // 只碰攻击集，发动/召唤/切阶段等其余标志保持原样，下一条询问重设
+        engine.clearAttackCommands();
         if (dLoc != 0) {
             engine.soundManager.playSoundEffect(SoundManager.SFX.ATTACK);
             ClientCard defCard = engine.field.getCard(engine.localPlayer(dCtrl & 1), dLoc & 0x7f, dSeq);
@@ -205,6 +248,68 @@ public class DuelEventHandler extends DuelEventHandlerBase {
     }
 
     @Override
+    public void onRockPaperScissors(int player) {
+        // duelclient.cpp MSG_ROCK_PAPER_SCISSORS L3973-3980：席位号在 C++ 侧读入即弃并弹 wHand，
+        // 本端同样一律弹猜拳窗（内置服务端只把该询问发给被问席位，见 DuelAnalyzer L731-737）；
+        // 应答是 CTOS_RESPONSE 的 int32 1/2/3，不是开局握手层的 CTOS_HAND_RESULT
+        //（区分源 event_handler.cpp BUTTON_HAND L42-58：curMsg==MSG_ROCK_PAPER_SCISSORS 走 SetResponseI，
+        // 否则才 SendPacketToServer(CTOS_HAND_RESULT)）。
+        // 回放无需在此早退：isSelectable(132) 已为真→ isNoFeed 拦在投喂层，由录制响应直接喂回引擎
+        //（对齐 replay_mode.cpp L758-761 的 ReadReplayResponse 而非 ClientAnalyze）
+        engine.mainHandler.post(() -> {
+            if (engine.listener != null) engine.listener.onSelectRequired(132, null);
+        });
+    }
+
+    @Override
+    public void onHandRes(int res) {
+        // duelclient.cpp MSG_HAND_RES L3982-3997：低 2bit 为引擎 P0 手势、其后 2bit 为引擎 P1 手势
+        //（各取 1=剪刀 2=石头 3=布，与 RPSDialog.HAND_* 常量同值），C++ 按 dInfo.isFirst 定出「我方」
+        // 再塞进 showcardcode 低/高 16 位走 showcard=100 绘制；此处同构换算为本方/对方手势后交 UI 播动画
+        if (engine.field.instantPlace || engine.replaySkip) return; // C++ 的 isReplaySkiping 分支只吃包不演
+        int hand0 = res & 0x3;
+        int hand1 = (res >> 2) & 0x3;
+        final boolean first = engine.isDuelFirst();
+        final int myHand = first ? hand0 : hand1;
+        final int oppHand = first ? hand1 : hand0;
+        engine.mainHandler.post(() -> {
+            if (engine.listener != null) engine.listener.onDuelRpsResult(myHand, oppHand);
+        });
+    }
+
+    @Override
+    public void onRandomSelected(int count, ByteBuffer data) {
+        // duelclient.cpp MSG_RANDOM_SELECTED L3462-3486：逐条 (c,l,s,ss) 取被选卡（overlay 取素材），
+        // 非回放快进时响 DICE 并 is_highlighting 青框 30 帧后收回——旧实现连消息都未解析，
+        // 随机选卡（如随机丢弃/随机除外/轮盘类效果）既无声也无高亮，与桌面版不一致
+        if (data == null || count <= 0) return;
+        final List<ClientCard> lit = new ArrayList<>();
+        for (int i = 0; i < count && data.remaining() >= 4; i++) {
+            int ctrl = engine.localPlayer(data.get() & 1);
+            int loc = data.get() & 0xFF;
+            int seq = data.get() & 0xFF;
+            int sub = data.get() & 0xFF;
+            ClientCard c = (loc & CardLocation.Overlay.value()) != 0
+                    ? engine.field.getCard(ctrl, loc & 0x7f, seq, sub)
+                    : engine.field.getCard(ctrl, loc, seq);
+            if (c != null && !lit.contains(c)) lit.add(c);
+        }
+        // C++ 的 isReplay && isReplaySkiping 分支只吃包不演：本端由 instantPlace/replaySkip 同义把握，
+        // 快进重算只取卡不响也不亮框
+        if (lit.isEmpty() || engine.field.instantPlace || engine.replaySkip) return;
+        engine.soundManager.playSoundEffect(SoundManager.SFX.DICE);
+        for (ClientCard c : lit) c.is_highlighting = true;
+        engine.mainHandler.post(() -> {
+            if (engine.listener != null) engine.listener.onFieldChanged();
+        });
+        // L3484-3486 WaitFrameSignal(30) 后逐张取消高亮（青框不参与闸门判定，必须自带收尾）
+        engine.mainHandler.postDelayed(() -> {
+            for (ClientCard c : lit) c.is_highlighting = false;
+            if (engine.listener != null) engine.listener.onFieldChanged();
+        }, 30L * 17L);
+    }
+
+    @Override
     public void onAnnounceRace(int player, int count, int availableRaces) {
         // duelclient.cpp MSG_ANNOUNCE_RACE L3996-4014：player 已消费，打包 count+available 转发
         ByteBuffer buf = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN);
@@ -246,6 +351,11 @@ public class DuelEventHandler extends DuelEventHandlerBase {
     public void onCardHint(int player, int location, int sequence, int hintType, int value) {
         // duelclient.cpp MSG_CARD_HINT L4094-4109：CHINT_DESC_ADD/REMOVE 维护卡片 desc_hints
         engine.field.applyCardHint(engine.localPlayer(player & 1), location, sequence, hintType, value);
+        // 持续适用中效果的引擎权威来源（用户新规格）：desc_hints 的加/删即代表某段持续效果“开始/停止
+        // 在场适用”，与 MSG_CHAINING/新回合/胜负等其它权威触发点同源刷徽标与列表（refreshApplyingEffects
+        // 自带 remove+post 合批，多次连投不重复重解）；其余 chtype（CHINT_TURN 等）不影响适用集合，不刷
+        if (hintType == GameField.CHINT_DESC_ADD || hintType == GameField.CHINT_DESC_REMOVE)
+            GameTopInfoManager.refreshApplyingEffects();
     }
 
     @Override

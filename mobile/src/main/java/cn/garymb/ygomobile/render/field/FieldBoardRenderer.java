@@ -18,12 +18,13 @@ public final class FieldBoardRenderer {
 
     private final GameFieldView view;
 
-    // === 总攻击力 bar 底图纹理键（矩形布局单一真值见 FieldGeometry.totalAtkRect）===
-    private static final long TOTAL_ATK_KEY = -3L;
+    // 总攻击力 bar 底图纹理键（矩形布局单一真值见 FieldGeometry.totalAtkRect）：需避开 -1/-2/-3（FieldTextureManager 的 cover/cover2/unknown 基础纹理键），
+    // 原用 -3 与 unknown.jpg 撞同一纹理缓存，总攻击力条先上传就会使场上 unknown 卡被画成 totalAtk.png（反向则底图变 unknown.jpg），故改用未占用的 -6
+    private static final long TOTAL_ATK_KEY = -6L;
     // 区域发动 / conti_act 旋转提示图标（materials: act.png），对齐 drawing.cpp DrawMisc 的 tAct + act_rot
     private static final long ACT_TEX_KEY = -4L;
-    // HINT_ZONE 玫红标注格下方的半透明无效徽记（materials: negated.png，tNegated）
-    private static final long NEGATED_TEX_KEY = -5L;
+    // HINT_ZONE 玫红标注格下方的半透明无效徽记（materials: negated.png，tNegated）：与卡面无效角标共用纹理管理器的同一键，避免同一 png 上传两张纹理
+    private static final long NEGATED_TEX_KEY = FieldTextureManager.NEGATED_TEX_KEY;
     // conti_cards 隐形格子最多堆叠显示层数（对齐 drawing.cpp 中部场地空隙的可视堆叠）
     private static final int MAX_CONTI_LAYERS = 5;
 
@@ -263,7 +264,8 @@ public final class FieldBoardRenderer {
     }
 
     /**
-     * 总攻击力 bar：duel_rule>=4 用 vTotalAtkme/op，否则 vTotalAtkmeT/opT；
+     * 总攻击力 bar：duel_rule>=4 用 vTotalAtkme/op 原版矩形；rule<4 用 MR3 中央空档带上/下两端的
+     * 重定位矩形（见 {@link FieldGeometry#totalAtkRect}，各自贴住本方怪兽行、不压怪兽格）；
      * raw x 经 fx 映射、y 直用，绘制空间再做 X 镜像，贴 totalAtk.png，仅 total_attack>0 时绘制。
      */
     public void drawTotalAttackBars(GameField f) {

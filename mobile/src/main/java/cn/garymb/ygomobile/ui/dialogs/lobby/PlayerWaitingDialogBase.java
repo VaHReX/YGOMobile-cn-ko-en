@@ -20,6 +20,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.PopupWindow;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -34,13 +35,14 @@ import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.YGOProActivity;
 import cn.garymb.ygomobile.bean.events.DeckFile;
+import cn.garymb.ygomobile.engine.NativeScriptBootstrap;
+import cn.garymb.ygomobile.engine.ScriptLoadStatus;
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.network.YGOProtocol;
 import cn.garymb.ygomobile.render.field.TextureLoader;
 import cn.garymb.ygomobile.ui.dialogs.duel.YesOrNoDialog;
 import cn.garymb.ygomobile.utils.DeckUtil;
 import cn.garymb.ygomobile.utils.DraggablePopupHelper;
-import cn.garymb.ygomobile.utils.ImePopupAdjuster;
 import ocgcore.DataManager;
 import ocgcore.LimitManager;
 import ocgcore.StringManager;
@@ -65,6 +67,11 @@ abstract class PlayerWaitingDialogBase {
     protected PopupWindow.OnDismissListener externalDismissListener;
     protected DraggablePopupHelper draggableHelper;
     protected DeckSelectorDialog deckSelectorDialog;
+    /**
+     * 卡组校验失败询问窗（handleDeckError 弹出）：需持引用登记，由等待界面退出/隐藏的各路径
+     * 统一关闭，避免玩家不点“确定”而直接点“退出”回主菜单后该窗残留遮挡。
+     */
+    protected YesOrNoDialog deckErrorDialog;
 
     protected String currentDeckCategory = "";
     protected String currentDeckName = "";
@@ -91,16 +98,28 @@ abstract class PlayerWaitingDialogBase {
     protected static final long PW_EMOTE_DURATION_MS = 3000L;
     protected CheckBox chkPwPlayer1Ready, chkPwPlayer2Ready, chkPwPlayer3Ready, chkPwPlayer4Ready;
     protected Button btnPwDuelistMode, btnPwSpectatorMode, btnPwReady, btnPwDeckSelect, btnPwExitWaiting;
+    /** “/ai”召唤人机入口，位于→决斗者按钮右侧 */
+    protected Button btnAiSummon;
     protected Button btnPwStartGame;
     protected ImageButton btnPwKickPlayer1, btnPwKickPlayer2, btnPwKickPlayer3, btnPwKickPlayer4;
     protected TextView tvRoomInfo;
     protected TextView tvWatchCount;
     protected TextView tvDeckSelectLabel;
     protected View layoutTagPlayers;
+    /** 脚本/卡数据加载进度区（建主进入等待界面时显示，就绪后隐藏） */
+    protected View layoutScriptLoading;
+    protected TextView tvScriptLoading;
+    protected ProgressBar pbScriptLoading;
+    /** 脚本/卡数据是否已就绪：false 时“开始”按钮保持置灰（见 updateStartButtonState） */
+    protected boolean scriptLoadReady = true;
+    /** 加载进度轮询（250ms 一次，就绪或关窗即停）：复用表情气泡的 Handler */
+    private final Runnable scriptLoadPoll = () -> refreshScriptLoadProgress();
     protected int selfPos = 0;
     protected boolean isSelfReady = false;
     protected boolean isHost = false;
     protected boolean isTagMode = false;
+    /** 当前房间禁卡表哈希（STOC_JOIN_GAME 的 lflist，0=N/A 无禁限）：供 /ai 人机列表过滤 */
+    protected int roomLflist = 0;
     protected int watchCount = 0;
     protected final List<String> observerNames = new ArrayList<>();
 
@@ -116,7 +135,9 @@ abstract class PlayerWaitingDialogBase {
         /** 点击“退出”等待界面：外部执行断线并返回局域网主界面 */
         void onExitWaiting();
 
-        void onPlayerWaitingDeckUpdate(List<Integer> main, List<Integer> extra, List<Integer> side);
+        /** 上传一份卡组（CTOS_UPDATE_DECK）。seat 为席位下标：solo 按 0..required-1 依次提交，
+         *  非 solo 恒为 0（本客户端自己的席位）；宿主据 seat 登记“当前对局卡组”快照，供换 side 载入 */
+        void onPlayerWaitingDeckUpdate(int seat, List<Integer> main, List<Integer> extra, List<Integer> side);
 
         void onStartGameRequested();
 
@@ -129,6 +150,9 @@ abstract class PlayerWaitingDialogBase {
          *  seat 为席位下标，deckName 需同步回填到 GameTopInfo 展示；
          *  deckPath 为该席位卡组文件路径，match 换 side 时据此载入对应卡组供编辑 */
         void onSoloSeatDeckUpdated(int seat, String deckName, String deckPath);
+
+        /** “/ai”人机卡组选择弹窗已确定：以聊天消息 /ai &lt;deckName&gt; 请求主机端拉起该人机 */
+        void onAiSummonRequested(String deckName);
     }
 
     protected final OnPlayerWaitingListener listener;
@@ -252,6 +276,7 @@ abstract class PlayerWaitingDialogBase {
 
     public void resetPlayerWaitingState() {
         hideAllSeatEmotes();
+        stopScriptLoadMonitor();
         if (etPwPlayer1Name != null) etPwPlayer1Name.setText("");
         if (etPwPlayer2Name != null) etPwPlayer2Name.setText("");
         if (etPwPlayer3Name != null) etPwPlayer3Name.setText("");
@@ -314,6 +339,8 @@ abstract class PlayerWaitingDialogBase {
         seat.setText(name);
         // 玩家加入(名字非空)时叠加半透明色提醒该席位已被占据，离开/清空时恢复透明
         seat.setBackground(TextUtils.isEmpty(name) ? context.getDrawable(R.drawable.ygopro_selected_background) : context.getDrawable(R.drawable.ygopro_base_background));
+        // 席位占用/释放即时重估“/ai”按钮：玩家进入/离开/换席都会经过这里
+        updateAiSummonButtonState();
     }
 
     public String getPlayerName(int pos) {
@@ -598,7 +625,8 @@ abstract class PlayerWaitingDialogBase {
 
     /**
      * 非 solo：点击准备即上传房主自身卡组（单一 currentDeckPath）。
-     * solo：卡组在点击“开始”时由 {@link #soloCommitDecksForStart()} 按席位顺序统一上传，
+     * solo：卡组在点击“开始”时由 {@code soloCommitDecksForStart()}（子类 PlayerWaitingDialogMid 实现）
+     * 按席位顺序统一上传，
      * 此处不发卡（避免“先上传席位0、其余席位未选→return false”造成的服务端部分上传脏状态），
      * 准备仅作为本地标记，返回 true。
      */
@@ -609,7 +637,7 @@ abstract class PlayerWaitingDialogBase {
             Toast.makeText(context, mStringManager.getSystemString(1406, "无效卡组"), Toast.LENGTH_SHORT).show();
             return false;
         }
-        if (listener != null) listener.onPlayerWaitingDeckUpdate(sec.get(0), sec.get(1), sec.get(2));
+        if (listener != null) listener.onPlayerWaitingDeckUpdate(0, sec.get(0), sec.get(1), sec.get(2));
         return true;
     }
 
@@ -683,9 +711,39 @@ abstract class PlayerWaitingDialogBase {
         cb.setChecked(checked);
         updateSelfCheckboxInteractivity();
     }
+    /**
+     * “/ai”呼叫 Bot 按钮可用性：仅当本房间决斗席位仍有空缺时可用（判定口径与服务端
+     * {@code GameRoomMid#firstFreeSeat} 一致：TAG 4 席、其余 2 席，席位名非空即视为有人）；
+     * 所有席位都有人时置灰不可点。纯单人(solo)模式服务端不接受 /ai，同样保持置灰。
+     */
+    protected void updateAiSummonButtonState() {
+        if (btnAiSummon == null) return;
+        int duelistCount = isTagMode ? 4 : 2;
+        boolean hasFreeSeat = false;
+        for (int i = 0; i < duelistCount; i++) {
+            if (TextUtils.isEmpty(getPlayerName(i))) {
+                hasFreeSeat = true;
+                break;
+            }
+        }
+        boolean enabled = hasFreeSeat && !soloMode;
+        btnAiSummon.setEnabled(enabled);
+        btnAiSummon.setTextColor(enabled ? Color.WHITE : Color.GRAY);
+    }
+
     protected void updateStartButtonState() {
+        // “/ai”按钮与开始按钮同源刷新：房主变更、TAG 模式回显、solo 开关、席位出入
+        // （经 setPlayerReady/refreshPlayerDisplay）都会走到这里
+        updateAiSummonButtonState();
         if (btnPwStartGame == null) return;
         if (!isHost) {
+            btnPwStartGame.setEnabled(false);
+            btnPwStartGame.setTextColor(Color.GRAY);
+            return;
+        }
+        // 脚本/卡数据未加载完时不允许开局：半套脚本/卡数据会被 ocgcore 以空表永久缓存，
+        // 缺脚本的卡之后也不会再加载（表现为只能盖放）。等待界面进度条就绪后解锁
+        if (!scriptLoadReady) {
             btnPwStartGame.setEnabled(false);
             btnPwStartGame.setTextColor(Color.GRAY);
             return;
@@ -721,6 +779,72 @@ abstract class PlayerWaitingDialogBase {
 
     public void setCardNameResolver(CardNameResolver resolver) {
         this.cardNameResolver = resolver;
+    }
+
+    // ==================================================================
+    // 脚本 / 卡数据加载进度（进等待界面即开始，就绪前“开始”置灰）
+    // ==================================================================
+
+    protected void bindScriptLoadingViews(View root) {
+        layoutScriptLoading = root.findViewById(R.id.layout_script_loading);
+        tvScriptLoading = root.findViewById(R.id.tv_script_loading);
+        pbScriptLoading = root.findViewById(R.id.pb_script_loading);
+    }
+
+    /**
+     * 开始监控脚本/卡数据加载进度（show() 内调用）：立即刷新一次，随后 250ms 轮询到就绪。
+     * 同时拉起引擎预热（幂等）——等待界面一出现就开始引导，进度才有内容可显示；
+     * 就绪前“开始”保持置灰，避免带半套脚本/卡数据开局（缺脚本的卡会被 ocgcore
+     * 永久缓存为空表，之后补齐也不再加载，表现为只能盖放）。
+     */
+    protected void startScriptLoadMonitor() {
+        NativeScriptBootstrap.warmUpAsync("WaitingScriptLoad", "等待界面-脚本加载");
+        refreshScriptLoadProgress();
+    }
+
+    protected void stopScriptLoadMonitor() {
+        pwEmoteHandler.removeCallbacks(scriptLoadPoll);
+    }
+
+    /** 刷新一次进度并安排下一轮轮询；就绪时隐藏进度区、解锁开始按钮 */
+    private void refreshScriptLoadProgress() {
+        pwEmoteHandler.removeCallbacks(scriptLoadPoll);
+        ScriptLoadStatus.Snapshot s = ScriptLoadStatus.snapshot();
+        boolean wasReady = scriptLoadReady;
+        scriptLoadReady = s.ready;
+        if (layoutScriptLoading != null) {
+            layoutScriptLoading.setVisibility(s.ready ? View.GONE : View.VISIBLE);
+        }
+        if (wasReady != s.ready) {
+            // 就绪态翻转：重评开始按钮（未就绪→置灰；就绪→按席位/准备态恢复）
+            updateStartButtonState();
+        }
+        if (!s.ready) {
+            if (tvScriptLoading != null) {
+                tvScriptLoading.setText(s.failed
+                        ? context.getString(R.string.script_loading_failed)
+                        : context.getString(R.string.script_loading_progress,
+                                context.getString(stageLabelRes(s.stage)), s.percent));
+            }
+            if (pbScriptLoading != null) {
+                pbScriptLoading.setProgress(s.percent);
+            }
+        }
+        // 持续轮询：期间若又起了新的资源检查（如 ACTION_RELOAD）也能重新显示进度并锁开始；
+        // 就绪后降为 500ms 一次，开销只是一次静态字段读取
+        pwEmoteHandler.postDelayed(scriptLoadPoll, s.ready ? 500L : 250L);
+    }
+
+    /** 当前最拖后腿的加载阶段对应的文案资源 */
+    private static int stageLabelRes(int stage) {
+        switch (stage) {
+            case ScriptLoadStatus.STAGE_SCRIPT:
+                return R.string.script_loading_stage_script;
+            case ScriptLoadStatus.STAGE_CDB:
+                return R.string.script_loading_stage_cdb;
+            default:
+                return R.string.script_loading_stage_engine;
+        }
     }
 
     protected PlayerWaitingDialogBase(Context context, OnPlayerWaitingListener listener) {

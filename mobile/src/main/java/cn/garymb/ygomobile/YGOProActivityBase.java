@@ -26,6 +26,7 @@ import android.widget.Toast;
 
 import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -66,6 +67,7 @@ import cn.garymb.ygomobile.utils.DraggablePopupHelper;
 import cn.garymb.ygomobile.utils.FullScreenUtils;
 import cn.garymb.ygomobile.utils.ImePopupAdjuster;
 import cn.garymb.ygomobile.utils.RightAlignedTiledDrawable;
+import ocgcore.data.Card;
 import ocgcore.DataManager;
 import ocgcore.StringManager;
 
@@ -139,6 +141,29 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
     protected final List<YesOrNoDialog> undoHiddenDialogs = new ArrayList<>();
 
     /**
+     * 点击撤回瞬间是否除询问窗外还收口了其它应答类弹窗（选卡/确认/选项/宣言/表示形式）：
+     * 这类窗没有可原地恢复的实例快照（弹完即只留静态 current 引用），被拒时只能按最近询问
+     * 快照重派发重建；未被收口时维持旧的「恢复询问窗实例」路径，不重派发以免把已答完的旧询问
+     * 弹回。标志随 clearUndoHiddenDialogs 一并作废，consumeUndoClosedQuestionDialog 读后复位。
+     */
+    protected boolean undoClosedQuestionDialog;
+
+    /**
+     * 点击撤回瞬间被作废的连锁询问现场备份：连锁窗静态引用（handleChainCancel 据此重新弹出）
+     * 与强制连锁标志（决定「取消操作」是否允许）。撤回被拒恢复询问窗时必须一并回灌，否则
+     * 连锁询问窗虽然重新可见，却因静态引用为空而使「取消操作」认不到自己那张窗。
+     */
+    protected YesOrNoDialog undoChainQueryBackup;
+    protected boolean undoChainForcedBackup;
+
+    /** 取用并复位「撤回瞬间收口过其它应答弹窗」标志（撤回被拒的恢复路径判定用） */
+    public boolean consumeUndoClosedQuestionDialog() {
+        boolean closed = undoClosedQuestionDialog;
+        undoClosedQuestionDialog = false;
+        return closed;
+    }
+
+    /**
      * 当前正在显示的投降确认对话框：显示期间（直至其消失）忽略投降按钮的重复点击，
      * 避免玩家多次点击弹出多个投降确认对话框（用户规格，竖屏/横屏按钮共用本入口）
      */
@@ -157,7 +182,7 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
     /**
      * 息屏→亮屏周期内冻结显示方向：息屏即锁定当前方向，重新亮屏时保持息屏前布局，
      * 不切换横竖屏（用户规格）；冻结经 wakeRotationWatcher 在亮屏后物理姿态跨轴变化时
-     * 解除，才按“游戏横屏锁定”设置决定是否允许旋转
+     * 解除，才按“游戏横屏锁定/竖屏锁定”设置决定是否允许旋转
      */
     protected boolean wakeRotationFrozen = false;
     /** 息屏时刻的显示方向（ORIENTATION_LANDSCAPE/PORTRAIT），供亮屏后姿态比对 */
@@ -227,10 +252,19 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
             }
         });
 
-        // 聊天：输入法把输入框抬高时，所有在显弹窗（玩家等待 + 决斗中的是/否询问、宣言类、
-        // 猜拳、先后攻、位置选择、卡片选择/显示、决斗记录、录像保存等，各 dialog 自行向
+        // 停用聊天后输入框转卡片关键词检索：输入法点发送即用卡组编辑同源规则检索并弹结果列表
+        chatInputUI.setOnKeywordSearchListener(keywords -> {
+            if (cardDetailPanel != null) {
+                cardDetailPanel.showKeywordSearchResult(keywords);
+            }
+        });
+
+        // 聊天：输入法把输入框抬高时，所有在显弹窗（决斗中的是/否询问、宣言类、
+        // 猜拳、先后攻、位置选择、卡片选择/显示、决斗记录、文本输入等，各 dialog 自行向
         // ImePopupAdjuster 登记）统一抬成「底边紧贴输入框上沿」，不再与输入框/键盘互相遮挡；
-        // 输入法收起后各弹窗回到 layout_game_right 中央（区域锚定由工具类还原时补做）
+        // 输入法收起后各弹窗回到 layout_game_right 中央（区域锚定由工具类还原时补做）。
+        // 例外：玩家等待弹窗按用户新规格不再登记（它铺满窗口且含席位名输入框，抬升路径
+        // 反复闪动仍遮挡输入框），改为 ADJUST_NOTHING 原位不动 + 可自由拖动让位
         chatInputUI.setImeVisibilityListener(new ChatInputUI.ImeVisibilityListener() {
             @Override
             public void onImeShown() {
@@ -240,10 +274,14 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
             @Override
             public void onImeHidden() {
                 ImePopupAdjuster.notifyImeHidden();
+                // 输入法收起：把血条下方各带（双方聊天行/弹幕带/提示带）重锚回正在落定的血条位置
+                //（未落定时由本调用自行按轮等待，不采压缩中间态），消除抬键盘期间发出的记录
+                // 顶在屏幕顶部、降回后不回位的问题（用户反馈）
+                if (fieldCtl != null) fieldCtl.repinHudBands();
             }
         });
-        // 提早把聊天输入框登记进联动工具：静置期采样其屏幕上沿基准，供玩家等待弹窗
-        // 按「输入框是否真被抬高」的几何判定抬升/回位（不随输入法显隐事件翻转闪动）
+        // 提早把聊天输入框登记进联动工具：静置期采样其屏幕上沿基准，供联动弹窗
+        // （如决斗记录）按「输入框是否真被抬高」的几何判定抬升/回位（不随输入法显隐事件翻转闪动）
         ImePopupAdjuster.bindChatInput(etChatInput);
 
         cardDetailPanel = new CardDetailPanel((YGOProActivity) this);
@@ -560,31 +598,57 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
      * <li>横屏：直接用原始横向图作窗口背景，layout_game_right 不设区域背景（透出窗口原图）；</li>
      * <li>竖屏：不再把横向图旋转 90° 后按高等比 REPEAT 平铺——旋转得到的纵向图窄于屏宽，
      * 平铺补边会在屏幕正中留下可见的图片拼贴边（历史 PlayerWaitingDialog 竖屏背景“正中显示
-     * 图片边缘”根因）。改为保持原本横向图，用 {@link RightAlignedTiledDrawable} 以<b>整个窗口</b>
-     * 为基准做 cover 缩放并右对齐（只显示图片最右侧的部分，左侧超出屏幕的部分被裁掉，X 方向
+     * 图片边缘”根因）。改为保持原本横向图，用 {@link RightAlignedTiledDrawable} 以<b>基准区</b>
+     * （顶部面板底缘以下，即 layout_game_right 那一段；顶部面板未显示时退回整窗口）为基准做
+     * cover 缩放并右对齐（只显示图片最右侧的部分，左侧超出屏幕的部分被裁掉，X 方向
      * CLAMP 不再平铺补边）：窗口背景与 layout_game_right 区域背景共用同一映射，区域显示的就是
      * 它实机宽度所处位置的那一片图，两者逐像素连续、无拼接缝——决斗(bg.jpg)/卡组编辑(bg_deck.jpg)/
-     * 大厅等待界面同规格。</li>
+     * 大厅等待界面同规格。基准区之上（卡片详情那一段）按用户规格不得透出背景图：窗口背景的宿主是
+     * 整个 DecorView，若不做处理会把图铺到顶部面板区域、且 cover 会按整屏高把图放大，故同一
+     * drawable 传入顶部面板作锚视图并把该段重涂为与面板同色——背景高度止于 layout_game_right 顶部。</li>
      * </ul>
      * 原始解码位图不改动，故旋转切换（rebuildUiForOrientation）与缓存命中（setWindowBackground）都会重算。
      */
     void updateFieldRegionBackground() {
         if (lastBgBitmap == null || lastBgBitmap.isRecycled()) {
             if (layoutGameRight != null) layoutGameRight.setBackground(null);
+            // 背景被清空同样改变了输入框所在处的明暗：一并重取检索态对比色
+            if (chatInputUI != null) chatInputUI.refreshSearchContrast();
             return;
         }
         boolean portrait = getResources().getConfiguration().orientation
                 == Configuration.ORIENTATION_PORTRAIT;
         if (portrait) {
-            // 竖屏：保持原本横向图，右对齐裁剪左侧超出（每张单独实例，避免窗口背景与区域背景共享）
-            getWindow().setBackgroundDrawable(new RightAlignedTiledDrawable(lastBgBitmap));
+            // 竖屏：保持原本横向图，右对齐裁剪左侧超出（每张单独实例，避免窗口背景与区域背景共享）。
+            // 基准区取顶部面板底缘以下（用户规格：背景高度只到 layout_game_right 顶部，不得延伸到
+            // 卡片详情区）；面板未显示（大厅聊天/主菜单，决斗场区升为整屏）时锚视图 isShown() 为假，
+            // drawable 内部自行退回整窗口基准，与旧行为一致
+            View anchor = topPanelForBackground();
+            int aboveRegionColor = ContextCompat.getColor(this, R.color.ygopro_list_background);
+            getWindow().setBackgroundDrawable(
+                    new RightAlignedTiledDrawable(lastBgBitmap, anchor, aboveRegionColor));
             if (layoutGameRight != null) {
-                layoutGameRight.setBackground(new RightAlignedTiledDrawable(lastBgBitmap));
+                layoutGameRight.setBackground(
+                        new RightAlignedTiledDrawable(lastBgBitmap, anchor, aboveRegionColor));
             }
         } else {
             getWindow().setBackgroundDrawable(new BitmapDrawable(getResources(), lastBgBitmap));
             if (layoutGameRight != null) layoutGameRight.setBackground(null);
         }
+        // 换肤/旋转重贴背景后输入框所在位置的实际背景已变：重取检索态的下划线与文字色
+        if (chatInputUI != null) chatInputUI.refreshSearchContrast();
+    }
+
+    /**
+     * 竖屏决斗背景基准区锚视图（顶部面板 layout_game_top_panel）：本字段在 initViews 与旋转重建
+     * 里绑定，而首次 setWindowBackground 可能早于视图装配，故为空时按 ID 兜底再取一次；
+     * 横屏布局无该节点，取不到就返回 null（调用处据此退回整窗口基准）。
+     */
+    private View topPanelForBackground() {
+        if (layoutGameTopPanel == null) {
+            layoutGameTopPanel = findViewById(R.id.layout_game_top_panel);
+        }
+        return layoutGameTopPanel;
     }
 
     /**
@@ -592,12 +656,17 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
      * 决斗场显示/卡组编辑器（需卡片详情+卡组按钮）→ VISIBLE（占屏高 1/3，
      * layout_game_right 余 2/3）；菜单/大厅聊天 → GONE（不占位，区域升为整屏）。
      * 横屏布局无该节点，findViewById 为 null 时静默跳过。
+     * <p>
+     * 面板底缘就是竖屏背景图的基准区上边界（见 {@link #updateFieldRegionBackground}），切换后
+     * 必须让窗口背景按新边界重画一次：否则“决斗结束回菜单”这类面板收起的过渡里，
+     * 上一帧的背景仍按旧边界只铺下部 2/3，上方露出纯色空窗。
      */
     void setGameTopPanelVisible(boolean visible) {
         if (layoutGameTopPanel == null)
             layoutGameTopPanel = findViewById(R.id.layout_game_top_panel);
         if (layoutGameTopPanel != null)
             layoutGameTopPanel.setVisibility(visible ? View.VISIBLE : View.GONE);
+        getWindow().getDecorView().invalidate();
     }
 
     /**
@@ -624,8 +693,8 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
 
     /**
      * 聊天开关（对齐 gframe event_handler.cpp BUTTON_CHATTING）：
-     * 停用状态（chkIgnore1=1）→ 启用：图标 tTalk、显示聊天输入框；
-     * 启用状态 → 停用：图标 tShut、隐藏聊天输入框并清空聊天消息
+     * 停用状态（chkIgnore1=1）→ 启用：图标 tTalk、输入框恢复聊天态；
+     * 启用状态 → 停用：图标改搜索 ic_search、输入框转卡片关键词检索态并清空已显示的聊天消息
      */
     public void toggleChatInput() {
         if (chatInputUI != null) {
@@ -636,11 +705,11 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
                 }
             });
             // 点击切换后立即同步图标（对齐 event_handler.cpp BUTTON_CHATTING）：
-            // 停用聊天显示 tShut、启用显示 tTalk，不再依赖设置对话框路径的 applySettingsToEngine
+            // 停用聊天显示搜索图标、启用显示 tTalk，不再依赖设置对话框路径的 applySettingsToEngine
             if (cardDetailPanel != null) {
                 cardDetailPanel.updateChatIcon(!enable);
             }
-            // 切换后走统一场景核算重置输入框可见性（ChatInputUI 内的直接显隐不感知抑制场景）
+            // 切换后走统一场景核算重置输入框形态与可见性（ChatInputUI 内的直接显隐不感知抑制场景）
             updateChatUIVisibility();
         }
     }
@@ -655,11 +724,30 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
         GameEngine eng = engine;
         if (eng == null) return false;
         if (eng.isSingleMode) return true;
-        return eng.replayMode && eng.replayPlayer != null && eng.replayPlayer.hasActiveSession();
+        return isReplaySessionActive();
     }
 
     /**
-     * 聊天输入框与聊天开关按钮可见性统一核算：输入框需设置允许（未停用聊天）且非抑制场景；
+     * 回放会话是否进行中或正在等加载（{@link ReplayPlayer#isUiSessionAlive()}：LOADING 或已在投喂）：
+     * 与旋转回显的决斗语境快照、聊天 UI 抑制共用同一判据。
+     * <p>主菜单重显入口（{@code MainMenuDialog.showMainMenu}）据此拦截：录像选择窗/设置窗的
+     * {@code dismiss} 回调常在焦点变化或退场动画之后才触发 {@code restoreMainMenu}，而它尾部的
+     * {@code hideGameUI()} 会把刚由 {@code enterReplayUI} 切过去的决斗场 UI 整层收起（layout_game_right
+     * GONE → GL 曲面销毁 → 卡片动画不再推进，只剩窗口背景图），即用户反馈的「外部打开 yrp 后只有
+     * 决斗背景、不显示场上卡片和决斗场、录像卡住」。
+     * <p>判据取会话状态而非 {@code replayMode && isRunning}：外部打开时等卡数据/解析录像的 LOADING
+     * 窗口可长达数十秒，该窗口内 {@code replayMode/isRunning} 均未置起，旧写法在窗口里到来的旋转重建
+     * 会误判为非决斗语境而收起决斗场区，同一机制把回放变成「只有背景的静帧」。
+     */
+    public boolean isReplaySessionActive() {
+        return engine != null && engine.replayPlayer != null
+                && engine.replayPlayer.isUiSessionAlive();
+    }
+
+    /**
+     * 聊天输入框与聊天开关按钮形态/可见性统一核算：停用聊天时输入框不再隐藏，而是就地
+     * 转为卡片关键词检索框（背景下横线、发送走检索）；卡组编辑/录像/残局这些无聊天对象
+     * 的抑制场景连检索框一并隐藏（卡组编辑自带自己的检索框），大厅保持聊天态。
      * 开关按钮（用户规格）不受停用聊天设置影响、仅抑制场景隐藏——停用后必须留着入口才能点回启用。
      * 卡组编辑/录像/残局进入与退出、旋转重建、设置变更均经此刷新（用户规格）。
      */
@@ -667,26 +755,24 @@ public abstract class YGOProActivityBase extends AppCompatActivity {
         boolean settingAllow = AppsSettings.get().getIntSettings("chkDisableChatting", 0) != 1;
         boolean suppressed = isChatUiSuppressedScene();
         if (etChatInput != null) {
-            // 大厅等待界面：输入框作为聊天主入口的初始可见由 enterLobbyChatUI 无条件 VISIBLE 保障；
-            // 但用户经聊天开关明确停用（ChatInputUI 运行时状态）后同样以 INVISIBLE 隐藏输入框
-            //（用户规格：横竖屏点击开关必须隐藏，INVISIBLE 保持占位不影响 gameField 位置）；
-            // 非大厅场景仍按持久停用聊天设置与抑制场景核算
             boolean lobby = playerWaitingDialog != null && playerWaitingDialog.isShowing();
-            boolean visible = lobby
-                    ? (chatInputUI == null || chatInputUI.isChatEnabled())
-                    : (settingAllow && !suppressed);
-            // 隐藏一律用 INVISIBLE 而非 GONE（用户规格）：竖屏底部聊天输入框为 weight 布局，
-            // GONE 会让左侧按钮组宽度跳变，INVISIBLE 保持占位稳定
+            // 检索态仅在决斗场（含观战）生效：大厅仍是聊天主入口，不转检索
+            boolean searchMode = !lobby && !settingAllow && !suppressed;
+            if (chatInputUI != null) chatInputUI.setSearchMode(searchMode);
+            // 输入框不再因「停用聊天」而被藏起（用户规格）：大厅也保持聊天态常驻，
+            // 只有卡组编辑/录像/残局这些无聊天对象的抑制场景才隐藏（一律用 INVISIBLE 而非 GONE，
+            // 竖屏底部聊天输入框为 weight 布局，GONE 会让左侧按钮组宽度跳变，INVISIBLE 保持占位稳定）
+            boolean visible = !suppressed;
             etChatInput.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
         }
         if (cardDetailPanel != null) {
-            // 停用聊天只隐藏输入框与聊天信息，开关恒可见（非抑制场景）
+            // 停用聊天只清空已显示的聊天信息、输入框转检索态，开关恒可见（非抑制场景）
             cardDetailPanel.setChatToggleVisible(!suppressed);
         }
     }
     public String getCardDisplayName(int code) {
         if (code <= 0) return "???";
-        ocgcore.data.Card card = DataManager.get().getCardManager().getCard(code);
+        Card card = DataManager.get().getCardManager().getCard(code);
         if (card != null && card.Name != null) return card.Name;
         return "Card#" + code;
     }

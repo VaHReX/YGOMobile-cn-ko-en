@@ -23,6 +23,14 @@ class AskWatchdog {
     private static final long ASK_WATCHDOG_TICK_MS = 500L;
 
     private volatile long lastAskRxAt;
+    /**
+     * 最近一条「需要本端应答」的询问（MSG_SELECT_*、宣言类 MSG_ANNOUNCE_* 与决斗中猜拳
+     * MSG_ROCK_PAPER_SCISSORS）到达时刻：
+     * 与 {@link #lastResponseTxAt} 比较即得「当前是否仍有一条询问待答」（见
+     * {@link #isQuestionPending()}），撤回被拒时据此决定能否按询问快照重派发重建弹窗。
+     * 不能复用 lastAskRxAt：它含 MSG_WAITING，等待提示会把已答完的旧询问误判为待答。
+     */
+    private volatile long lastQuestionRxAt;
     private volatile long lastResponseTxAt;
     private int askProbeCount;
     private long askProbeAt;
@@ -64,10 +72,11 @@ class AskWatchdog {
                 && (engine.isHost || engine.serverCapsAskResend);
     }
 
-    /** 由 GameActions 在实际发出 CTOS_RESPONSE 后回调：开始看门狗计时。 */
+    /** 由 GameActions 在实际发出 CTOS_RESPONSE 后回调：开始看门狗计时。
+     *  撤回闩锁不再在此解除（旧语义「本方发出一条应答才算完成一次撤回」使连续撤回不可用）：
+     *  改由 {@link UndoClientCoordinator#applyUndoResync} 在重同步落地时、以及被拒时解除，
+     *  能不能再撤的准入见 {@link UndoClientCoordinator#canSendUndo} */
     void notifyResponseSent() {
-        // 本方有了新的操作：解除撤回一次性闩锁
-        engine.undoBlockedUntilNewAction = false;
         lastResponseTxAt = System.currentTimeMillis();
         if (!canProbeAsk() || askWatchdogRunning) {
             return;
@@ -76,15 +85,46 @@ class AskWatchdog {
         engine.mainHandler.postDelayed(askWatchdogTask, ASK_WATCHDOG_TICK_MS);
     }
 
-    /** 询问/等待提示到达：求援计数作废。 */
-    void notifyAskReceived() {
-        lastAskRxAt = System.currentTimeMillis();
+    /**
+     * 询问/等待提示到达：求援计数作废；msgType 为需本端应答的询问（MSG_SELECT_* = 10..26、
+     * 宣言类 MSG_ANNOUNCE_* = 140..143 与决斗中猜拳 MSG_ROCK_PAPER_SCISSORS = 132）时另记待答询问时戳，
+     * 供 {@link #isQuestionPending()}。
+     */
+    void notifyAskReceived(int msgType) {
+        long now = System.currentTimeMillis();
+        lastAskRxAt = now;
+        if (isAnswerableQuestion(msgType)) {
+            lastQuestionRxAt = now;
+        }
         askProbeCount = 0;
+    }
+
+    /** 本端是否仍有一条尚未应答的询问：最近一条需应答的询问晚于最近一次实际发出的应答。 */
+    boolean isQuestionPending() {
+        return lastQuestionRxAt > lastResponseTxAt;
+    }
+
+    /**
+     * 这条消息是否需要本端给出应答（与询问快照留存范围同源，见 MsgDispatchGate）：
+     * MSG_SELECT_*(10..26)、宣言类 MSG_ANNOUNCE_*(140..143)，再加决斗中脚本猜拳
+     * MSG_ROCK_PAPER_SCISSORS(132)——core 写完那一字节就停在
+     * PROCESSOR_ROCK_PAPER_SCISSORS 等 int32 应答（operations.cpp field::rock_paper_scissors），
+     * 不纳入则「变则齿轮」(58297729) 一类卡既无求援也不落询问快照，对局始终挂死。
+     * MSG_HAND_RES(133) 则不能纳入：它是纯展示的结果广播、core 不等任何人应答，误记为
+     * 待答询问会使 isQuestionPending() 长期为真，把撤回恢复与应答屏障带偏。
+     */
+    static boolean isAnswerableQuestion(int msgType) {
+        return (msgType >= GameMessage.SelectBattleCmd.value()
+                && msgType <= GameMessage.SelectUnselectCard.value())
+                || msgType == GameMessage.RockPaperScissors.value()
+                || (msgType >= GameMessage.AnnounceRace.value()
+                && msgType <= GameMessage.AnnounceNumber.value());
     }
 
     /** 新一局开始：作废上一局时戳与求援计数。 */
     void resetAskWatchdog() {
         lastAskRxAt = 0L;
+        lastQuestionRxAt = 0L;
         lastResponseTxAt = 0L;
         askProbeCount = 0;
         askProbeAt = 0L;

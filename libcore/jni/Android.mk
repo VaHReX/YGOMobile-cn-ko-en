@@ -41,6 +41,7 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/libevent/include
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/libsndfile/include
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/mpg123/include
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/openal/include
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/liblzma/api
 
 LOCAL_SRC_FILES := $(LOCAL_PATH)/android/android_tools.cpp \
 				$(LOCAL_PATH)/android/xstring.cpp \
@@ -93,6 +94,7 @@ LOCAL_STATIC_LIBRARIES += libsndfile
 LOCAL_STATIC_LIBRARIES += libmpg123
 LOCAL_STATIC_LIBRARIES += openal
 LOCAL_STATIC_LIBRARIES += clzma
+LOCAL_STATIC_LIBRARIES += liblzma_xz
 LOCAL_STATIC_LIBRARIES += cspmemvfs
 LOCAL_STATIC_LIBRARIES += sqlite3
 LOCAL_STATIC_LIBRARIES += libft2
@@ -112,6 +114,7 @@ $(call import-module,mpg123)
 $(call import-module,openal)
 $(call import-module,freetype)
 $(call import-module,gframe/lzma)
+$(call import-module,liblzma)
 $(call import-module,gframe/spmemvfs)
 
 $(call import-module,android/native_app_glue)
@@ -156,7 +159,8 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../Classes/sqlite3
 # 故须带 jni/ 前缀，否则会在 libcore/ 下找不到 ygo_engine_jni.cpp。
 LOCAL_SRC_FILES := jni/ygo_engine_jni.cpp
 
-LOCAL_LDLIBS := -llog
+# -lz：scripts.zip 直读索引需要 zlib 的 raw inflate（deflate 条目）
+LOCAL_LDLIBS := -llog -lz
 
 LOCAL_STATIC_LIBRARIES := libocgcore_static liblua5.4 sqlite3
 

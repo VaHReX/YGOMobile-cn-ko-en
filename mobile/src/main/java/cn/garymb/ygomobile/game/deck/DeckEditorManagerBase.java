@@ -8,6 +8,7 @@ import android.os.Looper;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.TextView;
 
@@ -31,6 +32,7 @@ import cn.garymb.ygomobile.render.card.CardDetailPanel;
 import cn.garymb.ygomobile.render.field.TextureLoader;
 import cn.garymb.ygomobile.audio.SoundManager;
 import cn.garymb.ygomobile.ui.cards.deck.CardTypeImage;
+import cn.garymb.ygomobile.ui.cards.deck.DeckHistory;
 import cn.garymb.ygomobile.ui.cards.deck.DeckUtils;
 import cn.garymb.ygomobile.ui.cards.deck.ImageTop;
 import cn.garymb.ygomobile.ui.cards.deck.MyDeckItem;
@@ -112,6 +114,14 @@ abstract class DeckEditorManagerBase {
     boolean isPackMode = false;
     protected boolean isSiding = false;
     protected int preMainCount = 0, preExtraCount = 0, preSideCount = 0;
+    /** 换侧起点（enterSideMode 时的当前对局卡组三区卡码）：“重置”键恢复到这份内容，
+     *  而不是从磁盘 ydk 重读——第 2/3 局之间磁盘上那份已不是当前对局使用的卡组 */
+    protected final List<Integer> sidingBaseMain = new ArrayList<>();
+    protected final List<Integer> sidingBaseExtra = new ArrayList<>();
+    protected final List<Integer> sidingBaseSide = new ArrayList<>();
+    /** 换侧提交闸门：点“完成”后置真，防双击把同一席位卡组重复提交——solo 下服务端会把
+     *  第二份按内容归位到另一席位槽位，两席位卡组张数不同即回 ERRMSG_SIDEERROR（副卡组错误） */
+    protected boolean sideSubmitting = false;
     int savedNormalCardWidth = 0;
     int savedNormalCardHeight = 0;
     View rootView;
@@ -133,14 +143,20 @@ abstract class DeckEditorManagerBase {
     protected Button btnSave, btnSaveAs, btnShuffle, btnSort, btnClear, btnDelete, btnExit;
     protected Button btnDeckManager;
     protected Button btnSideFinish, btnSideShuffle, btnSideSort, btnSideReset;
-    // 卡组编辑侧边按钮列双副本：横屏占位 dock（activity_ygo_game 的 layout_game_content 内，
-    // id=layout_deck_side_buttons_dock，按钮列在左卡组布局在右）/竖屏悬浮
-    // （layout_deck_editor 根末尾，id=layout_deck_side_buttons，横向一行左下角），
-    // 按方向各点亮其一；按钮同 ID 双副本时全树 findViewById 按 DFS 先命中当前方向的
-    // 可见副本（dock 在水平行内先于 deck_editor），故经 activity 绑定）：
-    // 仅接线 设置/音乐 两键，其余四键 XML 静态 INVISIBLE 占位；用独立 ID
-    // （btn_deck_settings 等）避免与决斗场按钮列同名致全树 findViewById 错绑
+    // 卡组编辑侧边按钮列：同一份 layout_deck_side_buttons 按方向限定符各自解析——
+    // 横屏为纵向一列贴界面左下缘（layout_deck_editor 顶层水平行的首列 include），
+    // 竖屏为横向一行贴左下角（layout_deck_editor 根末尾的悬浮 include），
+    // 运行时每个方向只有一份副本（早先描述的 activity_ygo_game 内 dock 双副本机制已不存在）。
+    // 接线只涉及 设置(btn_deck_settings)/音乐(btn_deck_sound) 两键，撤销/重做另见 historyPanel；
+    // 用独立 ID（btn_deck_* 而非决斗场的 btn_settings 等）避免共存视图树下同 ID 错绑
     protected ImageView btnDeckSettings, btnDeckSound;
+    // 卡组编辑侧边按钮列的撤销/重做两键（与卡组编辑页同一语义、共用同一份历史）：
+    // 横屏排在设置键上方、竖屏排在可见键行末尾，由 DeckEditorHistoryPanel 接线与点亮
+    protected ImageButton btnDeckUndo, btnDeckRedo;
+    // 侧边按钮列上的“退出多选模式”键（绿勾图标 + 多选短标签）：只在长按进入批量勾选模式时点亮
+    // （横屏在 undo/redo 上方、竖屏在 undo 左侧），点击清空全部勾选并退出，
+    // 接线与显隐见 DeckBatchSelectionManager
+    protected Button btnDeckBatchExit;
     protected ImageTop mImageTop;
     protected CardTypeImage mCardTypeImage;
     protected ImageView ivMainMonsterType, ivMainSpellType, ivMainTrapType;
@@ -163,6 +179,10 @@ abstract class DeckEditorManagerBase {
     protected DeckGridLayoutApplier gridLayout;
     protected DeckStatsPanel statsPanel;
     protected DeckDropHandler dropHandler;
+    /** 长按进入的批量勾选模式（点击勾选、按住整组拖动），与单卡拖拽互斥协作 */
+    protected DeckBatchSelectionManager batchSelection;
+    /** 侧边按钮列上的撤销/重做，与卡组编辑页共用 DeckHistory 单例 */
+    protected DeckEditorHistoryPanel historyPanel;
 
     public CardSearcherManager getCardSearcherManager() {
         return cardSearcherManager;
@@ -170,8 +190,24 @@ abstract class DeckEditorManagerBase {
 
     public void setListener(DeckEditorListener listener) {
         this.listener = listener;
-        this.cardSearcherManager.setListener(count -> {
-            if (listener != null) listener.onSearchResultsUpdated(count);
+        this.cardSearcherManager.setListener(new CardSearcherManagerBase.SearchListener() {
+            @Override
+            public void onSearchResultsUpdated(int count) {
+                if (listener != null) listener.onSearchResultsUpdated(count);
+            }
+
+            /**
+             * 禁限下拉选了 OCG/TCG/简体中文/OCG独有/TCG独有：记下档位并让三个网格就地重画
+             * 卡底的赛制独有标识。只走 updateAvail 而不重建网格（notifyDeckChanged 会把卡片视图
+             * 全部重做，连拖拽监听与批量勾选都要重贴，为个标识不值得）
+             */
+            @Override
+            public void onAvailDisplayChanged(int availLm) {
+                DeckEditorManagerBase.this.availLm = availLm;
+                if (cgvMain != null) cgvMain.updateAvail(mImageTop, availLm);
+                if (cgvExtra != null) cgvExtra.updateAvail(mImageTop, availLm);
+                if (cgvSide != null) cgvSide.updateAvail(mImageTop, availLm);
+            }
         });
     }
     public void refreshLimitList() {
@@ -231,38 +267,40 @@ abstract class DeckEditorManagerBase {
     }
 
     protected void loadDeckFromPath(String deckPath) {
-        File deckFile = new File(deckPath);
-        boolean loaded = false;
-        if (deckFile.exists()) {
-            DeckInfo loadedDeck = DeckLoader.readDeck(cardLoader, deckFile);
-            if (loadedDeck != null) {
-                currentDeck.update(loadedDeck);
-                currentDeck.source = deckFile;
-                isModified = false;
-                loaded = true;
+        // 换卡组后三个区的卡片列表整体替新，批量勾选的下标与旧卡组绑定，必须先退出批量模式
+        if (batchSelection != null) batchSelection.reset();
+        // 载入期屏蔽快照写入：本方法中途的 notifyDeckChanged / applyPackMode 会把“刚读盘的
+        // 旧内容”推成会话游标，末尾就没有更晚的未保存修改可采纳，还会反过来把对端刷回磁盘版本
+        if (historyPanel != null) historyPanel.beginDeckLoad(deckPath);
+        try {
+            // ydk 可能在磁盘上，也可能在卡包 zip/ypk 里（引用路径，无实体文件），
+            // 因此统一用 DeckUtil.ydkExists 守门、readDeck(path) 读取
+            boolean loaded = false;
+            if (DeckUtil.ydkExists(deckPath)) {
+                DeckInfo loadedDeck = DeckLoader.readDeck(cardLoader, deckPath);
+                if (loadedDeck != null) {
+                    currentDeck.update(loadedDeck);
+                    currentDeck.source = new File(deckPath);
+                    isModified = false;
+                    loaded = true;
+                }
             }
-        }
-        String aiDeckDir = AppsSettings.get().getAiDeckDir();
-        isReadonly = deckPath.startsWith(aiDeckDir);
-        if (loaded) {
-            String packDir = AppsSettings.get().getPackDeckDir();
-            String cacheDeckDir = AppsSettings.get().getCacheDeckDir();
-            boolean packMode = deckPath.startsWith(packDir)
-                    || deckPath.startsWith(cacheDeckDir);
-            if (isPackMode != packMode) {
-                gridLayout.applyPackMode(packMode);
-            } else {
-                notifyDeckChanged();
+            //只读与卡包判定统一取 DeckHistory 的目录口径，与“不参与跨编辑器同步”同一根据
+            isReadonly = DeckHistory.isReadonlyDeck(deckPath);
+            if (loaded) {
+                boolean packMode = DeckHistory.isPackDeck(deckPath);
+                if (isPackMode != packMode) {
+                    gridLayout.applyPackMode(packMode);
+                } else {
+                    notifyDeckChanged();
+                }
             }
+            refreshReadonly();
+        } finally {
+            // 载入收尾必达：读卡或目录解析抛异常时也要解除载入屏蔽，
+            // 否则 recordSnapshot 从此永远短路，本侧再也不会写历史也不会广播
+            if (historyPanel != null) historyPanel.endDeckLoad();
         }
-        refreshReadonly();
-    }
-
-    /** Solo match 换 side：按席位卡组文件路径载入该副卡组到编辑器，
-     *  供 {@code EngineCallbackDelegate} 在 SIDING 时先载入再 enterSideMode。路径为空则不动。 */
-    public void loadDeckForSideSwap(String deckPath) {
-        if (deckPath == null || deckPath.isEmpty()) return;
-        loadDeckFromPath(deckPath);
     }
 
     // === 对应 deck_con.cpp: push_main ===
@@ -369,7 +407,7 @@ abstract class DeckEditorManagerBase {
     }
     // === 对应 deck_con.cpp: BUTTON_SIDE_OK ===
     public void sideFinish() {
-        if (!isSiding) return;
+        if (!isSiding || sideSubmitting) return;
         if (currentDeck.mainCards.size() != preMainCount
                 || currentDeck.extraCards.size() != preExtraCount
                 || currentDeck.sideCards.size() != preSideCount) {
@@ -382,15 +420,14 @@ abstract class DeckEditorManagerBase {
         for (Card c : currentDeck.mainCards) main.add(c.Code);
         for (Card c : currentDeck.extraCards) extra.add(c.Code);
         for (Card c : currentDeck.sideCards) side.add(c.Code);
+        // 提交闸门：防双击/连点把同一席位卡组重复提交（见字段注释）；下一席位 enterSideMode 复位
+        sideSubmitting = true;
         if (listener != null) listener.onSideDeckFinished(main, extra, side);
     }
 
     // === 对应 deck_con.cpp: BUTTON_SIDE_RELOAD ===
-    public void sideReset() {
-        if (currentDeckFilePath != null && !currentDeckFilePath.isEmpty()) {
-            loadDeckFromPath(currentDeckFilePath);
-        }
-    }
+    // 换侧重置见 DeckEditorManagerMid#sideReset（恢复到换侧起点，不读磁盘原始 ydk）
+
     // === 对应 deck_con.cpp: BUTTON_CLEAR_DECK ===
     public void clearDeck() {
         if (isReadonly) return;
@@ -458,7 +495,8 @@ abstract class DeckEditorManagerBase {
     }
 
     public void saveDeck() {
-        if (isReadonly) return;
+        // 卡包档案里的 ydk 没有实体文件可写：写回会在磁盘上造出“xxx.ypk!/pack/xxx.ydk”这种垃圾文件
+        if (isReadonly || DeckUtil.isArchiveYdk(currentDeckFilePath)) return;
         if (currentDeckFilePath == null || currentDeckFilePath.isEmpty()) {
             YGOUtil.showTextToast("请先选择或另存卡组");
             return;
@@ -467,6 +505,8 @@ abstract class DeckEditorManagerBase {
         boolean result = DeckUtils.save(currentDeck, deckFile);
         if (result) {
             isModified = false;
+            //已落盘内容成为历史原点：undo 回到这里时不再算“已修改”
+            if (historyPanel != null) historyPanel.markOrigin();
             if (soundManager != null) soundManager.playSoundEffect(SoundManager.SFX.BUTTON);
             YGOUtil.showTextToast(DataManager.get().getStringManager().getSystemString(1335, "保存成功"));
             if (listener != null) listener.onDeckSaved();
@@ -491,6 +531,10 @@ abstract class DeckEditorManagerBase {
             String uncatName = activity.getString(R.string.category_Uncategorized);
             currentDeckCategoryName = uncatName;
             isModified = false;
+            //另存为新卡组：会话跟着换户到新路径，并以当前内容定原点
+            if (historyPanel != null) {
+                historyPanel.markSavedAs(currentDeckFilePath);
+            }
             updateDeckManagerButtonText();
             AppsSettings.get().saveSettings("lastcategory", uncatName);
             AppsSettings.get().saveSettings("lastdeck", name);
@@ -551,6 +595,8 @@ abstract class DeckEditorManagerBase {
         setBtnState(btnShuffle, disabled, textColor);
         setBtnState(btnSort, disabled, textColor);
         setBtnState(btnDelete, disabled, textColor);
+        // 只读与卡包展示不可回退，同步收起侧边撤销/重做两键
+        if (historyPanel != null) historyPanel.refresh();
     }
 
     protected void setBtnState(Button btn, boolean disabled, int textColor) {
@@ -574,6 +620,8 @@ abstract class DeckEditorManagerBase {
     }
 
     public void onDeckCardClicked(DeckInfo.Type type, int position) {
+        // 批量勾选模式：点击只切换勾选，不再清除单选框、也不再显示卡片详情
+        if (batchSelection != null && batchSelection.handleTap(type, position)) return;
         if (cgvMain != null) cgvMain.clearSelection();
         if (cgvExtra != null) cgvExtra.clearSelection();
         if (cgvSide != null) cgvSide.clearSelection();
@@ -598,6 +646,10 @@ abstract class DeckEditorManagerBase {
         refreshCardGroupView(cgvMain, currentDeck.mainCards, DeckInfo.Type.Main);
         refreshCardGroupView(cgvExtra, currentDeck.extraCards, DeckInfo.Type.Extra);
         refreshCardGroupView(cgvSide, currentDeck.sideCards, DeckInfo.Type.Side);
+        // 网格卡片视图已整体重建，批量勾选的打勾图标需按当前勾选集合重新施加
+        if (batchSelection != null) batchSelection.applyChecks();
+        // 卡组内容变化即记一次快照（与游标相同会被去重），供两个编辑器共用的 undo/redo 使用
+        if (historyPanel != null) historyPanel.recordSnapshot();
         if (listener != null) listener.onDeckModified();
     }
 
@@ -608,18 +660,39 @@ abstract class DeckEditorManagerBase {
         groupView.updateTopImage(mImageTop, mLimitList);
         groupView.updateAvail(mImageTop, availLm);
         int count = groupView.getChildCount();
+        boolean batchMode = batchSelection != null && batchSelection.isBatchMode();
         for (int i = 0; i < count; i++) {
             CardView cardView = (CardView) groupView.getChildAt(i);
             final int index = i;
             cardView.setOnClickListener(v -> onDeckCardClicked(type, index));
-            DeckCardAdapter adapter = cardSearcherManager.getSearchAdapter();
-            if (adapter != null) {
-                cardView.setOnTouchListener(adapter.createDragTouchListener(type, index, cardView.getCard(), touchSlop, isReadonly || isPackMode));
+            // 批量模式下拖动语义变为“整组搬运”，由 batchSelection 提供触摸监听；
+            // 未进入批量模式时维持原单卡拖拽路径不变
+            if (batchMode) {
+                cardView.setOnTouchListener(batchSelection.createBatchTouchListener(type, index, cardView));
+            } else {
+                DeckCardAdapter adapter = cardSearcherManager.getSearchAdapter();
+                if (adapter != null) {
+                    cardView.setOnTouchListener(adapter.createDragTouchListener(type, index, cardView.getCard(), touchSlop, isReadonly || isPackMode));
+                }
             }
+            // 长按入口（进入批量模式）与打勾态随视图重建一并施加
+            if (batchSelection != null) batchSelection.attachCardView(cardView, type, index);
         }
     }
 
     protected void loadLastDeck() {
+        // 优先打开共享会话里正在编辑的那份卡组：settings 的 lastdeckpath 只由本编辑器写入，
+        // 卡组编辑页切卡组不会更新它，直接沿用它会让两侧停在不同卡组上、看不到对方最后修改
+        String sessionPath = historyPanel != null ? historyPanel.sessionDeckPath() : "";
+        if (!sessionPath.isEmpty() && DeckUtil.ydkExists(sessionPath)) {
+            currentDeckFilePath = sessionPath;
+            currentDeckCategoryName = DeckUtil.getDeckTypeName(sessionPath);
+            currentDeckName = DeckUtil.ydkDisplayName(sessionPath);
+            loadDeckFromPath(sessionPath);
+            updateDeckManagerButtonText();
+            return;
+        }
+
         AppsSettings settings = AppsSettings.get();
         String lastDeckPath = settings.getLastDeckPath();
         String lastDeckName = settings.getLastDeckName();
@@ -627,17 +700,19 @@ abstract class DeckEditorManagerBase {
 
         String savedPath = settings.getSettings("lastdeckpath");
         if (savedPath != null && !savedPath.isEmpty()) {
-            if (!new File(savedPath).exists()) {
+            if (!DeckUtil.ydkExists(savedPath)) {
+                // 旧版本把卡包 ydk 解压到 cacheDeck 再把那条实体路径存为“最后卡组”；
+                // 现在不再解压，同一个卡包只能从档案里读，按同名换回引用路径，
+                // 升级后打开编辑器仍然落在同一份卡包上
                 String cacheDeckDir = settings.getCacheDeckDir();
                 if (cacheDeckDir != null && savedPath.startsWith(cacheDeckDir)) {
-                    try {
-                        DeckUtil.getExpansionsDeckList();
-                    } catch (Exception e) {
-                        // ignore
+                    String relocated = DeckUtil.findPackYdkByName(new File(savedPath).getName());
+                    if (relocated != null) {
+                        savedPath = relocated;
                     }
                 }
             }
-            if (new File(savedPath).exists()) {
+            if (DeckUtil.ydkExists(savedPath)) {
                 currentDeckFilePath = savedPath;
                 currentDeckCategoryName = lastCategory != null ? lastCategory : "";
                 currentDeckName = lastDeckName != null ? lastDeckName : "";
@@ -692,8 +767,8 @@ abstract class DeckEditorManagerBase {
         }
         if (currentDeckFilePath != null && !currentDeckFilePath.isEmpty()) {
             AppsSettings.get().saveSettings("lastdeckpath", currentDeckFilePath);
-            String deckName = new File(currentDeckFilePath).getName().replace(".ydk", "");
-            AppsSettings.get().saveSettings("lastdeck", deckName);
+            // 卡包 ydk 现在可能是压缩包引用路径，取名字不能用 File.getName 之外的目录假设
+            AppsSettings.get().saveSettings("lastdeck", DeckUtil.ydkDisplayName(currentDeckFilePath));
         }
     }
 

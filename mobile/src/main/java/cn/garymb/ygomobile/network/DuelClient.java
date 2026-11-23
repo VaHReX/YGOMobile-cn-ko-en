@@ -4,11 +4,13 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -57,9 +59,14 @@ public class DuelClient implements YGOProtocol {
         /**
          * STOC_UNDO_ACK（本工程扩展）：服务端对 CTOS_UNDO 的结果。
          * result 为 {@code YGOProtocol.UNDO_ACK_*}；turn/currentPlayer/phase 为回退后的回合数、
-         * 当前回合玩家（协议侧 0/1）与阶段，随随后的 MSG_RELOAD_FIELD 一同生效。
+         * 当前回合玩家（协议侧 0/1）与阶段，随随后的 MSG_RELOAD_FIELD 一同生效；
+         * chainEvents 为回退后重放前缀内的「有效效果发动」条数（旧服务端无此字段时 -1），
+         *  客户端据此把发动账本超出该条数的后缀条目剪除（撤回连带回退已使用效果标记）；
+         *  ackRound 为服务端撤回轮次号（每受理一轮 OK/REBUILT 自增，旧服务端无此字段时 -1）：
+         *  超时自愈后迟到的旧轮 ACK 据此拒收，不再回填陈旧局面。
          */
-        default void onUndoResult(int result, int turn, int currentPlayer, int phase) {}
+        default void onUndoResult(int result, int turn, int currentPlayer, int phase,
+                                   int chainEvents, int ackRound) {}
         /**
          * STOC_UNDO_STATE（本工程扩展）：服务端按本连接身份告知「现在是否还有可撤回的动作」。
          * 1 = 本席位（或房主可代撤范围内）存在动作锚点，客户端据此让撤回图标闪动发光；
@@ -169,11 +176,11 @@ public class DuelClient implements YGOProtocol {
 
                 handlePacket(data);
             }
-        } catch (java.net.SocketException e) {
+        } catch (SocketException e) {
             if (running.get()) {
                 Log.w(TAG, "Connection aborted by remote: " + e.getMessage());
             }
-        } catch (java.io.EOFException e) {
+        } catch (EOFException e) {
             if (running.get()) {
                 Log.w(TAG, "Connection closed by remote (EOF)");
             }
@@ -354,15 +361,18 @@ public class DuelClient implements YGOProtocol {
         }
     }
 
-    /** STOC_UNDO_ACK 载荷：{@code [result(1B)][turn(1B)][currentPlayer(1B)][phase(u16 LE)]}。 */
+    /** STOC_UNDO_ACK 载荷：{@code [result(1B)][turn(1B)][currentPlayer(1B)][phase(u16 LE)][chainEvents(i32 LE)][ackRound(i32 LE)]}；
+     *  末尾两个可选字段为本工程逐版新增：旧服务端 5/9 字节短载荷时解析为 -1（账本回退/轮次校验均跳过）。 */
     private void handleUndoAck(ByteBuffer buf) {
         if (buf.remaining() < 5) return;
         int result = buf.get() & 0xFF;
         int turn = buf.get() & 0xFF;
         int currentPlayer = buf.get() & 0xFF;
         int phase = buf.getShort() & 0xFFFF;
+        int chainEvents = buf.remaining() >= 4 ? buf.getInt() : -1;
+        int ackRound = buf.remaining() >= 4 ? buf.getInt() : -1;
         if (listener != null) {
-            listener.onUndoResult(result, turn, currentPlayer, phase);
+            listener.onUndoResult(result, turn, currentPlayer, phase, chainEvents, ackRound);
         }
     }
 

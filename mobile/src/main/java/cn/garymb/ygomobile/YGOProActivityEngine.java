@@ -35,6 +35,7 @@ import java.util.List;
 
 import cn.garymb.ygodata.YGOGameOptions;
 import cn.garymb.ygomobile.audio.SoundManager;
+import cn.garymb.ygomobile.core.IrrlichtBridge;
 import cn.garymb.ygomobile.engine.NativeScriptBootstrap;
 import cn.garymb.ygomobile.game.chat.ChatInputUI;
 import cn.garymb.ygomobile.game.deck.DeckEditorManager;
@@ -137,14 +138,15 @@ abstract class YGOProActivityEngine extends YGOProActivityUi {
     }
 
     /**
-     * 启动即在子线程引导 native 决斗引擎：scripts.zip 解压、卡包脚本/cdb 物化、
-     * cards.cdb/扩展 cdb 加载（{@code NativeScriptBootstrap#ensureEngineReady} 的全部
-     * 环节，即 {@code OcgDuelEngine.init} 的首次数秒一次性开销）在 Activity 创建的
+     * 启动即在子线程引导 native 决斗引擎：旧版物化残留回收、
+     * cards.cdb/卡包 cdb 直读装载（{@code NativeScriptBootstrap#ensureEngineReady} 的全部
+     * 环节，即 {@code OcgDuelEngine.init} 的首次一次性开销：扫档案中央目录建索引 + 装载卡数据）
+     * 在 Activity 创建的
      * 第一刻就开始后台进行，与主菜单/建房/猜拳/选先后攻全部并行，使首次建立
      * 局域网主机与开局发牌都无需再等待引擎引导。预热进程内最早锚点已在
      * {@code App#onCreate}（AppEngineWarmUp），此处是同幂等方法的重申入口：
      * App 阶段因资源目录尚未就绪等瞬态原因失败时，本处重试链（含延后重试）
-     * 继续覆盖；已就绪时 ensureEngineReady 毫秒级返回，不重复解压/加载。
+     * 继续覆盖；已就绪时 ensureEngineReady 毫秒级返回，不重复清理/加载。
      */
     protected void warmUpDuelEngine() {
         NativeScriptBootstrap.warmUpAsync("EngineWarmUp", "游戏-引擎预热");
@@ -162,7 +164,7 @@ abstract class YGOProActivityEngine extends YGOProActivityUi {
             }
         }
 
-        String[] args = cn.garymb.ygomobile.core.IrrlichtBridge.getArgs(intent);
+        String[] args = IrrlichtBridge.getArgs(intent);
         if (args != null && args.length > 0) {
             return handleArgs(args);
         }
@@ -296,9 +298,11 @@ abstract class YGOProActivityEngine extends YGOProActivityUi {
 
     /**
      * 回放结束：用阶段文字（case 101）显示胜负 + 胜利原因，委托 EngineCallbackDelegate 的居中特效层。
+     * 胜负归属（YOU WIN / YOU LOSE / DRAW）与说明里的【败方】昵称都由 delegate 按当前视角换算
+     *（对齐 duelclient.cpp MSG_WIN 的 LocalPlayer(player)），调用方不再传胜者名。
      */
-    public void showReplayResult(int winner, int reason, String winnerName) {
-        if (engineCallback != null) engineCallback.showReplayResult(winner, reason, winnerName);
+    public void showReplayResult(int winner, int reason) {
+        if (engineCallback != null) engineCallback.showReplayResult(winner, reason);
     }
 
     // 录像回放的召唤/连锁/无效大图与阶段文字已由实况管线（EngineCallbackDelegate 的消息回调）

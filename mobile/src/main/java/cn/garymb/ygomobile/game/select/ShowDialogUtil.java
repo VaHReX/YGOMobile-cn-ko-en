@@ -17,6 +17,7 @@ import java.util.Random;
 import cn.garymb.ygomobile.YGOProActivity;
 import cn.garymb.ygomobile.loader.ImageLoader;
 import cn.garymb.ygomobile.render.card.CardDetailPanel;
+import cn.garymb.ygomobile.ui.dialogs.common.EditTextDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.AnnounceAttributeDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.AnnounceCardDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.AnnounceNumberDialog;
@@ -65,6 +66,13 @@ public class ShowDialogUtil {
     private boolean rpsAnimating;
     private boolean pendingHandSelect;
     private FirstOrSecondDialog tpSelectDialog;
+    /**
+     * 决斗中脚本猜拳（MSG_ROCK_PAPER_SCISSORS=132，如「变则齿轮」58297729）的弹窗载体：与开局握手用的
+     * {@link #handSelectDialog} 分实例持有——后者绑着一整套开局猜拳状态机（rpsResultShown / lastHandSent /
+     * rpsAnimating / pendingHandSelect，平局还要重挂窗），而对局内的应答走 CTOS_RESPONSE、结果不决定
+     * 先后攻，混用会让两个阶段互相串扰。结果动画（133）不归本实例，走 SpecEffectOverlay 的 case 100。
+     */
+    private RPSDialog inDuelRpsDialog;
 
     // === 同包协作类（构造时注入 this，经包级私有直连上述依赖） ===
 
@@ -177,6 +185,11 @@ public class ShowDialogUtil {
         if (handSelectDialog != null && handSelectDialog.isShowing()) {
             handSelectDialog.repositionAfterRotation();
         }
+        // 决斗中猜拳窗同样以 showAsDropDown 相对 layout_game_right 定位、不经 DraggablePopupHelper
+        // 包装，旋转重建后必须按新视图重算偏移，否则横竖屏切换后停在左下角
+        if (inDuelRpsDialog != null && inDuelRpsDialog.isShowing()) {
+            inDuelRpsDialog.repositionAfterRotation();
+        }
     }
 
     /**
@@ -213,6 +226,36 @@ public class ShowDialogUtil {
                 }
             });
         }
+    }
+
+    /**
+     * MSG_ROCK_PAPER_SCISSORS(132)：决斗中脚本发起的猜拳（duelclient.cpp L3973-3980 弹 wHand）。
+     * 复用 {@link RPSDialog} 的三个手势按钮，但点击后走 {@link #sendResponseInt}：core 侧
+     * field::rock_paper_scissors 停在 PROCESSOR_ROCK_PAPER_SCISSORS 读 int32 应答，与开局握手层的
+     * CTOS_HAND_RESULT 是两条不同协议路径（区分源 event_handler.cpp BUTTON_HAND L42-58 按 curMsg 分流）。
+     * 去重与「延迟到布局完成再显示」的实例持有沿用 showHandSelectDialog 口径：绝不创建第二个实例，
+     * 否则前一个窗无人持有引用、点不掉。结果动画由紧随的 MSG_HAND_RES 走特效层，不依赖本窗实例。
+     */
+    public void showInDuelRpsDialog() {
+        if (inDuelRpsDialog != null) {
+            // 已显示、或已创建并等布局完成后显示（延迟分支）：复用，不重建第二个窗
+            if (inDuelRpsDialog.isShowing()) return;
+            inDuelRpsDialog.dismiss();
+            inDuelRpsDialog = null;
+        }
+        RPSDialog dialog = new RPSDialog(activity);
+        inDuelRpsDialog = dialog;
+        dialog.setCancelable(false)
+                .setOnResultListener(result -> {
+                    // 点中即先收窗再发应答（弹窗已在按钮 ACTION_UP 里 dismiss，此处再收一次保证
+                    // 动画窗与尺寸监听一并释放），与开局握手窗同一时序约定
+                    dialog.dismiss();
+                    sendResponseInt(result);
+                });
+        // 猜拳无「取消/放弃」语义（core 只收 1/2/3），上一选择会话残留的 cancelOrFinish 在此既无
+        // 作用又会遮挡弹窗，按是/否询问窗同一口径收起
+        panel().hideCancelOrFinishButton();
+        dialog.show();
     }
 
     public void showTPSelectDialog() {
@@ -322,6 +365,9 @@ public class ShowDialogUtil {
                 return;
             }
 
+            // 登记我方当前对局卡组（本入口为非大厅流程的卡组选择，如 STOC_SELECT_HAND）；
+            // match 局间换 side 时编辑器据此载入，而不是从磁盘 ydk 重读
+            engine().updateMatchDeck(0, main, extra, side);
             engine().sendDeckUpdate(main, extra, side);
         }, "DeckLoad").start();
     }
@@ -366,8 +412,13 @@ public class ShowDialogUtil {
         cardCtl.showTributeSelectDialog(data);
     }
 
+    /**
+     * MSG_SELECT_COUNTER（取除指示物）：对齐 gframe 桌面版，不开任何弹窗——候选卡已由引擎
+     *（{@code MessageUIHandler.applyCounterCandidates}）标为场上可选，此处只开启场上点卡取除
+     * 会话，取满后由会话自行组 uint16 数组应答（event_handler.cpp L1536-1556）。
+     */
     public void showCounterSelectDialog(ByteBuffer data) {
-        YesOrNoDialog.showCounterSelectDialog(activity, data);
+        fieldCtl().beginCounterSelect();
     }
 
     public void showSumSelectDialog(ByteBuffer data) {
@@ -411,10 +462,14 @@ public class ShowDialogUtil {
     // === 决斗结果 / 结束 ===
 
     /**
-     * 连接断开 / 决斗结束时统一关闭所有可能残留的选择类对话框，
-     * 避免遗留弹窗遮挡重新显示的局域网主界面（由 YGOProActivity returnToLanMain 调用）
+     * 连接断开 / 决斗结束 / 点击撤回瞬间统一关闭全部可能残留的选择类对话框，
+     * 避免遗留弹窗遮挡重新显示的局域网主界面（由 YGOProActivity returnToLanMain 与
+     * closeDuelUiForUndo 调用）。
+     *
+     * @return 本次是否真的关掉了询问窗（YesOrNoDialog）之外的应答类弹窗：调用方（撤回）
+     *         据此决定被拒时是「按询问快照重派发重建」还是「恢复询问窗旧实例」
      */
-    public void dismissOpenGameDialogs() {
+    public boolean dismissOpenGameDialogs() {
         if (handSelectDialog != null) {
             handSelectDialog.dismiss();
             handSelectDialog = null;
@@ -425,28 +480,50 @@ public class ShowDialogUtil {
         }
         rpsResultShown = false;
         lastHandSent = 0;
-        // 一并关闭选项弹窗与全部宣言类弹窗（属性/数字/种族/卡片），与退出对战同口径：
-        // 这些弹窗不可取消，决斗结束时若仍在显示会残留遮挡，故统一主动关闭
-        dismissAnnounceDialogs();
+        // 卡片展示/确认窗（含堆叠区实时列表与确认类普通窗）：卡详面板只持最近一个实例引用，
+        // 被后续弹窗覆盖引用的旧窗会漏关，统一按静态名单收口（决斗退出/观战退出不残留）
+        CardDisplayDialog.dismissAllOpen();
+        // 一并关闭选项弹窗与全部宣言/表示形式弹窗（选项/属性/数字/种族/卡片/形式），与退出对战同口径：
+        // 这些弹窗不可取消，决斗结束或撤回时若仍在显示会残留遮挡，且按钮已发不出应答，故统一主动关闭
+        boolean closed = dismissAnnounceDialogs();
+        // 决斗中猜拳窗（MSG_ROCK_PAPER_SCISSORS）：结果动画属特效层，由 releaseSpecOverlayForRebuild /
+        // hide 收口，此处只管弹窗。计入 closed——132 现已属可应答询问（有快照），被撤回收口后需按快照重派发
+        if (inDuelRpsDialog != null) {
+            closed |= inDuelRpsDialog.isShowing();
+            inDuelRpsDialog.dismiss();
+            inDuelRpsDialog = null;
+        }
         // 连锁场上点击模式复位：关闭询问窗、退出命令上下文并清除高亮，避免脏状态残留到下一局
         YesOrNoDialog.dismissChainQuery();
+        // 知会窗（对位 C++ wMessage）同样收口：不可取消的它若不主动关闭会遮挡返回界面；
+        // 不计入 closed——它不是应答类弹窗，撤回被拒时无需按询问快照重建
+        YesOrNoDialog.dismissNoticeDialog();
+        // 文本输入弹窗（录像保存/重命名、新建与重命名卡组与分类）同样是锚在 Activity 窗口的独立
+        // 窗口，不随决斗 UI 隐显销毁；一律程序化关闭（不回调监听），否则误被当成玩家取消会多走
+        // 一层后续流程（如把待保存录像静默落盘、或继续弹下一张保存窗）
+        EditTextDialog.dismissAllOpen();
         GameFieldController fieldController = fieldCtl();
         if (fieldController != null) fieldController.endChainCommand();
         clearChainSelect();
-        panel().dismissOpenDialogs();
+        closed |= panel().dismissOpenDialogs();
+        return closed;
     }
 
     /**
-     * 退出对战（layout_game_right 隐藏）/ 决斗结束时关闭可能残留的宣言类与选项类对话框：
-     * 选项 / 宣言属性 / 宣言数字 / 宣言种族 / 宣言卡片（由 YGOProActivity hideGameUI 与
-     * dismissOpenGameDialogs 调用）。
+     * 退出对战（layout_game_right 隐藏）/ 决斗结束 / 撤回瞬间关闭可能残留的宣言类与选项类对话框：
+     * 选项 / 宣言属性 / 宣言数字 / 宣言种族 / 宣言卡片 / 表示形式（由 YGOProActivity hideGameUI、
+     * dismissOpenGameDialogs 与 closeDuelUiForUndo 调用）。
      * 各弹窗的实例引用与去重已下沉至对应 ui.dialogs 静态工厂的 current，此处调用其 dismissCurrent()。
+     *
+     * @return 六个弹窗中是否至少关掉了个在显窗
      */
-    public void dismissAnnounceDialogs() {
-        OptionDialog.dismissCurrent();
-        AnnounceAttributeDialog.dismissCurrent();
-        AnnounceNumberDialog.dismissCurrent();
-        AnnounceRaceDialog.dismissCurrent();
-        AnnounceCardDialog.dismissCurrent();
+    public boolean dismissAnnounceDialogs() {
+        boolean closed = OptionDialog.dismissCurrent();
+        closed |= AnnounceAttributeDialog.dismissCurrent();
+        closed |= AnnounceNumberDialog.dismissCurrent();
+        closed |= AnnounceRaceDialog.dismissCurrent();
+        closed |= AnnounceCardDialog.dismissCurrent();
+        closed |= PosSelectDialog.dismissCurrent();
+        return closed;
     }
 }

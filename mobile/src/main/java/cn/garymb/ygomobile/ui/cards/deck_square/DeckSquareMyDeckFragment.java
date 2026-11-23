@@ -13,8 +13,6 @@ import androidx.annotation.NonNull;
 import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.GridLayoutManager;
 
-import java.io.IOException;
-
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.lite.databinding.FragmentDeckSquareMyDeckBinding;
 import cn.garymb.ygomobile.bean.events.DeckDeleteEvent;
@@ -196,14 +194,21 @@ public class DeckSquareMyDeckFragment extends Fragment {
             return result;
 
         }).fail((e) -> {
+            // 登录期间对话框/宿主可能已销毁（旋转、关闭）：binding 已置空，不能再碰视图
+            if (binding == null) {
+                return;
+            }
             YGOUtil.showTextToast(R.string.logining_failed);
             binding.llMainUi.setVisibility(View.GONE);
             binding.progressBar.setVisibility(View.GONE);
             binding.btnLogin.setEnabled(true);
         }).done((result) -> {
+            // 同上：回调可能晚于 onDestroyView，先判空避免空指针
+            if (binding == null) {
+                return;
+            }
             if (result != null) {
                 binding.llMainUi.setVisibility(View.VISIBLE);
-                deckListAdapter.loadData();
                 binding.llDialogLogin.setVisibility(View.GONE);
                 binding.progressBar.setVisibility(View.GONE);
                 binding.btnLogin.setEnabled(true);
@@ -216,9 +221,17 @@ public class DeckSquareMyDeckFragment extends Fragment {
                 mcUser.setAvatar_url(ChatMessage.getAvatarUrl(userName));
                 mcUser.setToken(result.token);
 
-                GlideCompat.with(getActivity()).load(mcUser.getAvatar_url()).into(binding.myDeckAvatar);//刷新头像图片
+                if (getActivity() != null) {
+                    GlideCompat.with(getActivity()).load(mcUser.getAvatar_url()).into(binding.myDeckAvatar);//刷新头像图片
+                }
                 UserManagement.getDx().setMcUser(mcUser);
+                // 先用服务器现有数据展示在线列表：同步需要网络往返，不能让列表在同步完成前空白
+                deckListAdapter.loadData();
                 YGOUtil.showTextToast(R.string.login_succeed);
+                // 登录成功、token 已写入后再做双向同步：同步内部读取已保存 token，
+                // 必须等登录请求返回后才启动（旧写法在登录请求发出后即并行同步，
+                // 此时 token 尚未落库，synchronizeDecks 读到 null 直接跳过）
+                syncDecksAfterLogin();
             } else {
                 YGOUtil.showTextToast(R.string.logining_failed);
                 binding.llMainUi.setVisibility(View.GONE);
@@ -227,18 +240,44 @@ public class DeckSquareMyDeckFragment extends Fragment {
             }
 
         });
-        /* 自动同步 */
+    }
+
+    /**
+     * 登录成功后的卡组双向同步：后台执行 {@link DeckSquareApiUtil#synchronizeDecks()}
+     * （上传本地新增/较新的卡组、下载云端较新的卡组），完成后在主线程刷新「我的在线备份」
+     * 列表，并通知宿主卡组管理对话框刷新「本地卡组」页签（云卡组可能已下载到本地目录），
+     * 使登录后立即看到同步结果。
+     */
+    private void syncDecksAfterLogin() {
         VUiKit.defer().when(() -> {
-            try {
-                DeckSquareApiUtil.synchronizeDecks();
-            } catch (IOException e) {
-                return e;
-            }
+            DeckSquareApiUtil.synchronizeDecks();
             return 0;
         }).fail((e) -> {
             LogUtil.e(TAG, "Sync decks failed: " + e);
+            // 同步失败仍按服务器现有数据刷新列表，避免登录后一片空白
+            if (binding != null) {
+                deckListAdapter.loadData();
+            }
         }).done((result) -> {
-
+            if (binding == null) {
+                return;
+            }
+            // 同步完成后强制重新拉取一次：登录成功时发出的列表请求可能晚于同步返回，
+            // 用较旧响应覆盖缓存；此处以服务器最新数据重建列表
+            deckListAdapter.loadData(true);
+            refreshHostLocalDeckList();
         });
+    }
+
+    /** 同步完成后通知宿主卡组管理对话框刷新「本地卡组」页签 */
+    private void refreshHostLocalDeckList() {
+        if (getActivity() == null) {
+            return;
+        }
+        Fragment fragment = getActivity().getSupportFragmentManager()
+                .findFragmentByTag(DeckManageDialog.DIALOG_TAG);
+        if (fragment instanceof DeckManageDialog) {
+            ((DeckManageDialog) fragment).refreshLocalDeckList();
+        }
     }
 }

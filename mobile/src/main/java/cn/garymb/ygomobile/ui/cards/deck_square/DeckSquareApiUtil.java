@@ -1,17 +1,20 @@
 package cn.garymb.ygomobile.ui.cards.deck_square;
 
-import android.widget.Toast;
+import android.os.Looper;
 
 import com.google.gson.Gson;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import cn.garymb.ygomobile.AppsSettings;
@@ -68,7 +71,9 @@ public class DeckSquareApiUtil {
         Integer serverUserId = SharedPreferenceUtil.getServerUserId();
 
         if (serverToken == null || serverUserId == -1) {
-            YGOUtil.showTextToast(R.string.login_mycard);
+            // 本方法会在后台线程执行（卡组同步），提示一律走 YGOUtil.show
+            // 主线程投递，避免非 Looper 线程直接 Toast 抛异常
+            YGOUtil.show(R.string.login_mycard);
             return null;
         }
         return new LoginToken(serverUserId, serverToken);
@@ -117,7 +122,7 @@ public class DeckSquareApiUtil {
     public static MyDeckResponse getUserDecks(LoginToken loginToken) throws IOException {
 
         if (loginToken == null) {
-            YGOUtil.showTextToast("Login first", Toast.LENGTH_LONG);
+            YGOUtil.show("Login first");
 
             return null;
         }
@@ -137,7 +142,7 @@ public class DeckSquareApiUtil {
 
 
         if (result.code == 20) {//用户身份验证失败
-            YGOUtil.showTextToast("Login first", Toast.LENGTH_LONG);
+            YGOUtil.show("Login first");
         }
         return result;
     }
@@ -427,7 +432,18 @@ public class DeckSquareApiUtil {
         String url = "http://rarnu.xyz:38383/api/mdpro3/deck/" + deckId;
     }
 
+    /** 卡组双向同步互斥锁：打开卡组管理页与在线备份页登录后都会触发同步，
+     *  并发执行会对共享缓存 getOriginalData() 同时写入、并可能为同一本地卡组
+     *  重复申请 deckId，故统一串行化 */
+    private static final Object SYNC_LOCK = new Object();
+
     public static void synchronizeDecks() throws IOException {
+        synchronized (SYNC_LOCK) {
+            doSynchronizeDecks();
+        }
+    }
+
+    private static void doSynchronizeDecks() throws IOException {
         // 检查用户是否登录
         LoginToken loginToken = DeckSquareApiUtil.getLoginData();
         if (loginToken == null) {
@@ -444,9 +460,9 @@ public class DeckSquareApiUtil {
         }
         List<MyOnlineDeckDetail> onlineDecks = onlineDecksResponse.getData();
 
-        // 缓存原始在线卡组（使用副本避免后续修改影响缓存）
-        DeckManagerFragment.getOriginalData().clear();
-        DeckManagerFragment.getOriginalData().addAll(onlineDecks);
+        // 缓存原始在线卡组：写操作切主线程执行（见 updateOriginalDataCache），
+        // 避免与列表 UI 的遍历读取并发；传入时即复制快照，后续移除不影响缓存
+        updateOriginalDataCache(onlineDecks);
 
         // 遍历本地卡组与云备份卡组，过滤差异项（使用迭代器避免ConcurrentModificationException）
         List<MyDeckItem> syncUploadDecks = new ArrayList<>();
@@ -472,8 +488,8 @@ public class DeckSquareApiUtil {
                 if (localDeckName.equals(onLineDeckName) && localDeck.getDeckType().equals(onlineDeck.getDeckType())) {
                     // 时区校准：将两个时间戳都转换为系统默认时区的 Date 对象进行比较
                     // 这样可以确保在同一个时区下比较时间的先后
-                    java.util.Date onlineDate = new java.util.Date(onlineDeck.getDeckUpdateDate() - 28800000);
-                    java.util.Date localDate = new java.util.Date(localDeck.getUpdateTimestamp());
+                    Date onlineDate = new Date(onlineDeck.getDeckUpdateDate() - 28800000);
+                    Date localDate = new Date(localDeck.getUpdateTimestamp());
 
                     if (onlineDate.after(localDate)) {
                         // 在线卡组更新，需要下载到本地覆盖
@@ -535,6 +551,44 @@ public class DeckSquareApiUtil {
                 LogUtil.d(TAG, "synchronizeDecks 保存成功√的 云备份卡组: " + fileFullPath);
             }
         }
+    }
+
+    /**
+     * 把在线卡组列表写入共享缓存：写操作必须切到主线程执行，避免与列表 UI 的
+     * 遍历读取并发（ArrayList 非线程安全）。后台线程调用时等待主线程写入完成
+     * 后再返回，保证同步结束后调用方在主线程刷新列表能读到最新缓存。
+     *
+     * @param onlineDecks 在线卡组列表：方法内先复制快照，调用方随后对原列表的
+     *                    移除操作不会影响缓存内容
+     */
+    private static void updateOriginalDataCache(List<MyOnlineDeckDetail> onlineDecks) {
+        final List<MyOnlineDeckDetail> snapshot = new ArrayList<>(onlineDecks);
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyOriginalDataCache(snapshot);
+            return;
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        VUiKit.post(() -> {
+            try {
+                applyOriginalDataCache(snapshot);
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            if (!latch.await(3, TimeUnit.SECONDS)) {
+                LogUtil.w(TAG, "updateOriginalDataCache timeout: 主线程繁忙，缓存将在下次刷新时重建");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** 主线程内替换缓存内容（仅由 {@link #updateOriginalDataCache} 调用） */
+    private static void applyOriginalDataCache(List<MyOnlineDeckDetail> decks) {
+        List<MyOnlineDeckDetail> cache = DeckManagerFragment.getOriginalData();
+        cache.clear();
+        cache.addAll(decks);
     }
 
     public static void deleteDecks(List<DeckFile> deckFileList) {

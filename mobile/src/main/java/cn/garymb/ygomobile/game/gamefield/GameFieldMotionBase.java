@@ -34,7 +34,9 @@ abstract class GameFieldMotionBase {
 
     /**
      * 触发 LP 变化动画（duelclient.cpp MSG_DAMAGE/RECOVER/LPUPDATE/PAY_LPCOST）
-     * @param showText true=伤害/回复（先 30 帧浮字再扣减）；false=LPUPDATE/支付（立即扣减）
+     * @param showText true=伤害/回复/支付基本分（先 30 帧浮字再扣减，对齐 MSG_DAMAGE L3583-3585、
+     *                 MSG_RECOVER L3612-3614、MSG_PAY_LPCOST L3764-3766 的 lpcstring + WaitFrameSignal(30)+(11)）；
+     *                 false=LPUPDATE（无浮字，置 lpframe=10 后直接逐帧过渡，对齐 MSG_LPUPDATE L3666-3667）
      */
     public void startLpChange(int player, int finalLp, int color, String text, boolean showText) {
         if (field.instantPlace) {
@@ -182,6 +184,9 @@ abstract class GameFieldMotionBase {
     }
 
     public void updateCardAnimation(int frame) {
+        // 渲染循环心跳（GL 线程每帧只到这里一次，见 GameFieldView.onDrawFrame）：回放投喂侧据此区分
+        // 「动画真在推进但队列长」与「渲染缺位、aniFrame 永不递减」两种情形，见 GameField.animBeatMs
+        field.animBeatMs = System.currentTimeMillis();
         for (int p = 0; p < 2; p++) {
             updateListAnimation(field.players[p].deck);
             updateListAnimation(field.players[p].hand);
@@ -506,6 +511,19 @@ abstract class GameFieldMotionBase {
             return;
         }
         float[] loc = field.getCardLocation(pcard);
+        // 目标几何无效（location 不属于任何已知区域分支，getCardLocation 返回全 0）：
+        // 不能飞向世界原点（画面上落在侧列/对方除外区一带后消失），保持当前位置不动
+        //（对齐 C++ GetCardLocation 对未处理分支不改 curPos 的语义）
+        if (loc[0] == 0f && loc[1] == 0f && loc[2] == 0f && pcard.location != 0) {
+            return;
+        }
+        // 飞行起点兜底（对齐 C++ MoveCard 从 curPos 起飞的语义）：新对象/异常路径的卡从未定位过
+        // （cur 全 0）时若直接起飞，会从世界原点——画面上恰好落在对方除外/侧列一带——飞向目标，
+        // 出现「卡片错误移动到对方除外区附近然后消失」的假飞行。此时先把起点吸附到它当前所在区。
+        if (pcard.curX == 0f && pcard.curY == 0f && pcard.curZ == 0f
+                && pcard.location != 0) {
+            setCardPos(pcard);
+        }
 
         pcard.animJitterX = jitterX;
         pcard.animDelayFrame = Math.max(0, delay);

@@ -284,17 +284,30 @@ abstract class GameFieldViewBase extends GLSurfaceView implements GLSurfaceView.
         requestRender();
     }
 
-    /** 当前选中（移动端语义=点击，对位桌面悬停 hovered_card）并联动展示关联图标的卡片 */
-    volatile ClientCard markedCard;
+    /**
+     * 取消「点击卡片」产生的全部选中视觉（用户规格：点其它按钮/聊天输入框/其它弹窗等
+     * 卡片以外的位置即取消选中）：除金色呼吸外框与手卡抬升所需的选中三元组外，一并解除
+     * 点击时联动的装备/对象/连锁对象图标标记（{@code applyShowMarks} 留下的红色光晕），
+     * 否则只清外框而图标残留，看起来仍像处于被选中态。不触及通讯选择态
+     * （field.selectedCards 与蚂蚁线），那些由各自的应答会话管理。
+     */
+    public void clearClickSelection() {
+        clearSelection();
+        applyShowMarks(null);
+    }
 
     /**
      * event_handler.cpp 悬停触发 SetShowMark 的点击版：先对上一张解除装备/对象/连锁对象
-     * 图标标记，再对新点击卡置位；由 FieldTouchPicker 在卡片命中处调用
+     * 图标标记，再对新点击卡置位；由 FieldTouchPicker 在卡片命中处调用。
+     * <p>
+     * 「上一张」的引用存在 {@link GameField#showMarkedCard}（对位 C++ 的 dField.hovered_card）而不
+     * 是本视图字段：横竖屏切换会重建 GameFieldView 实例，随视图丢失的引用会使新视图只会点亮
+     * 不会清除，表现为旧关系卡与新关系卡同时带 target 图标。
      */
     void applyShowMarks(ClientCard card) {
         GameField f = field;
         if (f == null) return;
-        ClientCard old = markedCard;
+        ClientCard old = f.showMarkedCard;
         if (old == card) return;
         if (old != null) {
             try {
@@ -302,7 +315,7 @@ abstract class GameFieldViewBase extends GLSurfaceView implements GLSurfaceView.
             } catch (Throwable ignored) {
             }
         }
-        markedCard = card;
+        f.showMarkedCard = card;
         if (card != null) {
             try {
                 f.setShowMark(card, true);

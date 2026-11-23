@@ -2,8 +2,10 @@ package cn.garymb.ygomobile.game.engine;
 import cn.garymb.ygomobile.game.gamefield.ClientCard;
 import cn.garymb.ygomobile.game.gamefield.EffectActivationLedger;
 import cn.garymb.ygomobile.game.gamefield.GameField;
+import cn.garymb.ygomobile.game.gamefield.GameTopInfoManager;
 import cn.garymb.ygomobile.game.gamefield.MoveEventApplier;
 import cn.garymb.ygomobile.game.gamefield.ReloadFieldBuilder;
+import cn.garymb.ygomobile.game.gamefield.SummonPledgeLedger;
 import cn.garymb.ygomobile.game.gamefield.TagSwapApplier;
 
 import android.util.Log;
@@ -77,10 +79,11 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
 
     @Override
     public void onStart(int playerType, int duelRule, int lp0, int lp1, int deck0, int extra0, int deck1, int extra1) {
-        // 新一局/回放从头重播：清空已发动效果账本并把当前回合号复位到 0（实况与回放同走本链路）；
+        // 新一局/回放从头重播：清空已发动效果账本与召唤誓约账本并把当前回合号复位到 0（实况与回放同走本链路）；
         // 随后刷新正在展示的卡详，清除上一局/上一轮重播残留的标记文本
         EffectActivationLedger.clear();
         EffectActivationLedger.setCurrentTurn(0);
+        SummonPledgeLedger.clear();
         CardDetailPanel.refreshCardDetailMarks();
         engine.messageParser.onStart(playerType, duelRule, lp0, lp1, deck0, extra0, deck1, extra1);
     }
@@ -90,16 +93,24 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         // 用户规格：胜负（当前一局结束信息）出现即清空全部发动标记——「决斗中只能使用1次」
         // 类持续标记的寿命终点就是本局结束；新一局 MSG_START 会重发并再次复位
         EffectActivationLedger.clear();
+        SummonPledgeLedger.clear();
         CardDetailPanel.refreshCardDetailMarks();
         engine.messageParser.onWin(player, reason);
     }
 
     @Override
-    public void onUpdateData(int player, int location, ByteBuffer data) { engine.messageParser.onUpdateData(player, location, data); }
+    public void onUpdateData(int player, int location, ByteBuffer data) {
+        engine.messageParser.onUpdateData(player, location, data);
+        // 场上卡的状态位（效果无效/禁止）只随本消息与 onUpdateCard 一并写入：卡被无效时列表要按
+        // 规律 6/7 掉行、无效解除时要把行补回，故场上区（0x04/0x08）的刷新补一次解算
+        if ((location & 0x0c) != 0) GameTopInfoManager.refreshApplyingEffects();
+    }
 
     @Override
     public void onUpdateCard(int player, int location, int sequence, ByteBuffer data) {
         engine.messageParser.onUpdateCard(player, location, sequence, data);
+        // 同上：单卡查询刷新也携 STATUS_DISABLED/STATUS_FORBIDDEN，场上卡的无效态变化在此刷适用列表
+        if ((location & 0x0c) != 0) GameTopInfoManager.refreshApplyingEffects();
     }
 
     @Override
@@ -153,21 +164,27 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     @Override
     public void onSelectUnselectCard(ByteBuffer data) { engine.messageParser.onSelectUnselectCard(data); }
 
-    // ==== 召唤动画类转发（实现在 SummonAnimationManager） ====
+    // ==== 召唤动画类转发（实现在 SummonAnimationManager）====
+    //   同时给召唤誓约账本挂账（用户新规格2）：通常/反转/特殊召唤都不入连锁、不产生
+    //   MSG_CHAINING，而『把这张卡特殊召唤的回合，○○』『○○召唤成功的回合，○○』这类誓约
+    //   正是玩家「现在不能做什么」的直接原因；*SUMMONING 先挂账，真正成功（*SUMMONED）才落账
 
     @Override
     public void onSummoning(int code, int controler, int location, int sequence) {
         engine.summonAnim.onSummoning(code, controler, location, sequence);
+        SummonPledgeLedger.addPending(code, engine.localPlayer(controler & 1));
     }
 
     @Override
     public void onSpSummoning(int code, int controler, int location, int sequence) {
         engine.summonAnim.onSpSummoning(code, controler, location, sequence);
+        SummonPledgeLedger.addPending(code, engine.localPlayer(controler & 1));
     }
 
     @Override
     public void onFlipSummoning(int code, int controler, int location, int sequence, int position) {
         engine.summonAnim.onFlipSummoning(code, controler, location, sequence, position);
+        SummonPledgeLedger.addPending(code, engine.localPlayer(controler & 1));
     }
 
     // ==== 场地事件实现 ====
@@ -213,8 +230,11 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     }
 
     @Override
-    public void onShuffleSetCard(int player, int count, ByteBuffer data) {
-        engine.deckMotion.postFieldChanged();
+    public void onShuffleSetCard(int zone, int count, ByteBuffer data) {
+        // duelclient.cpp MSG_SHUFFLE_SET_CARD L2805-2857：卡码抹零 + 中场聚拢 10 帧 + 停留 10 帧
+        // + 两格互换后响 shuffle 并 MoveCard(10) 回新格，全部在 DeckHandMotionManager 实现
+        //（旧实现只 postFieldChanged 一次，既没交换格位也没动画与音效）
+        engine.deckMotion.applyShuffleSetCard(zone, count, data);
     }
 
     @Override
@@ -245,11 +265,13 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         // 卡详发动标记随回合轮转过期（用户规格：1回合1次类标记在回合结束轮转时清除，
         // 「决斗中只能使用1次」类由渲染方按描述文本判定后持续）：同步账本回合号并刷新正在展示的卡详
         EffectActivationLedger.setCurrentTurn(engine.field.turnCount);
+        // 挂账而未落账的召唤不带到下个回合（一次召唤的 *SUMMONING→*SUMMONED 在本回合内必闭合）
+        SummonPledgeLedger.dropPending();
         CardDetailPanel.refreshCardDetailMarks();
         // HINT_ZONE 纵列玫红标注清除：无限泡影类无效效果均携 RESET_PHASE+PHASE_END 于
         // 发动回合结束时失效，而客户端无显式失效通讯，下一个 MSG_NEW_TURN 即已跨过
         // 该 End Phase，此刻清除与效果寿命对齐（duelclient.cpp 仅瞬时高亮 40 帧，无持久态可照抄）
-        engine.field.hintZoneMask = 0;
+        engine.field.clearHintZoneMarks();
         // tag 队友切换（对齐 duelclient.cpp MSG_NEW_TURN L2879-2885：isTag 且非首回合时，
         // 该队每过一回合在主力/队友间轮换；player 为协议索引即队伍索引，不做 LocalPlayer 换算）
         if (engine.field.isTag && engine.field.turnCount != 1) {
@@ -289,6 +311,10 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     @Override
     public void onMove(int code, int oldCtrl, int oldLoc, int oldSeq, int oldPos,
                        int newCtrl, int newLoc, int newSeq, int position, int reason) {
+        // 召唤被无效的确定性信号（用户新规格2 的配套）：ocgcore 只在召唤真正成功时发 *SUMMONED，
+        // 无效召唤的分支直接结束（operations.cpp special_summon_step），被召唤的卡随即被 MSG_MOVE
+        // 送回手卡/额外/墓地——此时把尚在挂账的同一卡码从 pending 里撤掉，不当作召唤成功登记誓约
+        SummonPledgeLedger.cancelPending(code, newLoc);
         moveApplier.applyMove(code, oldCtrl, oldLoc, oldSeq, oldPos,
                 newCtrl, newLoc, newSeq, position, reason);
     }
@@ -316,6 +342,8 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     @Override
     public void onSummoned() {
         engine.hintManager.setEventString(1604, "怪兽召唤成功");
+        SummonPledgeLedger.commitPending();
+        GameTopInfoManager.refreshApplyingEffects();
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });
@@ -329,6 +357,9 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         engine.field.pendulumPreludeL = null;
         engine.field.pendulumPreludeR = null;
         engine.field.pendulumSelectPending = false;
+        // 灵摆/同步/超量/连接等多张一批特殊召唤也在本消息统一落账（逐张的 SPSUMMONING 已全部挂账）
+        SummonPledgeLedger.commitPending();
+        GameTopInfoManager.refreshApplyingEffects();
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });
@@ -337,6 +368,8 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     @Override
     public void onFlipSummoned() {
         engine.hintManager.setEventString(1608, "怪兽反转召唤成功");
+        SummonPledgeLedger.commitPending();
+        GameTopInfoManager.refreshApplyingEffects();
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });
@@ -364,9 +397,26 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         // triggering_controler；按 卡码×半场×回合 登记进决斗级账本（不依赖 chainCard 是否解析
         // 成功，墓地/卡组/额外等列表重建临时 ClientCard 场景也能按卡码命中），由
         // CardInfoBinder 映射到描述段落；登记后按卡码门控刷新正在展示的卡详（用户规格1/2：
-        // 本回合发动即时反映无需重新点卡，但只有同码/同 alias 卡发动才打扰面板）
-        EffectActivationLedger.record(code, desc, localCc, engine.field.turnCount);
-        CardDetailPanel.refreshCardDetailMarks(code);
+        // 本回合发动即时反映无需重新点卡，但只有同码/同 alias 卡发动才打扰面板）。
+        // MSG_RETRY 重放派发（suppressLedgerRecord）只重建 UI/动画，不重复登记与刷卡详：
+        // 同一笔发动的原始派发已计数，重放再计会使客户端账本条数超过服务端保留前缀计数
+        //（配合 EffectActivationLedger.record 幂等去重，双保险评审 Minor①）
+        if (!engine.suppressLedgerRecord) {
+            // 发动区域复原：协议里的 triggering_location 对两种发动都是魔陷区（核心先 move_to_field /
+            // change_position 再发链），改用上面的两条场地痕迹：手卡发动→0x02、盖放发动→0x08，
+            // 两个痕迹都没看到（重同步重建卡对象等）才退回协议值
+            int actLoc = cl & 0x7f;
+            if (chainCard != null) {
+                if (chainCard.actFromHand) actLoc = CardLocation.Hand.value();
+                else if (chainCard.actFromSet) actLoc = CardLocation.SpellZone.value();
+            }
+            EffectActivationLedger.record(code, desc, localCc, engine.field.turnCount, actLoc);
+            // 登记序快照（评审 Major①）：效果处理阶段适用的 HINT_ZONE/MSG_FIELD_DISABLED 标注
+            // 落本次发动的序而非标注到达时的实时条数，连锁交错（后链先结算/无关发动在后）
+            // 时撤回才不误清保留中的标注
+            engine.field.currentChain.activationOrdinal = EffectActivationLedger.eventCount();
+            CardDetailPanel.refreshCardDetailMarks(code);
+        }
         if (chainCard != null && chainCard.code != code) {
             chainCard.setCode(code);
             engine.field.moveCardAnimated(chainCard, 10);
@@ -457,12 +507,35 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
 
     @Override
     public void onChainSolving(int chainCount) {
-
+        // 记录正在结算的链的登记序（MSG_CHAINED 已按 1..n 把 currentChain 依 CHAINING 顺序
+        // 压入 chains，第 ct 链 = chains.get(ct-1)）：本链效果处理内适用的场地标注据此落戳；
+        // 取不到对应链（异常/越界）时清 0，标注退回实时 eventCount() 口径
+        GameField.ChainInfo ci = chainCount >= 1 && chainCount <= engine.field.chains.size()
+                ? engine.field.chains.get(chainCount - 1) : null;
+        engine.field.resolvingChainOrdinal = ci != null ? ci.activationOrdinal : 0;
     }
 
     @Override
     public void onChainSolved(int chainCount) {
+        // 用户新规格：「持续适用中效果」的条目与金色徽标从效果**成功适用**那一刻才出现（而不是
+        // MSG_CHAINING 刚挂上连锁就有）：本消息即该链效果处理完成，标条目为已适用并刷一次
+        // 徽标/已展开的列表（列表从无到有时正好触发一次闪动）
+        markApplied(chainCount);
+    }
 
+    /**
+     * 把刚结算完的这条链的发动条目标为「已适用」（与 {@link #markPledge} 同一取链口径：
+     * {@code chains.get(ct-1)} 的 卡码/段落/半场）；取不到链时静默跳过，
+     * 不报错也亮不了徽标，比误标另一条目安全。
+     */
+    private void markApplied(int chainCount) {
+        List<GameField.ChainInfo> chains = engine.field.chains;
+        if (chainCount < 1 || chainCount > chains.size()) return;
+        GameField.ChainInfo ci = chains.get(chainCount - 1);
+        if (ci == null || ci.code <= 0) return;
+        EffectActivationLedger.markApplied(ci.code, EffectActivationLedger.resolveOffset(ci.code, ci.desc),
+                ci.controler, engine.field.turnCount);
+        GameTopInfoManager.refreshApplyingEffects();
     }
 
     @Override
@@ -471,11 +544,19 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         // is_showchaintarget 后再 chains.clear()
         for (GameField.ChainInfo ch : engine.field.chains) {
             for (ClientCard t : ch.targets) t.is_showchaintarget = false;
-            if (ch.chainCard != null) ch.chainCard.is_showchaintarget = false;
+            if (ch.chainCard != null) {
+                ch.chainCard.is_showchaintarget = false;
+                // 发动方式痕迹仅本次连锁内有效：随手清掉，避免该卡之后在场上发动别的卡的效果时被旧痕迹
+                // 误判（chains 即将 clear，故必须在本遍里清）
+                ch.chainCard.actFromHand = false;
+                ch.chainCard.actFromSet = false;
+            }
         }
         chainCodes.clear();
         engine.field.chains.clear();
         engine.field.currentChain = new GameField.ChainInfo();
+        // 结算链登记序随链结束复位（下次链外持续/规则类适用退回实时条数）
+        engine.field.resolvingChainOrdinal = 0;
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });
@@ -485,12 +566,33 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
     public void onChainNegated(int chainCount) {
         engine.soundManager.playSoundEffect(SoundManager.SFX.NEGATE);
         engine.summonAnim.postNegatedAnimation(chainCount);
+        markPledge(chainCount, false);
     }
 
     @Override
     public void onChainDisabled(int chainCount) {
         engine.soundManager.playSoundEffect(SoundManager.SFX.NEGATE);
         engine.summonAnim.postNegatedAnimation(chainCount);
+        markPledge(chainCount, true);
+    }
+
+    /**
+     * 把链的结算结果映射到发动账本条目（用户新规格：被无效的效果，不适用的誓约不该出现在
+     * 「持续适用中效果」列表里）：{@code disabled=false} 为 MSG_CHAIN_NEGATED（<b>发动无效</b>，除括号内
+     * 『（这个回合，○○）』外全不适用），{@code true} 为 MSG_CHAIN_DISABLED（<b>效果无效</b>，只属卡的效果的
+     * 『这个回合/发动后/发动过的回合』类附加处理不适用）。按 {@link #onChainSolving} 同款口径取
+     * {@code chains.get(ct-1)} 的 卡码/段落/半场，标到 {@link EffectActivationLedger} 对应条目上
+     * 并刷新徽标与已展开的列表（两型无效各自留哪几档在 {@code ContinuousEffectApplier} 里做）。
+     * 取不到链（越界/已被 CHAIN_END 清理）时静默跳过：宁可多留一条也不误清仍在适用的誓约。
+     */
+    private void markPledge(int chainCount, boolean disabled) {
+        List<GameField.ChainInfo> chains = engine.field.chains;
+        if (chainCount < 1 || chainCount > chains.size()) return;
+        GameField.ChainInfo ci = chains.get(chainCount - 1);
+        if (ci == null || ci.code <= 0) return;
+        EffectActivationLedger.markPledgeNegated(ci.code, EffectActivationLedger.resolveOffset(ci.code, ci.desc),
+                ci.controler, engine.field.turnCount, disabled);
+        GameTopInfoManager.refreshApplyingEffects();
     }
 
     @Override
@@ -551,6 +653,11 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
             pcard = new ClientCard();
             pcard.owner = p;
             pcard.controler = p;
+            // 列表空位（张数与实际对象错位）的降级新建：先把起点落在卡组顶，否则新对象 cur 全 0，
+            // 飞入手牌时从世界原点（画面上是侧列/对方除外区一带）起飞，形成抽卡时的错误飞行
+            pcard.location = deckLoc;
+            pcard.sequence = Math.max(0, t);
+            engine.field.snapCardPos(pcard);
         }
         // 关键：立即写入本次收到的卡码（已含服务器的遮蔽处理：对手抽卡时为 0），防止复用卡组顶
         // 旧对象时残留上一次的卡码、或经 chain_code 回退取值，造成信息泄露。必须在设置 handFlipT
@@ -560,14 +667,15 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
         // 我方抽卡入手恒为正面（对齐 C++ gframe 我方手卡只按卡码贴卡面、从不走卡背）：从卡组顶
         // 取回的 ClientCard 对象可能残留此前作为手卡 / 洗切被置 0 的 handFlipT，若放任不管，
         // updateHandFlip 会以 0→1 逐帧推进，出现「背面入手→短暂停留→翻开」与原版不一致的观感。
-        // 入手前直接把翻面进度吸附到正面终态，渲染线程永不看到其卡背态；code==0 时渲染层仍按卡码
-        // 画卡背不会误露。仅对 p==0（我方视角）生效，对方抽卡维持遮蔽背面语义不变
-        if (p == 0) {
-            pcard.handFlipT = 1f;
-        } else {
-            // 对手的抽卡必须保持卡背：强制 backface 终态（0f）+ 禁止显示 code=0 时的 cardback
-            pcard.handFlipT = 0f;
-        }
+        // 入手朝向与 DeckHandMotionManager.applyMoveToHandReveal 同口径：只认卡码——
+        // 有码即吸附正面终态并以正面状态从卡组飞入手卡（我方抽卡、录像/单人的全量流
+        // 真实卡码、正正堂堂/真实之言类 EFFECT_PUBLIC 公开抽卡 bit31 都属此类）；
+        // 无码（对手私有抽卡已由 localDrawCode 遮蔽为 0）直接落卡背终态。
+        // 不能按「p==0 || revealsBothHands」预先分流：实况公开抽卡同样携带真实卡码，
+        // 若被塞进卡背分支，updateHandFlip 随后会按 code!=0 的目标把它 0→1 翻正，
+        // 即「先里侧抽入再翻到正面」的两步观感；反之对零码写 1f 也会被目标值拉回 0f，
+        // 卡背白白压窄展开一次。
+        pcard.handFlipT = pcard.code != 0 ? 1f : 0f;
         engine.field.addCard(p, handLoc, 0, pcard);
         for (ClientCard hc : engine.field.players[p].hand) {
             // 冻结待码的入手卡不参与让位重排，避免被提前拽离卡组顶坐标
@@ -600,11 +708,15 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
      * 翻成正面（GameFieldMotionBase.updateHandFlip L617 与 FieldCardRenderer.handShowsFace），
      * 于是出现「抽卡阶段常规抽卡 / 效果抽卡都把对方抽的卡亮出卡面」的泄露。故此处对对手（p==1）
      * 的私有抽卡把码遮蔽为 0、令手卡保持卡背；本方抽卡（p==0）与公开抽卡（bit31 置位，如天变
-     * 地异的 public 抽卡）保留原码。检索类「卡组→手卡」不走本路径（经 MSG_CONFIRM_CARDS 揭示），
+     * 地异的 public 抽卡）保留原码；公开手卡模式（录像/纯单人，见 GameEngine.revealsBothHands）
+     * 两侧手卡恒公开，遮蔽分支不启用——全量流里的真实卡码直接用于正面入手。
+     * 检索类「卡组→手卡」不走本路径（经 MSG_CONFIRM_CARDS 揭示），
      * 其展示不受影响——即「抽卡不展示、非抽卡把卡组卡加入手卡才展示」的口径。
      */
-    private static int localDrawCode(int p, int rawCode) {
-        if (p == 1 && (rawCode & 0x80000000) == 0) return 0;
+    private int localDrawCode(int p, int rawCode) {
+        // 公开手卡模式（录像/纯单人）不按视角遮蔽：否则 drawOneCard 只能按零码落卡背，
+        // 等后续手卡刷新补码时才翻正，正好抵消「抽卡直接正面入手」
+        if (!engine.revealsBothHands() && p == 1 && (rawCode & 0x80000000) == 0) return 0;
         return rawCode & 0x7fffffff;
     }
 
@@ -661,6 +773,12 @@ abstract class DuelEventHandlerBase implements GameMessageParser.MessageHandler 
 
     @Override
     public void onLpUpdate(int player, int lp) {
+        // duelclient.cpp MSG_LPUPDATE L3656-3672：lp[player] 直接取通讯里的终值（不做加减），
+        // 无音效、无 lpcstring 浮字（C++ 只置 lpplayer/lpd/lpframe=10 + WaitFrameSignal(11)），
+        // 故 showText=false 走 startLpChange 的「立即逐帧扣减到终值」分支；回放快进/上一步重算
+        // （instantPlace）在该分支内已直接落位，与 C++ 的 isReplaySkiping 分支同构。
+        // 注意：本分支为「绝对值覆写」，与上面 onDamage/onRecover/onPayLpCost 的按量加减只差一行形态
+        // 但语义来源不同（core 下发的是终值而非变化量），切勿改成 += / -= 否则立即双倍偏移
         int p = engine.localPlayer(player & 1);
         engine.field.players[p].lp = lp;
         engine.field.startLpChange(p, lp, 0, null, false);

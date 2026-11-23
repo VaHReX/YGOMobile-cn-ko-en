@@ -4,6 +4,7 @@ import android.util.Log;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.Set;
 
@@ -48,13 +49,15 @@ abstract class GameRoomMid extends GameRoomBase {
             hostInfo.mode = MODE_SINGLE | (hostInfo.mode & 0x10); // preserve solo bit
         }
         soloMode = hostInfo.soloMode();
+        matchMode = hostInfo.duelMode() == MODE_MATCH;
+        // TAG 不再只限纯单人：4 条连接各占一席位同样走引擎 TAG 开局（对齐 TagDuel）
+        tagMode = hostInfo.duelMode() == MODE_TAG;
         // 本内置服务端实现了 CTOS_UNDO（撤回）：在 HostInfo 的 pad 扩展位上打能力标记，
         // 该标记经 STOC_JOIN_GAME / 局域网房间列表回显给连入方，使其也能显示撤回按钮
-        //（gframe 等第三方服务端该 3 字节为未定义填充，不会凑出这个魔术字节）
+        //（gframe 等第三方服务端该 3 字节为未定义填充，不会凑出这个魔术字节）。
+        // TAG 同样开放撤回：整局重放重同步已按“多个重放席位”实现，与纯单人 TAG 体验一致。
         hostInfo.extMagic = HOST_EXT_MAGIC;
         hostInfo.extCaps = HOST_CAP_UNDO | HOST_CAP_ASK_RESEND;
-        matchMode = hostInfo.duelMode() == MODE_MATCH;
-        tagMode = soloMode && hostInfo.duelMode() == MODE_TAG;
         roomName = BufferIO.readUTF16(body, 20);
         roomPass = BufferIO.readUTF16(body, 20);
         conn.host = true;
@@ -88,35 +91,29 @@ abstract class GameRoomMid extends GameRoomBase {
                 return;
             }
         }
-        if (hostPlayer == null && players[0] == null && players[1] == null && observers.isEmpty()) {
+        if (hostPlayer == null && firstFreeSeat() >= 0 && observers.isEmpty()) {
             hostPlayer = dp;
             dp.host = true;
         }
         dp.state = ServerConnection.STATE_FREE;
 
         int typeChange = (hostPlayer == dp) ? 0x10 : 0;
-        if (players[0] == null || players[1] == null) {
-            int pos = players[0] == null ? 0 : 1;
+        int seats = seatCount();
+        int pos = firstFreeSeat();
+        if (pos >= 0) {
             // 通知已在房间的玩家与观战：新人进入
             byte[] enter = playerEnterPayload(dp.name, pos);
-            if (players[0] != null) {
-                players[0].send(STOC_HS_PLAYER_ENTER, enter);
-            }
-            if (players[1] != null) {
-                players[1].send(STOC_HS_PLAYER_ENTER, enter);
+            for (int i = 0; i < seats; i++) {
+                if (players[i] != null) {
+                    players[i].send(STOC_HS_PLAYER_ENTER, enter);
+                }
             }
             for (ServerConnection o : observers) {
                 o.send(STOC_HS_PLAYER_ENTER, enter);
             }
-            if (players[0] == null) {
-                players[0] = dp;
-                dp.type = NETPLAYER_TYPE_PLAYER1;
-                typeChange |= NETPLAYER_TYPE_PLAYER1;
-            } else {
-                players[1] = dp;
-                dp.type = NETPLAYER_TYPE_PLAYER2;
-                typeChange |= NETPLAYER_TYPE_PLAYER2;
-            }
+            players[pos] = dp;
+            dp.type = pos;
+            typeChange |= pos;
         } else {
             if (observers.size() >= MAX_OBSERVER) {
                 sendError(dp, ERRMSG_JOINERROR, 1);
@@ -126,11 +123,10 @@ abstract class GameRoomMid extends GameRoomBase {
             dp.type = NETPLAYER_TYPE_OBSERVER;
             typeChange |= NETPLAYER_TYPE_OBSERVER;
             byte[] wc = watchChangePayload(observers.size());
-            if (players[0] != null) {
-                players[0].send(STOC_HS_WATCH_CHANGE, wc);
-            }
-            if (players[1] != null) {
-                players[1].send(STOC_HS_WATCH_CHANGE, wc);
+            for (int i = 0; i < seats; i++) {
+                if (players[i] != null) {
+                    players[i].send(STOC_HS_WATCH_CHANGE, wc);
+                }
             }
             for (ServerConnection o : observers) {
                 o.send(STOC_HS_WATCH_CHANGE, wc);
@@ -142,13 +138,13 @@ abstract class GameRoomMid extends GameRoomBase {
         // 此时 dp 已入位（players[pos] 或 observers），sendToAllPresent 会连本人一并送达。
         if (!isCreater) {
             broadcastSystemChat(displayName(dp)
-                    + (dp.type <= 1 ? " 加入了房间" : " 加入观战"));
+                    + (dp.type < seats ? " 加入了房间" : " 加入观战"));
         }
         // 回执本人：房间信息 + 自身座位
         dp.send(STOC_JOIN_GAME, hostInfo.toBytes());
         dp.send(STOC_TYPE_CHANGE, new byte[]{(byte) typeChange});
         // 把已存在的对手/队友与观战人数补发给新人
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < seats; i++) {
             if (players[i] != null) {
                 dp.send(STOC_HS_PLAYER_ENTER, playerEnterPayload(players[i].name, i));
                 if (ready[i]) {
@@ -159,6 +155,17 @@ abstract class GameRoomMid extends GameRoomBase {
         if (!observers.isEmpty()) {
             dp.send(STOC_HS_WATCH_CHANGE, watchChangePayload(observers.size()));
         }
+    }
+
+    /** 首个空闲决斗位（0..seatCount()-1），已坐满返回 -1。 */
+    private int firstFreeSeat() {
+        int seats = seatCount();
+        for (int i = 0; i < seats; i++) {
+            if (players[i] == null) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     void leaveGame(ServerConnection dp) {
@@ -188,7 +195,7 @@ abstract class GameRoomMid extends GameRoomBase {
             dp.close();
             return;
         }
-        if (dp.type > 1) {
+        if (dp.type >= seatCount()) {
             dp.close();
             return;
         }
@@ -196,11 +203,10 @@ abstract class GameRoomMid extends GameRoomBase {
             players[dp.type] = null;
             ready[dp.type] = false;
             byte[] pc = new byte[]{(byte) ((dp.type << 4) | PLAYERCHANGE_LEAVE)};
-            if (players[0] != null && dp.type != 0) {
-                players[0].send(STOC_HS_PLAYER_CHANGE, pc);
-            }
-            if (players[1] != null && dp.type != 1) {
-                players[1].send(STOC_HS_PLAYER_CHANGE, pc);
+            for (int i = 0; i < seatCount(); i++) {
+                if (players[i] != null && i != dp.type) {
+                    players[i].send(STOC_HS_PLAYER_CHANGE, pc);
+                }
             }
             for (ServerConnection o : observers) {
                 o.send(STOC_HS_PLAYER_CHANGE, pc);
@@ -230,20 +236,16 @@ abstract class GameRoomMid extends GameRoomBase {
     // ==================================================================
 
     void toDuelist(ServerConnection dp) {
-        if (dp.type != NETPLAYER_TYPE_OBSERVER || (players[0] != null && players[1] != null)) {
+        if (dp.type != NETPLAYER_TYPE_OBSERVER) {
+            return;
+        }
+        int pos = firstFreeSeat();
+        if (pos < 0) {
             return;
         }
         observers.remove(dp);
-        int pos;
-        if (players[0] == null) {
-            players[0] = dp;
-            dp.type = NETPLAYER_TYPE_PLAYER1;
-            pos = 0;
-        } else {
-            players[1] = dp;
-            dp.type = NETPLAYER_TYPE_PLAYER2;
-            pos = 1;
-        }
+        players[pos] = dp;
+        dp.type = pos;
         byte[] enter = playerEnterPayload(dp.name, pos);
         byte[] wc = watchChangePayload(observers.size());
         sendToAllPresent(STOC_HS_PLAYER_ENTER, enter);
@@ -252,15 +254,14 @@ abstract class GameRoomMid extends GameRoomBase {
     }
 
     void toObserver(ServerConnection dp) {
-        if (dp.type > 1) {
+        if (dp.type >= seatCount()) {
             return;
         }
         byte[] pc = new byte[]{(byte) ((dp.type << 4) | PLAYERCHANGE_OBSERVE)};
-        if (players[0] != null) {
-            players[0].send(STOC_HS_PLAYER_CHANGE, pc);
-        }
-        if (players[1] != null) {
-            players[1].send(STOC_HS_PLAYER_CHANGE, pc);
+        for (int i = 0; i < seatCount(); i++) {
+            if (players[i] != null) {
+                players[i].send(STOC_HS_PLAYER_CHANGE, pc);
+            }
         }
         for (ServerConnection o : observers) {
             o.send(STOC_HS_PLAYER_CHANGE, pc);
@@ -273,7 +274,7 @@ abstract class GameRoomMid extends GameRoomBase {
     }
 
     void playerReady(ServerConnection dp, boolean isReady) {
-        if (dp.type > 1 || ready[dp.type] == isReady) {
+        if (dp.type >= seatCount() || ready[dp.type] == isReady) {
             return;
         }
         if (soloMode && isReady) {
@@ -298,11 +299,12 @@ abstract class GameRoomMid extends GameRoomBase {
         }
         ready[dp.type] = isReady;
         byte[] pc = new byte[]{(byte) ((dp.type << 4) | (isReady ? PLAYERCHANGE_READY : PLAYERCHANGE_NOTREADY))};
-        if (players[dp.type] != null) {
-            players[dp.type].send(STOC_HS_PLAYER_CHANGE, pc);
-        }
-        if (players[1 - dp.type] != null) {
-            players[1 - dp.type].send(STOC_HS_PLAYER_CHANGE, pc);
+        for (int i = 0; i < seatCount(); i++) {
+            ServerConnection p = players[i];
+            // solo 下一条连接占两席位，按连接身份去重避免双收同一条准备回显
+            if (p != null && (i == 0 || p != players[0])) {
+                p.send(STOC_HS_PLAYER_CHANGE, pc);
+            }
         }
         for (ServerConnection o : observers) {
             o.send(STOC_HS_PLAYER_CHANGE, pc);
@@ -310,7 +312,7 @@ abstract class GameRoomMid extends GameRoomBase {
     }
 
     void playerKick(ServerConnection dp, int pos) {
-        if (pos > 1 || dp != hostPlayer || dp == players[pos] || players[pos] == null) {
+        if (pos >= seatCount() || dp != hostPlayer || dp == players[pos] || players[pos] == null) {
             return;
         }
         leaveGame(players[pos], true);
@@ -324,7 +326,7 @@ abstract class GameRoomMid extends GameRoomBase {
         int required = requiredSoloDecks();
         // solo：首局按已收集份数门槛；换 side 阶段按已提交备牌份数；非 solo：按座位就绪位
         boolean full = duelCount > 0 ? soloSideCount >= required : soloDeckCount >= required && ready[0];
-        if (dp.type > 1 || (soloMode ? full : ready[dp.type])) {
+        if (dp.type >= seatCount() || (soloMode ? full : ready[dp.type])) {
             return;
         }
         if (body.remaining() < 8) {
@@ -385,7 +387,7 @@ abstract class GameRoomMid extends GameRoomBase {
             decks[targetSlot] = nd;
             ready[targetSlot] = true;
             dp.send(STOC_DUEL_START, null);
-            if (ready[0] && ready[1] && duel != null) {
+            if (allSeatsReady() && duel != null) {
                 duel.startNextDuelFromSide();
             }
             return;
@@ -426,6 +428,17 @@ abstract class GameRoomMid extends GameRoomBase {
     // 开始决斗 → 猜拳 → 先攻
     // ==================================================================
 
+    /** 本房间全部决斗位都已准备（TAG 需 4 席位，其余 2）。 */
+    private boolean allSeatsReady() {
+        int seats = seatCount();
+        for (int i = 0; i < seats; i++) {
+            if (!ready[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void startDuel(ServerConnection dp) {
         if (dp != hostPlayer) {
             return;
@@ -440,28 +453,47 @@ abstract class GameRoomMid extends GameRoomBase {
             }
             ready[1] = true;
         } else {
-            if (!ready[0] || !ready[1]) {
+            if (!allSeatsReady()) {
                 return;
             }
         }
+        // 对齐 single_duel.cpp / tag_duel.cpp StartDuel 的 NetServer::StopListen()：开局即停监听，
+        // 决斗进行中不接受任何新连接（观战也只在开局前入座，本局中途接入无通讯可补）。
         server.stopListen();
-        players[0].send(STOC_DUEL_START, null);
-        if (!soloMode) {
-            players[1].send(STOC_DUEL_START, null);
+        int seats = seatCount();
+        ServerConnection seat0 = players[0];
+        for (int i = 0; i < seats; i++) {
+            // solo 下 players[1]==players[0] 为同一连接，按身份去重，避免开局包双发
+            if (players[i] != null && (i == 0 || players[i] != seat0)) {
+                players[i].send(STOC_DUEL_START, null);
+            }
         }
         for (ServerConnection o : observers) {
             o.state = CTOS_LEAVE_GAME;
             o.send(STOC_DUEL_START, null);
         }
         if (tagMode) {
-            // TAG：房主（players[0]）看自席 decks[0] 与队友席 decks[2]（对齐 TagDuel::StartDuel）
-            players[0].send(STOC_DECK_COUNT, PlayerDeck.deckCountPayload(decks[0], decks[2], 0));
+            // TAG：卡组堆叠按队下发（对齐 tag_duel.cpp L303-310）——本队主位 decks[0]/decks[2] 在前，
+            // 同队两席位收到同一份，另一队两席位收到前后半交换的那一份。
+            byte[] teamA = PlayerDeck.deckCountPayload(decks[0], decks[2], 0);
+            byte[] teamB = PlayerDeck.deckCountPayload(decks[0], decks[2], 1);
+            if (soloMode) {
+                players[0].send(STOC_DECK_COUNT, teamA);
+            } else {
+                players[0].send(STOC_DECK_COUNT, teamA);
+                players[1].send(STOC_DECK_COUNT, teamA);
+                players[2].send(STOC_DECK_COUNT, teamB);
+                players[3].send(STOC_DECK_COUNT, teamB);
+            }
         } else {
             players[0].send(STOC_DECK_COUNT, PlayerDeck.deckCountPayload(decks[0], decks[1], 0));
+            if (!soloMode) {
+                players[1].send(STOC_DECK_COUNT, PlayerDeck.deckCountPayload(decks[0], decks[1], 1));
+            }
         }
-        if (!soloMode) {
-            players[1].send(STOC_DECK_COUNT, PlayerDeck.deckCountPayload(decks[0], decks[1], 1));
-        }
+        // STOC_DECK_COUNT 只发决斗位（对齐 single_duel.cpp L346-351 / tag_duel.cpp L303-309）：
+        // 观战席位不收本包，它的卡组/额外堆叠由 TPResult 里发给它的那条 MSG_START 按帧内 deckc/
+        // extrac 建立，与桌面 gframe 完全一致。
         if (soloMode) {
             // Skip rock-paper-scissors: directly ask host to choose first/second
             players[0].send(STOC_SELECT_TP, null);
@@ -469,13 +501,27 @@ abstract class GameRoomMid extends GameRoomBase {
             players[0].state = CTOS_TP_RESULT;
             duelStage = DUEL_STAGE_FIRSTGO;
         } else {
-            players[0].send(STOC_SELECT_HAND, null);
-            players[1].send(STOC_SELECT_HAND, null);
+            // 猜拳只由两队首席操作（对齐 tag_duel.cpp L311-316：players[0] 与 players[2]）
+            for (int team = 0; team < 2; team++) {
+                ServerConnection cap = players[teamCaptainSeat(team)];
+                if (cap == null) {
+                    return;
+                }
+                cap.send(STOC_SELECT_HAND, null);
+                cap.state = CTOS_HAND_RESULT;
+            }
             handResult[0] = 0;
             handResult[1] = 0;
-            players[0].state = CTOS_HAND_RESULT;
-            players[1].state = CTOS_HAND_RESULT;
             duelStage = DUEL_STAGE_FINGER;
+        }
+    }
+
+    /** 把同一包发给某队的全部决斗位（真 TAG 两席，其余单席），观战另走 observers。 */
+    private void sendToTeamSeats(int team, int proto, byte[] payload) {
+        for (ServerConnection c : teamSeats(team)) {
+            if (c != null) {
+                c.send(proto, payload);
+            }
         }
     }
 
@@ -483,36 +529,42 @@ abstract class GameRoomMid extends GameRoomBase {
         if (res == 0 || res > 3 || dp.state != CTOS_HAND_RESULT) {
             return;
         }
-        int p = dp.type;
+        // 每队只收一份手势（对齐 tag_duel.cpp L322：player = (dp->type & 0x2) >> 1）
+        int p = seatTeam(dp.type);
         if (handResult[p] != 0) {
             return;
         }
         handResult[p] = res;
         if (handResult[0] != 0 && handResult[1] != 0) {
-            players[0].send(STOC_HAND_RESULT, new byte[]{(byte) handResult[0], (byte) handResult[1]});
+            byte[] ab = new byte[]{(byte) handResult[0], (byte) handResult[1]};
+            byte[] ba = new byte[]{(byte) handResult[1], (byte) handResult[0]};
+            // A 队（含其两席位）与观战收 res1=自己、B 队收 res1=对方
+            sendToTeamSeats(0, STOC_HAND_RESULT, ab);
             for (ServerConnection o : observers) {
-                o.send(STOC_HAND_RESULT, new byte[]{(byte) handResult[0], (byte) handResult[1]});
+                o.send(STOC_HAND_RESULT, ab);
             }
-            players[1].send(STOC_HAND_RESULT, new byte[]{(byte) handResult[1], (byte) handResult[0]});
+            sendToTeamSeats(1, STOC_HAND_RESULT, ba);
+            int capA = teamCaptainSeat(0);
+            int capB = teamCaptainSeat(1);
             if (handResult[0] == handResult[1]) {
-                players[0].send(STOC_SELECT_HAND, null);
-                players[1].send(STOC_SELECT_HAND, null);
+                players[capA].send(STOC_SELECT_HAND, null);
+                players[capB].send(STOC_SELECT_HAND, null);
                 handResult[0] = 0;
                 handResult[1] = 0;
-                players[0].state = CTOS_HAND_RESULT;
-                players[1].state = CTOS_HAND_RESULT;
+                players[capA].state = CTOS_HAND_RESULT;
+                players[capB].state = CTOS_HAND_RESULT;
             } else if ((handResult[0] == 1 && handResult[1] == 2)
                     || (handResult[0] == 2 && handResult[1] == 3)
                     || (handResult[0] == 3 && handResult[1] == 1)) {
-                players[1].send(STOC_SELECT_TP, null);
+                players[capB].send(STOC_SELECT_TP, null);
                 tpPlayer = 1;
-                players[0].state = ServerConnection.STATE_NONE;
-                players[1].state = CTOS_TP_RESULT;
+                players[capA].state = ServerConnection.STATE_NONE;
+                players[capB].state = CTOS_TP_RESULT;
                 duelStage = DUEL_STAGE_FIRSTGO;
             } else {
-                players[0].send(STOC_SELECT_TP, null);
-                players[1].state = ServerConnection.STATE_NONE;
-                players[0].state = CTOS_TP_RESULT;
+                players[capA].send(STOC_SELECT_TP, null);
+                players[capB].state = ServerConnection.STATE_NONE;
+                players[capA].state = CTOS_TP_RESULT;
                 tpPlayer = 0;
                 duelStage = DUEL_STAGE_FIRSTGO;
             }
@@ -534,26 +586,119 @@ abstract class GameRoomMid extends GameRoomBase {
         if (lastChar != 0) {
             return;
         }
+        String text = decodeChatText(msg).trim();
+        // 聊天 “/ai [卡组名]” 命令（本工程扩展）：主机端据此拉起人机加入本房间，纯 /ai 为随机
+        if (text.equals(AI_CHAT_COMMAND)) {
+            handleAiChatCommand("");
+        } else if (text.startsWith(AI_CHAT_COMMAND + " ")) {
+            handleAiChatCommand(text.substring(AI_CHAT_COMMAND.length() + 1).trim());
+        }
         byte[] payload = chatPayload(dp.type, msg);
-        // 中继统一走 sendToAllPresent：solo 模式下 players[1] == players[0] 为同一连接，
-        // 按连接身份去重，避免同一条聊天被双发（历史缺陷：双端收到重复消息/重复弹幕）
-        sendToAllPresent(STOC_CHAT, payload);
-        // 录像：对局中把玩家/观战发言录为 0xF1 伪帧，使纯消息流回放血条下按时间线重现；
-        // 与引擎消息同处单线程房间执行器，追加顺序即时序。playerType 取 dp.type（与实时
-        // STOC_CHAT 首字节同值，回放分侧/命名一致）；文本取 UTF-16LE 并去除尾部 NUL 码元。
-        if (isDueling() && duel != null && duel.replay != null) {
-            int units = msg.length / 2;
-            while (units > 0 && ((msg[units * 2 - 2] & 0xFF) | ((msg[units * 2 - 1] & 0xFF) << 8)) == 0) {
-                units--;
+        // 仅人机房间里的 AI 决斗席位（非房主、非观战）才过闸门；观战/房主/局域网对局一律照常
+        boolean aiSeat = peerNeedsReplayResync && dp != hostPlayer && duel != null
+                && dp.type >= 0 && dp.type < seatCount();
+        // 人机房间：AI 席位只在自己正要操作时才中继发言——
+        // ① 撤回的静默重放期一律丢弃（重放会让人机对旧询问重复回话）；
+        // ② 必须是本队当前行动席位；
+        // ③ 本回合属于它所在队伍，或它正在行动：引擎刚把询问交给它这一队（beingAsked），
+        //    或它刚完成一次行动（justActed，带时间窗）——对手回合发动卡片效果/连锁应答属于后者，应放行；
+        //    其余非本回合的牵连回话依旧丢弃。
+        // 玩家（房主）发言不受限；单局/比赛只有一个 AI 且免回合限制，观感与原先一致。
+        if (aiSeat) {
+            int team = seatTeam(dp.type);
+            boolean silentReplay = duel.isSilentReplay();
+            boolean acting = dp == duelPlayer(team);
+            boolean ownTurn = seatCount() <= 2 || duel.currentTurnPlayer() == team;
+            boolean beingAsked = lastResponse == team;
+            long sinceAct = System.currentTimeMillis() - lastActingAtMs;
+            boolean justActed = lastActingSeat == dp.type
+                    && sinceAct >= 0 && sinceAct <= AI_CHAT_ACTION_WINDOW_MS;
+            if (silentReplay || !acting || (!ownTurn && !beingAsked && !justActed)) {
+                Log.i(TAG, "chat dropped: AI seat " + dp.type
+                        + (silentReplay ? " during undo replay"
+                        : !acting ? " is not the acting seat of team " + team
+                        : " is neither on its own turn nor taking an action"));
+                return;
             }
-            String text = new String(msg, 0, units * 2, java.nio.charset.StandardCharsets.UTF_16LE);
-            duel.replay.writeChatFrame(dp.type, text);
-            // 录制验证落点：每条对局聊天录为 0xF1 伪帧均留痕，logcat 过滤 "GameRoom" 即可
-            // 确认聊天已落盘；回放开场信息另标注文件内聊天帧总条数（ReplayPlayer.buildReplayInfo）
-            Log.i(TAG, "replay chat frame recorded: type=" + dp.type + " len=" + text.length());
-        } else if (dp.type < 4) {
+        }
+        // 人机席位的操作播报排队等候：WindBot 会在一个决策点把整轮行动说明一次发完（先发聊天、后发应答），
+        // 立即中继会出现「台词先于动作」且「一股脑提前弹出所有步骤」。改为入队，每个被接受的应答只
+        // 放行一条（见 {@code ServerDuelBase#getResponse} → flushPendingAiChat），使台词与实际操作
+        // 节点逐一对齐；应答被拒/被吞、撤回、回合切换或本局终止时队列清空（未发生的动作不得播报）。
+        if (aiSeat && dp == duelPlayer(seatTeam(dp.type))) {
+            if (dp.pendingAiChats.size() >= AI_CHAT_QUEUE_LIMIT) {
+                Log.w(TAG, "chat queue overflow: AI seat " + dp.type + " drops new line");
+                return;
+            }
+            dp.pendingAiChats.addLast(new ServerConnection.PendingChat(payload, text));
+            Log.i(TAG, "chat queued until action lands: seat " + dp.type
+                    + " len=" + text.length() + " queue=" + dp.pendingAiChats.size());
+            return;
+        }
+        // 中继统一走 broadcastChat：人机房间只发给房主与观战（AI 不收聊天，避免回话刷屏）；
+        // solo 模式下 players[1] == players[0] 为同一连接，按连接身份去重，避免同一条聊天被双发
+        broadcastChat(payload);
+        recordChatFrame(dp.type, text);
+    }
+
+    /**
+     * 放行一条被压住的人机操作播报（它的应答已被引擎接受、动作消息已下发），并补录回放聊天帧。
+     * 每次应答只放一条：人机若在决策点把整轮计划一次说完，台词会随其后的逐个操作依次出现。
+     */
+    void flushPendingAiChat(ServerConnection dp) {
+        if (dp == null) {
+            return;
+        }
+        ServerConnection.PendingChat chat = dp.pendingAiChats.pollFirst();
+        if (chat == null) {
+            return;
+        }
+        broadcastChat(chat.payload);
+        recordChatFrame(dp.type, chat.text == null ? "" : chat.text);
+        Log.i(TAG, "chat released after action: seat " + dp.type
+                + " (left=" + dp.pendingAiChats.size() + ")");
+    }
+
+    /** 丢弃压住的人机操作播报（应答被拒/被吞、回合切换或本局终止：未发生的动作不得播报）。 */
+    void clearPendingAiChat(ServerConnection dp) {
+        if (dp != null) {
+            dp.pendingAiChats.clear();
+        }
+    }
+
+    /** 录像：对局中把玩家/观战/人机发言录为 0xF1 伪帧，使纯消息流回放血条下按时间线重现。 */
+    private void recordChatFrame(int playerType, String text) {
+        if (isDueling() && duel != null && duel.replay != null) {
+            duel.replay.writeChatFrame(playerType, text);
+            Log.i(TAG, "replay chat frame recorded: type=" + playerType + " len=" + text.length());
+        } else if (playerType < 4) {
             Log.d(TAG, "chat not recorded (dueling=" + isDueling()
                     + " duel=" + (duel != null) + "): stage not in-duel");
         }
+    }
+
+    /** 聊天 “/ai” 命令前缀（后跟一个空格与卡组名，与线上服务器约定一致）。 */
+    private static final String AI_CHAT_COMMAND = "/ai";
+
+    /** 人机聊天闸门的“刚行动过”时间窗：应答/挂询问后该时长内仍允许 AI 播报（覆盖应答与聊天包的先后错位）。 */
+    private static final long AI_CHAT_ACTION_WINDOW_MS = 5000L;
+
+    /** 人机操作播报的等待队列上限：超过则丢弃新台词（多为超出本轮实际操作步数的计划尾句）。 */
+    private static final int AI_CHAT_QUEUE_LIMIT = 8;
+
+    /** UTF-16LE 聊天文本解码：去掉尾部 NUL 码元，供 /ai 命令判定与录像帧共用。 */
+    private static String decodeChatText(byte[] msg) {
+        int units = msg.length / 2;
+        while (units > 0 && ((msg[units * 2 - 2] & 0xFF) | ((msg[units * 2 - 1] & 0xFF) << 8)) == 0) {
+            units--;
+        }
+        return new String(msg, 0, units * 2, StandardCharsets.UTF_16LE);
+    }
+
+    /** “/ai [卡组名]” 命令：仅建房等待阶段、非纯单人且仍有空闲决斗位时，请求主机端拉起人机（空名=随机）。 */
+    private void handleAiChatCommand(String deckName) {
+        if (duelStage != DUEL_STAGE_BEGIN || soloMode) return;
+        if (firstFreeSeat() < 0) return;
+        server.requestChatBot(deckName, hostInfo.lflist);
     }
 }

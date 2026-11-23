@@ -151,7 +151,9 @@ public class YGOProActivity extends YGOProActivityEngine {
         isGameStarted = false;
         if (engineCallback != null) engineCallback.resetDuelEndState();
         if (topInfoManager != null) topInfoManager.stopTimer();
-        if (dialogUtil != null) dialogUtil.dismissOpenGameDialogs();
+        // 同 dismissDuelDialogsForExit：纯观战可能从未弹过询问窗（dialogUtil 未惰性创建），
+        // 不能判空跳过，否则展示类弹窗会残留遮挡局域网主界面
+        getDialogUtil().dismissOpenGameDialogs();
         // 撤回快照里被即时隐藏的询问窗一并作废：决斗已结束，服务端迟到/被拒的撤回 ACK
         // 不得再把上一局的旧询问窗重新弹回主界面（restoreUndoHiddenDialogs 只认快照）
         clearUndoHiddenDialogs();
@@ -187,6 +189,19 @@ public class YGOProActivity extends YGOProActivityEngine {
             Toast.makeText(this, toastMsg, Toast.LENGTH_SHORT).show();
         }
     }
+
+    /**
+     * 回放结束/退出观战等场景的弹窗收口：与 {@link #returnToLanMain} 同一口径关闭仍在
+     * 窗口上显示的决斗内弹窗（展示列表/确认/选项/宣言…）。录像退出走
+     * ReplayModeDialog.quitReplay、不经 returnToLanMain，故单列为公开入口。
+     */
+    public void dismissDuelDialogsForExit() {
+        // 不能沿用 dialogUtil 判空跳过：录像播放期间 MessageUIHandler 对所有 select 询问直接
+        // return，dialogUtil 可能从未被惰性创建（纯观看、未弹过询问窗），判空会让收口整个跳过，
+        // 堆叠区展示窗就会留在录像选择界面上。getDialogUtil 同时负责惰性创建。
+        getDialogUtil().dismissOpenGameDialogs();
+    }
+
     /**
      * 显式退出玩家等待界面时由 MainMenuNavigator.onExitWaiting 在 disconnect 前调用：
      * 抑制本次 DISCONNECTED 自动 returnToLanMain（否则会连带弹出 LanModeDialog/MainMenuDialog），
@@ -258,6 +273,37 @@ public class YGOProActivity extends YGOProActivityEngine {
     public void showDeckEditorView() {
         deckEditorHost.show();
     }
+
+    /**
+     * match 局间换 side 专用：与 {@link #showDeckEditorView()} 同一套显隐编排，但不重载上次卡组——
+     * 换侧编辑的是当前对局卡组，由 {@code applySidingScreen} 按席位快照紧接着载入
+     * （实现见 {@link DeckEditorViewHost#showForSiding()}）。
+     */
+    public void showDeckEditorViewForSiding() {
+        deckEditorHost.showForSiding();
+    }
+
+    /**
+     * match 局间换 side 结束的场地收口（用户规格：隐藏卡组编辑器的同时把决斗场区与聊天输入行
+     * 一并恢复显示，不留中间帧）。
+     * <p>
+     * 换 side 进编辑器时 {@code showInternal} 走过 {@code hideGameUI}：{@code layout_game_right}
+     * 与其内的 {@code game_field_view}、底部聊天输入行全部退场，只剩顶部面板与编辑器两个权重格。
+     * 若提交完副卡组只收掉编辑器，这一帧只剩顶部面板是 {@code layout_game_content} 里唯一带权重
+     * 的可见子 View——它会被顶成整屏高（卡详图跟着放大），而聊天输入行因决斗场区仍 GONE 根本不显示，
+     * 直到下一局 STOC_DUEL_START 才回正，观感就是闪一下。故这里在同一帧把决斗场区整体接回：
+     * 内容区与决斗场区显示、顶部面板保持决斗几何（1/3 + 2/3）、退出大厅聊天态以恢复 GL 决斗场视图，
+     * 最后按新场景重算聊天输入框与 FPS 角标显隐。下一局 {@code enterDuelingUI} 再走一遍相同调用，幂等。
+     */
+    void restoreDuelAreaAfterSideSwap() {
+        if (layoutGameContent != null) layoutGameContent.setVisibility(View.VISIBLE);
+        if (layoutGameRight != null) layoutGameRight.setVisibility(View.VISIBLE);
+        setGameTopPanelVisible(true);
+        // game_field_view 恢复 VISIBLE 并退出大厅聊天列表态（本就不在大厅态时内部自行短路，无副作用）
+        exitLobbyChatUI();
+        updateFpsVisibility();
+        updateChatUIVisibility();
+    }
     /**
      * 投降入口（对齐 event_handler.cpp BUTTON_LEAVE_GAME → wSurrender(1359) 确认 → CTOS_SURRENDER）：
      * 先弹 YesOrNoDialog 二次确认，确认后才发送投降通讯；
@@ -298,31 +344,88 @@ public class YGOProActivity extends YGOProActivityEngine {
      */
     public void requestUndo() {
         if (engine == null || !engine.isInDuel() || !engine.canUndo()) return;
-        // sendUndo 的防连点闸门一致：本次不会真正发出撤回请求时不隐藏弹窗（隐藏后无人恢复）
-        if (engine.undoBlockedUntilNewAction) return;
+        // sendUndo 的准入闸门一致（重同步未落地 / 回退点询问未挂回 / 不足最小间隔）：
+        // 本次不会真正发出撤回请求时不隐藏弹窗（隐藏后无人恢复）
+        if (!engine.canSendUndo()) return;
         // 点击撤回瞬间先隐藏全部正在显示的询问弹窗（YesOrNoDialog），不等服务端 ACK：
         // 回退后旧询问必然失效，留着旧窗只会在 ACK 前误答旧询问。快照存入
         // undoHiddenDialogs：撤回被拒（onUndoDenied）且询问未被重派时逐个恢复，
         // 撤回被接受（onUndoResync）时快照作废，服务端重同步后会重新挂回新询问
         undoHiddenDialogs.clear();
+        // 连锁询问现场备份：下面的收口会连静态引用与必发标志一起作废，被拒恢复时要回灌
+        undoChainQueryBackup = YesOrNoDialog.getChainQueryDialog();
+        undoChainForcedBackup = YesOrNoDialog.isChainForcedMode();
         for (YesOrNoDialog d : YesOrNoDialog.snapshotShowingDialogs()) {
             undoHiddenDialogs.add(d);
             d.dismiss();
         }
+        // 用户规格：duel 相关的其余弹窗（选卡/确认/选项/宣言/表示形式/命令菜单）此刻一并自动隐藏。
+        // 点击瞬间引擎已布防撤回应答代次屏障，这些窗上的按钮再点也发不出应答（被丢弃），与其
+        // 留个“看起来能点、点了没反应”的旧窗遮住回退后的新局面，不如按撤回成功时的同一口径立即
+        // 收口；确实收口过应答窗时记下方志，被拒时据此重建（见 EngineCallbackDelegate.onUndoDenied）
+        undoClosedQuestionDialog = closeDuelUiForUndo();
         engine.sendUndo();
+    }
+
+    /**
+     * 撤回相关的一刀切收口（点击撤回瞬间与撤回成功重同步前共用）：关闭选卡/确认/展示/选项/
+     * 宣言/表示形式等全部 duel 弹窗，并作废其选择上下文与进行中的交互会话（这些状态由已被
+     * 撤销的询问建立，任其存活则下一次卡片/格子点击会拿旧询问的编码去应答新局面 → 非法应答
+     * → MSG_RETRY 风暴），同时取消卡片点击选中态与状态气泡。
+     * <p>不发出任何应答，也不依赖弹窗实例可重建（询问窗自身的快照恢复另由 undoHiddenDialogs 负责）。
+     *
+     * @return 本次是否真的关掉了询问窗之外的应答类弹窗
+     */
+    public boolean closeDuelUiForUndo() {
+        boolean closedOther = false;
+        if (dialogUtil != null) closedOther = dialogUtil.dismissOpenGameDialogs();
+        if (cardDetailPanel != null) {
+            // 与 dismissOpenGameDialogs 内部的同一方去重关闭（已关时仅返回 false）：保留原有
+            // 双重收口调用点，避免撤回链上因 dialogUtil 未就绪而漏关
+            closedOther |= cardDetailPanel.dismissOpenDialogs();
+            // 面板的选择上下文必须一并作废：「取消操作 / 完成选择」按钮按 currentSelectType 直接
+            // 编码应答，撤回后新询问已到达，误触这个旧按钮就是把一份旧询问的答复打到新局面上
+            cardDetailPanel.setSelectType(-1);
+            cardDetailPanel.hideCancelOrFinishButton();
+            cardDetailPanel.setCurrentDialog(null);
+            cardDetailPanel.setCardSelectDialog(null);
+            cardDetailPanel.setCardDisplayDialog(null);
+        }
+        // 连锁必发标志与询问窗静态引用作废：否则「取消操作」会被吞掉，或去 show 一个已死弹窗
+        YesOrNoDialog.setChainForcedMode(false);
+        YesOrNoDialog.setChainQueryDialog(null);
+        if (fieldCtl != null) {
+            fieldCtl.abortPendingSelectSessions();
+            fieldCtl.clearSelectionVisuals();
+            // 撤回后局面已变：旧的卡片点击选中态（金色呼吸外框/手卡抬升）与状态气泡一并收起
+            fieldCtl.cancelCardClickSelection();
+            fieldCtl.invalidate();
+        }
+        return closedOther;
     }
 
     /** 撤回被拒且询问未被屏障路径重派：恢复点击撤回时隐藏的询问弹窗，避免待答询问永久不可见 */
     public void restoreUndoHiddenDialogs() {
+        boolean chainRestored = false;
         for (YesOrNoDialog d : undoHiddenDialogs) {
             if (!d.isShowing()) d.show();
+            if (d == undoChainQueryBackup) chainRestored = true;
         }
         undoHiddenDialogs.clear();
+        // 恢复出的确是那张连锁询问窗：静态引用与必发标志原样回灌，「取消操作」继续可用
+        if (chainRestored) {
+            YesOrNoDialog.setChainQueryDialog(undoChainQueryBackup);
+            YesOrNoDialog.setChainForcedMode(undoChainForcedBackup);
+        }
+        undoChainQueryBackup = null;
     }
 
-    /** 撤回被接受或询问已按新询问重派：隐藏快照作废，不得再恢复旧窗 */
+    /** 撤回被接受或询问已按新询问重派：隐藏快照、连锁现场备份与「收口过其它应答弹窗」标志一并作废 */
     public void clearUndoHiddenDialogs() {
         undoHiddenDialogs.clear();
+        undoClosedQuestionDialog = false;
+        undoChainQueryBackup = null;
+        undoChainForcedBackup = false;
     }
 }
 

@@ -19,14 +19,132 @@
             android:layout_height="match_parent"
             android:orientation="vertical">
 
-            <com.tubb.smrv.SwipeMenuRecyclerView
-                android:id="@+id/list_cards"
+            <!-- 结果区自上而下三块：计数/排序行、结果列表、发售日期时间轴（贴底，方便手指拖动）。
+                 列表按剩余高度填充，不再用固定 marginTop 顶开（计数行高度随字号变化也不会盖住列表） -->
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
-                android:divider="@android:color/transparent"
-                android:dividerHeight="4dp"
-                android:padding="5dp"
-                android:scrollbars="vertical" />
+                android:orientation="vertical">
+
+                <!-- 顶部一行：搜索结果计数 + 排序规则切换（用户规格：新建立一行，与卡组编辑页
+                     左抽屉的顶部计数行观感一致）。计数原先在右下角卡查按钮下方，现上移到本行 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="top"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:paddingStart="5dp"
+                    android:paddingEnd="10dp">
+
+                    <TextView
+                        android:id="@+id/search_result_count"
+                        android:layout_width="wrap_content"
+                        android:layout_height="match_parent"
+                        android:background="@drawable/ic_radius_bg"
+                        android:clickable="false"
+                        android:gravity="center"
+                        android:text="0"
+                        android:textAlignment="center"
+                        android:textColor="@color/gold"
+                        android:textSize="10sp" />
+
+                    <!-- 我的收藏星标（用户规格：由右侧筛选面板移到本行，与本行其它控件同行）：
+                         空心星=普通搜索态，实心星=当前正在展示收藏列表；点击行为与原来的文字按钮一致
+                         （首次点按进入收藏列表，再点回到上一次搜索结果） -->
+                    <ImageButton
+                        android:id="@+id/btn_my_fav"
+                        android:layout_width="wrap_content"
+                        android:layout_height="match_parent"
+                        android:layout_marginHorizontal="5dp"
+                        android:background="@drawable/ic_radius_bg"
+                        android:contentDescription="@string/my_favorites"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/selector_favorite" />
+
+                    <!-- 展现模式切换按钮（用户规格）：默认列表，点一下换宫格；图标始终显示当前模式
+                         （列表态 ic_view_list_24，宫格态 ic_view_grid_24），由页面点击后刷新；
+                         本页不读卡组，因此行模式仍不装配加卡键 -->
+                    <ImageButton
+                        android:id="@+id/btn_result_view_mode"
+                        android:layout_width="wrap_content"
+                        android:layout_height="match_parent"
+                        android:layout_marginEnd="5dp"
+                        android:background="@drawable/ic_radius_bg"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/ic_view_list_24" />
+
+                    <!-- 排序规则按钮（固定写在布局上，位序即 sortSel：0=星数 / 1=攻击 / 2=守备 / 3=名称 / 4=时间）：
+                         按钮宽度按文字自适应，小屏放不下时整排可横向滑动；文字由代码按系统字符串本地化，
+                         选中项换 radius 底 + 金字，其余为 button_radius_black_transparents 底 + 白字 -->
+                    <cn.garymb.ygomobile.ui.widget.HorizontalScrollViewPlus
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="center_vertical"
+                        android:padding="2dp"
+                        android:background="@drawable/selected_light"
+                        android:layout_weight="1"
+                        android:overScrollMode="never"
+                        android:scrollbars="none">
+
+                        <LinearLayout
+                            android:id="@+id/ll_result_sort"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <androidx.appcompat.widget.AppCompatTextView
+                                android:id="@+id/btn_sort_time"
+                                style="@style/ResultSortButton"
+                                android:text="时间↓" />
+
+                            <androidx.appcompat.widget.AppCompatTextView
+                                android:id="@+id/btn_sort_star"
+                                style="@style/ResultSortButton"
+                                android:text="星数↓" />
+
+                            <androidx.appcompat.widget.AppCompatTextView
+                                android:id="@+id/btn_sort_atk"
+                                style="@style/ResultSortButton"
+                                android:text="攻击↓" />
+
+                            <androidx.appcompat.widget.AppCompatTextView
+                                android:id="@+id/btn_sort_def"
+                                style="@style/ResultSortButton"
+                                android:text="守备↓" />
+
+                            <androidx.appcompat.widget.AppCompatTextView
+                                android:id="@+id/btn_sort_name"
+                                style="@style/ResultSortButton"
+                                android:text="名称↑" />
+                        </LinearLayout>
+                    </cn.garymb.ygomobile.ui.widget.HorizontalScrollViewPlus>
+                </LinearLayout>
+
+                <!-- 列表底部做半透明渐隐（FadeBottomRecyclerView 自绘 alpha 遮罩，不带背景色），
+                     下边缘自然融进下方时间轴的透明背景 -->
+                <cn.garymb.ygomobile.ui.widget.FadeBottomRecyclerView
+                    android:id="@+id/list_cards"
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1"
+                    android:divider="@android:color/transparent"
+                    android:dividerHeight="4dp"
+                    android:padding="5dp"
+                    android:scrollbars="vertical" />
+
+                <!-- 发售日期时间轴（用户规格）：摆在结果列表下方；控件自己不画背景（全透明），
+                     上方列表底部已是半透明渐隐，两者在交界处自然衔接。
+                     左右留白走控件 padding；卡包数据没读完时由页面置 GONE -->
+                <cn.garymb.ygomobile.ui.widget.DateRangeSlider
+                    android:id="@+id/release_date_bar"
+                    android:layout_width="match_parent"
+                    android:layout_height="42dp"
+                    android:paddingStart="5dp"
+                    android:paddingEnd="5dp"
+                    android:visibility="gone" />
+            </LinearLayout>
 
             <LinearLayout
                 android:layout_width="wrap_content"
@@ -39,29 +157,19 @@
                 android:orientation="vertical"
                 android:padding="10dp">
 
+                <!-- 卡查按钮：结果计数已上移到顶部的计数+排序行（search_result_count），
+                     本悬浮列只留按钮本身，原先按钮下方的 10dp 间距是用来隔开计数的，一并去掉 -->
                 <ImageButton
                     android:id="@+id/btn_search"
                     android:layout_width="60dp"
                     android:layout_height="60dp"
                     android:layout_gravity="center"
-                    android:layout_marginBottom="10dp"
                     android:background="@drawable/button_cube"
                     android:src="@drawable/search"
                     android:scaleType="fitCenter"
                     android:adjustViewBounds="true"
                     android:padding="10dp"
                     android:clickable="false" />
-                <TextView
-                    android:id="@+id/search_result_count"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:background="@drawable/ic_radius_bg"
-                    android:clickable="false"
-                    android:gravity="center"
-                    android:textAlignment="center"
-                    android:text="0"
-                    android:textColor="@color/gold"
-                    android:textSize="10sp" />
             </LinearLayout>
 
         </FrameLayout>

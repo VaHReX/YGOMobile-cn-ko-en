@@ -44,6 +44,8 @@ public class CardDragHelper {
     private Card dragCard;
     private float grabDX, grabDY;
     private View highlightTarget;
+    /** 落点/悬停判定坐标的复用容器（存虚影中心，而非手指位置） */
+    private final float[] hit = new float[2];
 
     public CardDragHelper(Activity activity, DropHandler dropHandler, SoundManager soundManager) {
         this.activity = activity;
@@ -64,7 +66,11 @@ public class CardDragHelper {
      * 后续触摸事件经{@link #onTouchEvent}继续转发。
      */
     public void startDrag(View shadowView, DeckInfo.Type source, int index, Card card, MotionEvent trigger) {
-        if (dragging || card == null) return;
+        if (card == null) return;
+        //上一次的拖动没收过抬手（拖到一半被弹窗/重绑抢走事件）时残留的虚影先清掉再继续，
+        //不能因 dragging 还挂着就直接早退
+        if (dragging) cancelDrag();
+        DragLayers.sweep();
         content = activity.findViewById(android.R.id.content);
         if (content == null) return;
 
@@ -75,6 +81,8 @@ public class CardDragHelper {
         dragLayer.setAlpha(0.85f);
         content.addView(dragLayer, new FrameLayout.LayoutParams(
                 dragBitmap.getWidth(), dragBitmap.getHeight()));
+        //登记到跨实例活浮层表：抬手丢失时由下一次按下或新拖动的 sweep 自愈
+        DragLayers.add(dragLayer, content);
 
         int[] cloc = new int[2];
         content.getLocationOnScreen(cloc);
@@ -147,8 +155,23 @@ public class CardDragHelper {
         return null;
     }
 
+    /**
+     * 落点 / 悬停判定点取虚影中心而不是手指位置：按住卡片边角起拖时两者可差半张卡，
+     * 按手指判定会出现“虚影明明在某区、实际却落到另一区”。阴影左上角的屏幕坐标恒为
+     * “手指坐标 - 抓取偏移”（见{@link #moveLayer}），因此直接算而不查 View。
+     */
+    private void hitPoint(float rawX, float rawY) {
+        hit[0] = rawX - grabDX;
+        hit[1] = rawY - grabDY;
+        if (dragBitmap != null) {
+            hit[0] += dragBitmap.getWidth() / 2f;
+            hit[1] += dragBitmap.getHeight() / 2f;
+        }
+    }
+
     private void updateHighlight(float rawX, float rawY) {
-        View target = findTarget(rawX, rawY);
+        hitPoint(rawX, rawY);
+        View target = findTarget(hit[0], hit[1]);
         if (target == highlightTarget) return;
         clearHighlight();
         highlightTarget = target;
@@ -165,19 +188,24 @@ public class CardDragHelper {
     private void performDrop(float rawX, float rawY) {
         //对齐 C++ EMIE_LMOUSE_LEFT_UP 拖拽结束放置时 PlaySoundEffect(CARD_DROP)
         if (soundManager != null) soundManager.playSoundEffect(SoundManager.SFX.CARD_DROP);
-        View target = findTarget(rawX, rawY);
+        //先把落点换算成虚影中心，命中判定与下游插入下标均用该点，与玩家看到的阴影位置一致
+        hitPoint(rawX, rawY);
+        float dropX = hit[0];
+        float dropY = hit[1];
+        View target = findTarget(dropX, dropY);
         DeckInfo.Type source = dragSource;
         int index = dragIndex;
         Card card = dragCard;
         cancelDrag();
         if (target != null) {
-            dropHandler.onCardDrop(target, source, index, card, rawX, rawY);
+            dropHandler.onCardDrop(target, source, index, card, dropX, dropY);
         }
     }
 
     private void removeDragLayer() {
         if (dragLayer != null) {
-            if (content != null) content.removeView(dragLayer);
+            //经登记处摘除：父容器已换（旋转/重建）时按当前父容器也能摘干净
+            DragLayers.remove(dragLayer);
             dragLayer = null;
         }
         if (dragBitmap != null) {

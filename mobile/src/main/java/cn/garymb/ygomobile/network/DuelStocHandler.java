@@ -81,6 +81,12 @@ public class DuelStocHandler implements DuelClient.ClientListener {
     @Override
     public void onPlayerChange(int status) {
         Log.i(TAG, "Player change: " + String.format("0x%02X", status));
+        // 对齐 duelclient.cpp STOC_HS_PLAYER_CHANGE L1189-1191：低 4 位状态 < 8（即新人入座引起的席位重排；
+        // OBSERVE=8/READY=9/NOTREADY=a/LEAVE=b 不响）时播玩家进入音效，与 STOC_HS_PLAYER_ENTER 同响——
+        // 旧实现只在 ENTER 包响，换位时无声
+        if ((status & 0xf) < 8) {
+            engine.soundManager.playSoundEffect(SoundManager.SFX.PLAYER_ENTER);
+        }
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onPlayerChange(status);
         });
@@ -109,7 +115,10 @@ public class DuelStocHandler implements DuelClient.ClientListener {
 
     @Override
     public void onDuelStart() {
-        engine.field.clear();
+        // 新一局开场硬复位（对齐 C++ STOC_DUEL_START 的 dField.Clear()）：同步丢弃上一局遗留的
+        // 待派发消息与动画/持闸状态，并把清场作为新一局的第一条串行动作——旧实现把清场排到队列
+        // 尾，若上一局在对方动画播完前投降，会先把旧动画（含投降演出）全部播完才开始新一局。
+        engine.prepareNewDuel();
         // 新一场决斗（含 match 三局的开场包）：丢弃上一场未与录像配对的残留 MSG 段
         engine.resetMsgRecording();
         // 作废上一局可能残留的撤回 latch（ACK 先到、reload 因断线未落地），
@@ -214,10 +223,8 @@ public class DuelStocHandler implements DuelClient.ClientListener {
         // 对齐 duelclient.cpp STOC_CHANGE_SIDE L543：进入换 side 前 dField.Clear()。
         // match 局间上一局的场上卡片、LP 增减动画必须在此彻底清除，否则换完备卡回到
         // 决斗场时仍会残留上一局的卡片与最后一次伤害动画。clear() 已复位 LP 动画状态机。
-        engine.field.clear();
-        engine.mainHandler.post(() -> {
-            if (engine.listener != null) engine.listener.onFieldChanged();
-        });
+        // 排到通讯队列尾部执行（与 MSG_* 同序），避免插到下一局已建好的堆叠之后。
+        clearFieldAfterPendingMsgs();
         // Solo 连续换 side：上一份 side 提交后编辑器已隐藏但引擎状态仍停留在 SIDING，
         // 服务端随即下发第二条 CHANGE_SIDE。setEngineState 因状态未变会去重、不回调，
         // 导致下一席位换 side 界面无法重新载入（表现为编辑器消失后不再出现）。
@@ -234,14 +241,28 @@ public class DuelStocHandler implements DuelClient.ClientListener {
         engine.inDuel = false;
         Log.i(TAG, "Waiting for side change");
         // 对齐 duelclient.cpp STOC_WAITING_SIDE L578：等待对方换备卡时 dField.Clear()，
-        // 清除本局换 side 前可能残留的场上卡片与 LP 动画，保证下一局开场是干净空场
-        engine.field.clear();
-        engine.mainHandler.post(() -> {
-            if (engine.listener != null) engine.listener.onFieldChanged();
-        });
+        // 清除本局换 side 前可能残留的场上卡片与 LP 动画，保证下一局开场是干净空场。
+        // 排到通讯队列尾部执行（与 MSG_* 同序）：match 局间本包与下一局的 MSG_START 几乎同批
+        // 到达，观战积压时即时 clear 会插到「下一局已建好的卡组/额外堆叠」之后，把堆叠抹成
+        // 空场且再不重建（用户反馈的三局两胜中途观战「突然重置」）。
+        clearFieldAfterPendingMsgs();
         // 对齐 duelclient.cpp L575-580：STOC_WAITING_SIDE 显示"等待换备卡"
         engine.hintManager.stopWaitHint();
         engine.hintManager.postDuelHint(engine.hintManager.sysString(1409, "等待对方换备卡..."));
+    }
+
+    /**
+     * 把「清空场地」排到待派发通讯队列的尾部执行（与 {@code MSG_*} 同序，对齐 C++
+     * {@code duelclient.cpp ClientAnalyze} 只有一条按到达顺序的链：动画期用 WaitFrameSignal
+     * 阻塞消息线程，STOC 不可能插到队列中间），清完再通知视图刷新。供三处会抹掉卡组/额外堆叠的
+     * STOC（STOC_DUEL_START / STOC_CHANGE_SIDE / STOC_WAITING_SIDE）使用；队列已空（正常实况）
+     * 时等价于立即执行，行为不变。
+     */
+    private void clearFieldAfterPendingMsgs() {
+        engine.postOnMsgQueue(() -> {
+            engine.field.clear();
+            if (engine.listener != null) engine.listener.onFieldChanged();
+        });
     }
 
     @Override
@@ -318,12 +339,16 @@ public class DuelStocHandler implements DuelClient.ClientListener {
     }
 
     @Override
-    public void onUndoResult(int result, int turn, int currentPlayer, int phase) {
-        // ACK 不进动画闸门（它不是对局消息），直接把回退后的回合/阶段 latch 到引擎，
-        // 由随后的 MSG_RELOAD_FIELD 落地时消费（reload 不带回合号，也不重发 MSG_START）
+    public void onUndoResult(int result, int turn, int currentPlayer, int phase, int chainEvents,
+                             int ackRound) {
+        // ACK 不进动画闸门（它不是对局消息），直接把回退后的回合/阶段、重放前缀内的
+        // 有效发动条数与撤回轮次号 latch 到引擎，由随后的 MSG_RELOAD_FIELD 落地时消费
+        //（reload 不带回合号，也不重发 MSG_START）；chainEvents 供发动账本回退、
+        // ackRound 供陈旧 ACK 拒收，旧服务端短载荷均为 -1
         Log.i(TAG, "Undo ack: result=" + result + " turn=" + turn + " player=" + currentPlayer
-                + " phase=0x" + Integer.toHexString(phase));
-        engine.onUndoAck(result, turn, currentPlayer, phase);
+                + " phase=0x" + Integer.toHexString(phase) + " chainEvents=" + chainEvents
+                + " round=" + ackRound);
+        engine.onUndoAck(result, turn, currentPlayer, phase, chainEvents, ackRound);
     }
 
     @Override

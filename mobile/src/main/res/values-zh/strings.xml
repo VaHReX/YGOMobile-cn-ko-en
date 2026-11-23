@@ -42,20 +42,19 @@
     <string name="fetch_online_deck">通过网络获取在线卡组</string>
     <string name="fetch_ex_card">通过网络获取先行卡</string>
     <string name="ex_card_list_title">超先行服☆专用☆</string>
-    <string name="ex_card_log_title">更新日志</string>
-    <string name="ex_card_report_title">反馈</string>
     <string name="ex_card_check_toast_message">未开启扩展卡包会在该服务器遇到未知卡，推荐开启扩展卡包后再进入</string>
     <string name="ex_card_check_toast_message_ii">未下载扩展卡包会在该服务器遇到未知卡，推荐下载扩展卡包后再进入</string>
-    <string name="ex_card_check_toast_message_iii">未获取到先行卡信息，将跳转233官网下载</string>
+    <string name="ex_card_check_toast_message_iii">未获取到先行卡信息，请稍后重试</string>
 
     <!-- settings -->
     <string name="settings_about">关于</string>
     <string name="settings_about_sub_about">关于</string>
     <string name="settings_game_enable_sound_effect">启用游戏音效</string>
     <string name="settings_game_screen_orientation">游戏横屏锁定</string>
+    <string name="settings_game_portrait_orientation">游戏竖屏锁定</string>
     <string name="settings_game_font_antialias">字体抗锯齿</string>
     <string name="settings_game_lab_pendulum_scale">灵摆数字图片</string>
-    <string name="settings_native_game_mode">原生 UI 游戏模式</string>
+    <string name="settings_native_game_mode">实验室：新游戏UI</string>
     <string name="settings_native_game_mode_summary">比原版有更多新功能</string>
     <string name="settings_game_font_antialias_summary">禁用字体抗锯齿可以提升帧数</string>
     <string name="settings_about_author_pref">作者</string>
@@ -164,8 +163,13 @@
     <string name="save_deck">保存</string>
     <string name="save_as_deck">另存为</string>
     <string name="deck_list">卡组列表</string>
-    <string name="loading">加载中..."</string>
-    <string name="loading_failed">加载失败"</string>
+    <string name="loading">加载中...</string>
+    <string name="loading_failed">加载失败</string>
+    <string name="script_loading_progress">正在加载卡片脚本（%1$s） %2$d%%</string>
+    <string name="script_loading_stage_script">脚本档案</string>
+    <string name="script_loading_stage_cdb">卡片数据库</string>
+    <string name="script_loading_stage_engine">卡片数据与脚本</string>
+    <string name="script_loading_failed">卡片脚本加载失败，请退出后重试</string>
     <string name="tip">提示</string>
     <string name="question">询问</string>
     <string name="question_delete_deck">删除卡组?</string>
@@ -182,9 +186,19 @@
     <string name="tip_drag_side_full" formatted="false">副卡组已满（上限%d）</string>
     <string name="tip_drag_extra_in_main">额外卡组的卡片不能放入主卡组</string>
     <string name="tip_drag_normal_in_extra">普通卡片不能放入额外卡组</string>
+    <string name="batch_delete_done" formatted="false">已删除 %d 张卡</string>
+    <string name="batch_delete_none">尚未勾选任何卡片</string>
+    <string name="batch_mode_exit">多选</string>
     <string name="file_exist">文件已经存在</string>
     <string name="share_deck">分享卡组</string>
     <string name="code_share">卡组码分享</string>
+    <string name="ask_idle_cmd_label">召唤、盖放、灵摆发动前询问</string>
+    <string name="ask_cmd_summon_confirm" formatted="false">是否确定召唤[%s]？</string>
+    <string name="ask_cmd_set_confirm" formatted="false">是否确定盖放[%s]？</string>
+    <string name="ask_cmd_pendulum_confirm" formatted="false">是否确定将[%s]在灵摆区域发动？</string>
+    <string name="settings_pendulum_activate_btn">单独灵摆刻度发动按钮</string>
+    <string name="cmd_pendulum_activate">灵摆区域发动</string>
+    <string name="cmd_activate_monster_effect">怪兽效果发动</string>
     <string name="screenshoot">图片分享</string>
     <string name="ydk_share">文件分享</string>
     <string name="no_share_app">没有找到分享应用</string>
@@ -199,7 +213,12 @@
     <string name="refresh">刷新</string>
     <string name="select_deck">点击选择卡组</string>
     <string name="solo_mode">纯单人模式</string>
+    <string name="bot_p2_deck_label">P2卡组：</string>
+    <string name="bot_tag_max_select">TAG模式最多选择3个人机，请先点击已选条目取消后再换人</string>
+    <string name="bot_favorite_added">已收藏 %1$s，该人机已置顶到列表顶部</string>
+    <string name="bot_favorite_removed">已取消收藏 %1$s，该人机已回到列表原位</string>
     <string name="quit_deck_tip">卡组未保存，是否退出本应用？</string>
+    <string name="deck_discard_switch_tip">此操作将放弃对当前卡组的修改，是否继续？</string>
     <string name="deck_delete_text">拖到这里删除</string>
     <string name="question_keep_cur_deck">保留当前卡牌？</string>
     <string name="check_choose_file" formatted="false">确定选择这个 %s ？</string>
@@ -270,9 +289,6 @@
     <string name="Join_QQ">机型调试群</string>
     <string name="about_Join_QQ">软件遇到使用问题可以加群</string>
     <string name="donatefor">您的捐赠将用于维持自动更新费用，收集更新资料、修图后期以及购买适配机型等</string>
-    <string name="coverSelect">点击相应卡背选择文件</string>
-    <string name="bgSelect">点击相应背景选择文件</string>
-    <string name="avatarSelect">点击相应头像选择文件</string>
     <string name="ClickLinkArrows">点亮箭头</string>
     <string name="tip_no_permission" formatted="false">权限 %s 被你禁止了</string>
     <string name="Already_Lastest">未发现新版本，要不去作者动态看看？或许有最新消息</string>
@@ -288,6 +304,23 @@
     <string name="Download_Precard_Failed">先行卡下载失败</string>
     <string name="Pre_Server_Name">萌卡超先行服</string>
     <string name="Ask_to_Change_Other_Way">主线获取失败，尝试备选线路中...</string>
+    <string name="superpre_inc_checking">检查中...</string>
+    <string name="superpre_inc_comparing">比对中...</string>
+    <string name="superpre_inc_requesting">请求中...</string>
+    <string name="superpre_inc_downloading">%1$d%%</string>
+    <string name="superpre_inc_retry_network">重连中...</string>
+    <string name="superpre_inc_retry_server">服务器忙</string>
+    <string name="superpre_inc_merging">合成中...</string>
+    <string name="superpre_inc_start">增量更新：下载 %1$d 个文件（%2$s）</string>
+    <string name="superpre_inc_fallback">增量更新暂不可用（服务器或数据问题）。要改为下载完整包吗？</string>
+    <string name="superpre_inc_network_failed">网络连接失败，已下载的 %1$s 会保留，网络恢复后点下载继续</string>
+    <string name="superpre_inc_network_failed_nothing_kept">网络连接失败，网络恢复后点下载重试</string>
+    <string name="superpre_inc_try_later">先行卡正在发布新版本，请几分钟后再试</string>
+    <string name="superpre_inc_long_press_tip">长按下载按钮可以选择完整下载。</string>
+    <string name="superpre_inc_choose_title">选择下载方式</string>
+    <string name="superpre_inc_choose_message">增量更新：下载有变化的文件。\n完整下载：重新下载整个先行卡包，即原来的方式。</string>
+    <string name="superpre_inc_choose_incremental">增量更新</string>
+    <string name="superpre_inc_choose_full">完整下载</string>
     <string name="DuelAssistant">决斗助手启用中</string>
     <string name="masterrule">学习大师规则</string>
     <string name="tutorial">查看软件教程</string>
@@ -306,6 +339,7 @@
     <string name="searchresult">搜索结果</string>
     <string name="Pre_share">准备分享，请稍候……</string>
     <string name="category_pack">卡包展示</string>
+    <string name="label_release_date">发售日期</string>
     <string name="category_windbot_deck">人机卡组</string>
     <string name="category_Uncategorized">未分类卡组</string>
     <string name="please_input_category_name">请输入新卡组分类名</string>
@@ -353,7 +387,7 @@
     <string name="guide_search_result_count">这里显示搜索结果卡片数量</string>
     <string name="guide_button_search_result">点击显示搜索结果\n默认显示收藏的卡片</string>
     <string name="guide_view_deck_manager">点击切换卡组\n也可以在此管理多个卡组分类</string>
-    <string name="guide_view_move_card">按住一张卡片可以拖动到其他位置\n长按这张卡片即可删除它</string>
+    <string name="guide_view_move_card">按住一张卡片可以拖动到其他位置\n长按卡片进入批量勾选：可整组拖动或删除</string>
     <string name="guide_view_banner">萌卡新闻轮播，可以点击查看内容</string>
     <string name="title_delete_ex">删除扩展卡包</string>
     <string name="ask_delete_ex">点击确认以清空</string>
@@ -513,9 +547,34 @@
     <string name="resource_lflist">· 禁卡表</string>
     <string name="resource_strings">· 字段等配置</string>
     <string name="resource_pics">· 卡图压缩包</string>
+    <string name="resource_scripts">· 脚本压缩包</string>
 
     <!-- System Strings for UI Localization (index 1740+) -->
     <string name="spectator_skip_to_current">跳到当前</string>
     <string name="refresh_lan_button">刷新局域网</string>
     <string name="mode_single_duel_solo">单人模式</string>
+
+    <!-- 持续适用中效果提示（头像角金色感叹号徽标与其下拉列表） -->
+    <string name="applying_effects_title">持续适用中的效果</string>
+    <string name="applying_effects_self">我方持续适用中的效果</string>
+    <string name="applying_effects_opponent">对方持续适用中的效果</string>
+    <string name="applying_effect_scope_turn">本回合</string>
+    <string name="applying_effect_scope_duel">整局决斗</string>
+    <!-- /ai 人机召唤 UI -->
+    <string name="btn_ai_summon">/ai（呼叫Bot）</string>
+    <string name="ai_deck_select_title">符合%1$s的人机列表</string>
+    <string name="ai_deck_random">随机-不指定</string>
+    <string name="ai_deck_empty">没有符合当前禁卡表的人机卡组</string>
+    <string name="cancel">取消</string>
+    <string name="sort_rule_time">时间↓</string>
+    <!-- 搜索结果分段说明 -->
+    <string name="section_title_star">%1$d星</string>
+    <string name="section_title_link">LINK-%1$d</string>
+    <string name="section_title_spell">魔法</string>
+    <string name="section_title_trap">陷阱</string>
+    <string name="section_title_other">其他</string>
+    <string name="section_title_digits">数字</string>
+    <string name="section_title_year">%1$d年</string>
+    <string name="section_title_unknown">未知</string>
+    <string name="section_title_with_count">%1$s · %2$d张</string>
 </resources>

@@ -1,27 +1,24 @@
 package cn.garymb.ygomobile.engine;
 
+import android.content.Context;
 import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Enumeration;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -29,33 +26,34 @@ import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.NativeInitOptions;
 import cn.garymb.ygomobile.utils.CrashHandler;
+import cn.garymb.ygomobile.utils.IOUtils;
 
 /**
- * native 决斗引擎（libygoengine.so）的启动引导：脚本与卡包物化 + 引擎初始化。
+ * native 决斗引擎（libygoengine.so）的启动引导：档案直读下的引擎初始化。
  *
- * <p>JNI 侧（ygo_engine_jni.cpp::engineScriptReader）只认资源根目录下的<b>实体文件</b>：
- * 卡片脚本优先 {@code root/expansions/script/*.lua}，其次 {@code root/script/*.lua}
- *（对齐 C++ data_manager.cpp::ScriptReaderEx 在 prefer_expansion_script=1 时的
- * “expansions 散文件 > 卡包档案 > 主脚本”语义）；卡片数据库仅认传入的实体 cdb
- * 路径列表，按“优先级从低到高、后加载覆盖”装载（对齐 game.cpp 先 LoadDB(mDbList)
- * 后 LoadExpansions() 的净效果：扩展覆盖主库同名卡）。
- *
- * <p>由此，资源根目录（ygocore/）与 expansions/ 下的每张卡包压缩包（.zip/.ypk）
- * 必须物化两样东西，否则扩展包卡片在主卡片数据/脚本完备时仍会因引擎侧
- * <b>既无卡片数据（type=0 无法召唤）又无脚本（无法发动效果）</b>而只能盖放：
+ * <p>本类不再解压任何东西。两套 C++ 读取通道都直接从档案里取数据（对齐
+ * {@code Classes/gframe/game.cpp::LoadExpansions} 与
+ * {@code Classes/gframe/data_manager.cpp::ScriptReaderEx}/{@code LoadDB}）：
  * <ul>
- *   <li>包内 script/ 的 cXXX.lua → {@code <root>/expansions/script/}；</li>
- *   <li>包内全部 *.cdb → {@code <root>/expansions/cdb/<包名>_<序号>.cdb}，由
- *       {@code AppsSettings#makeCdbList} 纳入引擎列表。</li>
+ *   <li>libygoengine.so（本类引导）：{@code ygo_engine_jni.cpp} 自己扫
+ *       {@code <root>/*.zip|*.ypk} 与 {@code <root>/expansions/*.zip|*.ypk} 的中央目录建索引，
+ *       按需 pread+inflate 就地读包内 {@code script/*.lua} 与 {@code *.cdb}；主脚本走
+ *       {@code <root>/scripts.zip} 同一套机制；</li>
+ *   <li>libYGOMobile.so（gframe）：靠 {@code AppsSettings#makeZipList} 把同一批档案挂进
+ *       irrlicht FileArchives，脚本与 cdb 由 gframe 就地读。</li>
  * </ul>
- * 同种数据源的统一读取优先级（高→低）：expansions 散文件 ＞ 卡包 zip/ypk
- *（文件名字典序，靠后的包覆盖靠前的包）＞ 主资源（cards.cdb / scripts.zip / pics.zip）
- * ＞ 主散目录，cdb/script/pics 三类一致（参考 game.cpp、data_manager.cpp、
- * image_manager.cpp）。
  *
- * <p>局域网主机（LanGameServer 监听就绪后的后台引导）与旧格式录像回放（EngineReplaySource）
- * 均经 {@link #ensureEngineReady()} 完成“解压脚本∥物化卡包（两子线程并行）→
- * OcgDuelEngine.init”引导；卡包增删/变更后 cdb 列表变化时热重载（{@code reloadCards}），
+ * <p>读取优先级（高→低）与 cdb/pics 统一口径一致：
+ * {@code <expansions>/script|*.cdb} 散调试文件 ＞ 卡包 zip/ypk（按包名字典序，靠后的包优先）
+ * ＞ 主资源档案（{@code cards.cdb} / {@code scripts.zip}）＞ 主散目录。
+ * 因此卡包档案内 cdb 与 script 的效力恒高于 {@code ygocore/cards.cdb} 与
+ * {@code scripts.zip}，且都不需要落地解压。
+ *
+ * <p>Java 侧只负责三件事：① 把包内 {@code scripts.zip} 拷到资源根目录
+ *（{@link #copyScriptsZipFromAssets}）；② 一次性清掉旧版本"卡包物化"落地的残留
+ *（{@link #pruneLegacyMaterialized}，残留副本会盖住档案里的新内容，必须清）；
+ * ③ 引导与热重载：卡包增删/覆写不改变 cdb 列表，故用
+ *{@link #packsFingerprint} 单独判定并触发 {@code reloadCards}（native 侧重扫档案），
  * 无需重启应用。
  */
 public final class NativeScriptBootstrap {
@@ -63,145 +61,143 @@ public final class NativeScriptBootstrap {
 
     /** 已成功 init 的资源根目录；相同路径重复调用直接放行（引擎全局状态幂等）。 */
     private static volatile String sInitedRootPath;
-    /** 上次 init/reloadCards 实际使用的 cdb 列表，用于检测卡包物化后的列表变化。 */
+    /** 上次 init/reloadCards 实际使用的主资源 cdb 列表，用于检测数据库变化。 */
     private static volatile String[] sInitedCdbPaths = new String[0];
+    /** 上次 init/reloadCards 实际使用的卡包档案指纹，用于检测卡包增删/覆写。 */
+    private static volatile String sInitedPacksFp = "";
+    /** 上次 init/reloadCards 实际使用的主 cdb / scripts.zip 资源指纹（大小+mtime）：
+     *  资源检查“删旧→拷新”完成后据此热重载，避免半套卡数据被永久缓存。 */
+    private static volatile String sInitedResFp = "";
+    /** 旧版物化残留清理只做一次（进程内首次引导时）。 */
+    private static volatile boolean sLegacyPruned;
 
-    /** 卡包物化标记的版本前缀：标记内容=本行指纹+该包历次解出的文件清单；
-     * 旧版单行标记（无前缀）指纹一致时走快速路径：脚本只记清单不重写盘，仅补物化
-     * cdb；指纹不符或无标记才全量重解。 */
-    private static final String PACK_MARK_PREFIX = "packv2 ";
+    /** 旧版卡包物化标记文件名前缀，仅用于按清单回收历史产物。 */
+    private static final String MARK_PREFIX = ".mark_";
 
     private NativeScriptBootstrap() {
     }
 
     /**
-     * 引导引擎：确保 script/ 目录已就绪后调用 {@link OcgDuelEngine#init}。
+     * 引导引擎：全部档案直读（无解压），调用 {@link OcgDuelEngine#init}。
      *
      * @return 引擎可用且初始化成功返回 true
      */
     public static synchronized boolean ensureEngineReady() {
         if (!OcgDuelEngine.isAvailable()) {
             Log.e(TAG, "libygoengine.so 不可用");
+            ScriptLoadStatus.engineLoadFailed();
             return false;
         }
+        // 进度上报：等待界面（PlayerWaitingDialog）据此显示加载进度，开局闸门据
+        // ScriptLoadStatus 等到就绪；未就绪就开局会把缺脚本/卡数据的卡永久缓存
+        ScriptLoadStatus.engineLoadStarted();
         try {
-            // 先物化再取 NativeInitOptions：makeCdbList 要扫描卡包物化产物目录
-            // <expansions>/cdb/，顺序颠倒会漏掉本轮新增的卡包数据库
-            String rootPath = AppsSettings.get().getResourcePath();
-            final String extractRoot = rootPath;
             long t0 = SystemClock.uptimeMillis();
-            // 脚本解压与卡包物化并行：主 scripts.zip 解到 <root>/script/、卡包物化到
-            // <root>/expansions/，两阶段产物目录/标记文件均无交集，低配设备上用两条
-            // 子线程同时进行，引导墙钟时间从“两者之和”压缩为“两者较大者”。
-            // cdb 列表须在二者全部完成后解算（makeCdbList 扫描物化产物目录）
-            final long[] phaseMs = new long[2];
-            final Throwable[] phaseErr = new Throwable[2];
-            Thread mainScripts = new Thread(() -> {
-                long s = SystemClock.uptimeMillis();
-                try {
-                    ensureScriptsExtracted(extractRoot);
-                } catch (Throwable t) {
-                    phaseErr[0] = t;
-                }
-                phaseMs[0] = SystemClock.uptimeMillis() - s;
-            }, "EngineBootMainScripts");
-            Thread packMaterialize = new Thread(() -> {
-                long s = SystemClock.uptimeMillis();
-                try {
-                    // 扩展卡包物化：ygocore/ 与 expansions/ 下全部 .zip/.ypk 的 script/*.lua →
-                    // <root>/expansions/script/，包内 *.cdb → <root>/expansions/cdb/；否则
-                    // 卡包卡片因引擎无数据无脚本只能盖放（见类注释）。包间字典序升序
-                    // 覆写的优先级在本线程内串行保持，不受并行影响
-                    ensureExpansionScriptsExtracted(extractRoot);
-                } catch (Throwable t) {
-                    phaseErr[1] = t;
-                }
-                phaseMs[1] = SystemClock.uptimeMillis() - s;
-            }, "EngineBootPacks");
-            mainScripts.setDaemon(true);
-            packMaterialize.setDaemon(true);
-            mainScripts.start();
-            packMaterialize.start();
-            try {
-                mainScripts.join();
-                packMaterialize.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                Log.w(TAG, "引擎引导等待解压线程时被中断");
-            }
-            if (phaseErr[0] != null) {
-                Log.e(TAG, "主脚本解压异常", phaseErr[0]);
-            }
-            if (phaseErr[1] != null) {
-                Log.e(TAG, "卡包物化异常", phaseErr[1]);
-            }
+            // 旧版把卡包 script/*.lua 与包内 cdb 解压落地到 expansions/script、expansions/cdb。
+            // 现在两套 C++ 都能就地读档案，落地不仅白占空间，残留旧副本还会以最高优先级盖住
+            // 档案里的新内容，因此首轮一次性回收
+            ScriptLoadStatus.engineProgress(0.02d, 0.05d);
+            pruneLegacyMaterialized(AppsSettings.get().getResourcePath());
             long t1 = SystemClock.uptimeMillis();
+            ScriptLoadStatus.engineProgress(0.08d, 0.12d);
             NativeInitOptions options = AppsSettings.get().getNativeInitOptions();
-            rootPath = options.mWorkPath;
+            final String rootPath = options.mWorkPath;
             String[] cdbPaths = options.mDbList.toArray(new String[0]);
+            // 卡包列表变化不会改变 mDbList，单独算指纹才能触发热重载
+            final String packs = packsFingerprint(rootPath);
+            // 资源指纹（主 cdb/scripts.zip 的大小+mtime）：资源检查删除旧库再拷新的窗口内
+            // 初始化只能读到半套数据，指纹变化后热重载自愈，不必重启应用
+            final String resFp = resourcesFingerprint(rootPath, cdbPaths);
+            final boolean readExpansions = AppsSettings.get().isReadExpansions();
             long t2 = SystemClock.uptimeMillis();
-            // 诊断：内置引擎（LAN 建主/残局/旧格式回放）的真实脚本根目录——卡片 lua 脚本
-            // 优先读 <root>/expansions/script/（散调试文件+卡包物化区），其次 <root>/script/
-            //（主，scripts.zip 解出）；scripts.zip 指纹变化时 ensureScriptsExtracted 会
-            // 用 zip 内容覆写主脚本区（手改主脚本会被冲掉）
+            // 诊断：档案直读三段来源的当前态
             Log.i(TAG, "engine bootstrap root=" + rootPath
-                    + " script/init.lua exists=" + new File(new File(rootPath,
-                    Constants.CORE_SCRIPT_PATH), "init.lua").exists()
-                    + " expansions/script/init.lua exists=" + new File(new File(rootPath,
-                    Constants.CORE_EXPANSIONS + "/" + Constants.CORE_SCRIPT_PATH),
-                    "init.lua").exists()
-                    + " packcdb=" + listPackCdbCount(rootPath)
-                    + " scripts.zip exists=" + new File(rootPath,
-                    Constants.CORE_SCRIPTS_ZIP).exists());
-            // 分段耗时：开局卡顿定位用（预热未完成时 startDuel 闸门会同步等到这里全部结束）；
-            // 解压两阶段为并行线程，各自耗时与并行墙钟（取较大者）分别记录
-            Log.i(TAG, "engine bootstrap 耗时(ms) 主脚本解压=" + phaseMs[0]
-                    + " 卡包物化=" + phaseMs[1] + "（并行墙钟=" + (t1 - t0) + "）"
+                    + " scripts.zip=" + sizeOrMissing(new File(rootPath, Constants.CORE_SCRIPTS_ZIP))
+                    + " cards.cdb=" + sizeOrMissing(new File(rootPath, Constants.DATABASE_NAME))
+                    + " 卡包=" + countOf(collectPacks(rootPath))
+                    + " readExpansions=" + readExpansions
+                    + " 主cdb数=" + cdbPaths.length);
+            // 分段耗时：开局卡顿定位用（预热未完成时 startDuel 闸门会同步等到这里全部结束）
+            Log.i(TAG, "engine bootstrap 耗时(ms) 旧物化清理=" + (t1 - t0)
                     + " 选项解算=" + (t2 - t1));
             if (rootPath.equals(sInitedRootPath)) {
-                // 已初始化：卡包增删/变更导致 cdb 列表变化时热重载引擎卡数据
-                if (!Arrays.equals(sInitedCdbPaths, cdbPaths)) {
+                // 已初始化：主 cdb 内容变化、卡包增删/覆写或资源检查重写过 scripts.zip 时
+                // 热重载引擎卡数据（native reloadCards 会重扫档案，故包内容变了也不必重启应用）
+                if (!Arrays.equals(sInitedCdbPaths, cdbPaths) || !packs.equals(sInitedPacksFp)
+                        || !resFp.equals(sInitedResFp)) {
                     long r0 = SystemClock.uptimeMillis();
-                    OcgDuelEngine.reloadCards(cdbPaths);
+                    ScriptLoadStatus.engineProgress(0.20d, 0.90d);
+                    OcgDuelEngine.reloadCards(cdbPaths, readExpansions);
                     sInitedCdbPaths = cdbPaths;
-                    Log.i(TAG, "卡片数据库列表变化，热重载引擎卡数据，耗时="
+                    sInitedPacksFp = packs;
+                    sInitedResFp = resFp;
+                    Log.i(TAG, "卡片数据库/卡包档案变化，热重载引擎卡数据，耗时="
                             + (SystemClock.uptimeMillis() - r0) + "ms");
                 }
+                ScriptLoadStatus.engineLoadSucceeded();
                 return true;
             }
+            // 主 cdb 尚不齐全（资源检查“删旧→拷新”的窗口）：不得以半套数据初始化，
+            // 否则 sInitedRootPath 会把半套卡数据缓存到进程结束，后续补齐也拿不到脚本
+            if (!cdbPathsPresent(cdbPaths)) {
+                Log.w(TAG, "主卡片数据库尚未就绪（资源检查拷贝中），稍后重试");
+                ScriptLoadStatus.engineLoadFailed();
+                return false;
+            }
+            ScriptLoadStatus.engineProgress(0.20d, 0.90d);
             long i0 = SystemClock.uptimeMillis();
-            if (OcgDuelEngine.init(rootPath, cdbPaths)) {
+            if (OcgDuelEngine.init(rootPath, cdbPaths, readExpansions)) {
                 Log.i(TAG, "引擎 init 完成，耗时=" + (SystemClock.uptimeMillis() - i0)
-                        + "ms cdb数=" + cdbPaths.length);
+                        + "ms cdb数=" + cdbPaths.length + " 卡包数=" + countOf(collectPacks(rootPath)));
                 sInitedRootPath = rootPath;
                 sInitedCdbPaths = cdbPaths;
+                sInitedPacksFp = packs;
+                sInitedResFp = resFp;
+                ScriptLoadStatus.engineLoadSucceeded();
                 return true;
             }
             Log.e(TAG, "OcgDuelEngine.init 失败: " + rootPath);
+            ScriptLoadStatus.engineLoadFailed();
             return false;
         } catch (Throwable t) {
             Log.e(TAG, "引擎引导异常", t);
+            ScriptLoadStatus.engineLoadFailed();
             return false;
         }
     }
 
-    /** 诊断用：已物化的卡包 cdb 个数（不改变任何状态）。 */
-    private static int listPackCdbCount(String resourcePath) {
-        File[] fs = new File(new File(new File(resourcePath, Constants.CORE_EXPANSIONS),
-                Constants.CORE_PACK_CDB_DIR), "").listFiles(
-                f -> f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".cdb"));
-        return fs == null ? 0 : fs.length;
+    /** 主资源 cdb 是否都已存在：资源检查“删旧→拷新”的窗口内不得以其初始化。 */
+    private static boolean cdbPathsPresent(String[] cdbPaths) {
+        for (String path : cdbPaths) {
+            if (path == null || !new File(path).isFile()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 资源指纹：主 cdb 列表与 scripts.zip 的大小+mtime；变化即需热重载引擎卡数据。 */
+    private static String resourcesFingerprint(String rootPath, String[] cdbPaths) {
+        StringBuilder sb = new StringBuilder(128);
+        for (String path : cdbPaths) {
+            File f = new File(path);
+            sb.append(path).append(':').append(f.isFile() ? f.length() : -1)
+                    .append(':').append(f.isFile() ? f.lastModified() : 0).append(';');
+        }
+        File zip = new File(rootPath, Constants.CORE_SCRIPTS_ZIP);
+        sb.append("scripts:").append(zip.isFile() ? zip.length() : -1)
+                .append(':').append(zip.isFile() ? zip.lastModified() : 0);
+        return sb.toString();
     }
 
     /**
      * 后台预热入口：在创建时刻立即起子线程执行 {@link #ensureEngineReady()}
-     * （解压脚本∥物化卡包两线程并行 → cdb 加载），把开局闸门需要等待的引导
-     * 全量提前到进程/界面创建时刻，用后续全部自然操作耗时（资源检查/导航/
-     * 建房/猜拳/选先后攻）覆盖引导总时长。瞬态失败（如首次安装时资源目录
-     * 尚未就绪）每 3 秒重试一次、至多 3 次；native 库缺失（非 ARM ABI/未打包）
-     * 属永久不可用不重试。ensureEngineReady 同步幂等，多个预热点（App 创建/
-     * YGOProActivity 创建/建主引导）并发时串行合并互不重复；失败不阻断任何
-     * 流程，开局闸门仍会作最后一次同步引导。
+     *（旧残留清理 → cdb 装载），把开局闸门需要等待的引导全量提前到进程/界面创建时刻，
+     * 用后续全部自然操作耗时（资源检查/导航/建房/猜拳/选先后攻）覆盖引导总时长。瞬态失败
+     *（如首次安装时资源目录尚未就绪）每 3 秒重试一次、至多 3 次；native 库缺失（非 ARM
+     * ABI/未打包）属永久不可用不重试。ensureEngineReady 同步幂等，多个预热点（App 创建/
+     * YGOProActivity 创建/建主引导）并发时串行合并互不重复；失败不阻断任何流程，开局闸门
+     * 仍会作最后一次同步引导。
      *
      * @param threadName 子线程名（logcat 定位用）
      * @param scene      崩溃诊断场景锚点（CrashHandler.hookThread）与日志标识
@@ -234,364 +230,221 @@ public final class NativeScriptBootstrap {
     }
 
     /**
-     * {@code scripts.zip} 自上次解压后已更新（比对 大小+lastModified 指纹标记）时，把
-     * zip 重新解压到资源根目录（zip 条目自带 script/ 、single/ 前缀，直接按相对路径
-     * 覆写落盘）。
+     * 把包内 {@code scripts.zip} 落到资源根目录：单条大档案一次流式拷贝，只在内容变化时重写
+     *（保留 mtime，native 侧的 size+mtime 自查因此不会反复重建索引），进度按字节上报。
+     * 主脚本与卡包脚本都由 native 直接读档案，不再解压成 {@code script/} 下的散文件。
      *
-     * <p>快速路径仅认指纹标记，<b>不</b>叠加 {@code script/init.lua} 存在条件：部分
-     * 资源包的 scripts.zip 本就不含 init.lua（实测 bootstrap 诊断行 exists=false，
-     * 引擎靠卡脚本+内置常量照样开局），旧判定 {@code initLua.exists() && 指纹一致}
-     * 在此类资源上永不命中，导致每次 ensureEngineReady（预热/建主引导/开局闸门
-     * 各一次）都串行重做全量解压（实测 15039ms/次），开局闸门等待被叠成多次重解
-     * 之和（实测 34875ms）。标记只在解压成功后写入，指纹一致即该 zip 已完整解出
-     * 过；{@code script/} 被手工清空时标记同灭，自愈重解。
-     *
-     * <p>必须比对指纹而不能只看解压过：JNI 侧 engineScriptReader 只认实体文件，而
-     * C++ gframe 的 ScriptReaderEx 优先读 zip 挂载——资源升级后若不解压更新，Java 引擎重跑
-     * 用的是陈旧脚本、行为与录制时代分叉，是旧格式回放中途 MSG_RETRY 的根因之一。
+     * @param update true 才做“内容变了就重写”；false 时目标存在就不动（正常启动靠它零开销）
      */
-    public static void ensureScriptsExtracted(String resourcePath) {
-        if (resourcePath == null || resourcePath.isEmpty()) {
-            return;
-        }
-        File root = new File(resourcePath);
-        File scriptDir = new File(root, Constants.CORE_SCRIPT_PATH);
-        File initLua = new File(scriptDir, "init.lua");
-        File zip = new File(root, Constants.CORE_SCRIPTS_ZIP);
-        if (!zip.exists()) {
-            if (!initLua.exists()) {
-                Log.w(TAG, "scripts.zip 不存在，无法解压脚本目录: " + zip.getAbsolutePath());
-            }
-            return;
-        }
-        File marker = new File(scriptDir, ".scripts_zip_mark");
-        // 快速路径仅认指纹标记（见方法注释）：旧版叠加的 initLua.exists() 条件在
-        // 不含 init.lua 的资源包上永不命中，每次引导都全量重解压 15s
-        if (zipFingerprint(zip).equals(readMarker(marker))) {
-            return;
-        }
-        ZipFile zf = null;
-        boolean ok = false;
-        try {
-            zf = new ZipFile(zip);
-            String rootCanonical = root.getCanonicalPath();
-            Enumeration<? extends ZipEntry> entries = zf.entries();
-            int count = 0;
-            while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
-                if (entry.isDirectory()) {
-                    continue;
-                }
-                File out = new File(root, entry.getName());
-                // 防 zip slip：目标必须落在资源根目录内
-                if (!out.getCanonicalPath().startsWith(rootCanonical + File.separator)) {
-                    Log.w(TAG, "跳过非法条目: " + entry.getName());
-                    continue;
-                }
-                File parent = out.getParentFile();
-                if (parent != null && !parent.exists() && !parent.mkdirs()) {
-                    continue;
-                }
-                try (InputStream is = zf.getInputStream(entry);
-                        OutputStream os = new FileOutputStream(out)) {
-                    byte[] buf = new byte[65536];
-                    int n;
-                    while ((n = is.read(buf)) > 0) {
-                        os.write(buf, 0, n);
-                    }
-                }
-                count++;
-            }
-            ok = true;
-            Log.i(TAG, "scripts.zip 解压完成，共 " + count + " 个文件 → " + rootCanonical);
-        } catch (IOException e) {
-            Log.e(TAG, "解压 scripts.zip 失败", e);
-        } finally {
-            if (zf != null) {
-                try {
-                    zf.close();
-                } catch (IOException e) {
-                    // ignore
-                }
-            }
-            if (ok) {
-                writeMarker(marker, zipFingerprint(zip));   // 指纹未落盘则下次仍重解，自愈
-            }
-        }
-    }
-
-    private static String zipFingerprint(File zip) {
-        return zip.length() + ":" + zip.lastModified();
+    public static void copyScriptsZipFromAssets(Context context, String assetZip, File resDir,
+            boolean update, IOUtils.CopyProgress progress) throws IOException {
+        IOUtils.copyFileFromAssetsIfChanged(context, assetZip, resDir, update, progress);
     }
 
     /**
-     * 扩展卡包物化引导（修复卡包卡片"只能盖放"的关键）：薄 JNI 引擎只认<b>实体文件</b>——
-     * 脚本走 engineScriptReader 的两级查找（{@code <root>/expansions/script/} 优先，
-     * 对齐 data_manager.cpp::ScriptReaderEx 的 prefer_expansion_script=1），卡片数据走
-     * nativeInit/reloadCards 的实体 cdb 路径列表。因此资源根目录（ygocore/）与
-     * expansions/ 下的每张卡包压缩包（.zip/.ypk）必须物化两样东西：
-     * <ul>
-     *   <li>包内 script/ 的 cXXX.lua（及顶层散 lua）→ {@code <root>/expansions/script/}，
-     *       否则卡包卡片效果脚本对引擎不可见（无法召唤/发动）；</li>
-     *   <li>包内全部 *.cdb → {@code <root>/expansions/cdb/<包名>_<序号>.cdb}，由
-     *       {@code AppsSettings#makeCdbList} 按"主库→包 cdb→散 cdb"
-     *       低→高优先级纳入引擎——此前包内 cdb 从未进引擎，卡片 type=0 被规则层
-     *       拒绝召唤/发动，是只解脚本仍修不好"只能盖放"的根因。</li>
-     * </ul>
-     *
-     * <p>包间优先级：按包文件名字典序<b>升序</b>迭代、后包直接覆写前包同名产物，
-     * 即"靠后的包优先"——与 makeZipList（倒序挂载档案）/ImageLoader（倒序查包）/
-     * CardManager（升序后读覆盖）统一为同一优先级体系：expansions 散文件 ＞
-     * 卡包 zip/ypk（后名优先）＞ 主资源 ＞ 主散目录。
-     *
-     * <p>逐包物化标记落在 {@code <expansions>/script/.mark_<包名>}：首行
-     * {@code packv2 + 大小:lastModified 指纹}（未变更整体跳过），其后为该包历次解出的
-     * 文件清单（s:脚本相对路径 / d:物化 cdb 文件名），包内容变更时按清单删除已
-     * 消失的旧产物、包被删除（或 {@code isReadExpansions} 关闭）时由
-     * {@link #pruneOrphanPacks} 据孤儿标记整体清理。旧版单行指纹标记若指纹一致
-     * 则脚本走快速路径（只记清单不重写盘，仅补物化 cdb），避免升级首轮全量重解
-     * 卡住开局；指纹不符或无标记才整体重解。
+     * 资源根目录（ygocore/）与 {@code expansions/} 下的全部卡包档案（.zip/.ypk，ypk 只是
+     * 换了扩展名的 zip），按包文件名升序返回；排除主资源档案 pics.zip / scripts.zip 与隐藏
+     * 临时档案，口径与 native 侧 {@code collectPacksIn} 一致。
      */
-    public static void ensureExpansionScriptsExtracted(String resourcePath) {
+    public static List<File> collectPacks(String resourcePath) {
+        List<File> out = new ArrayList<>();
         if (resourcePath == null || resourcePath.isEmpty()) {
-            return;
+            return out;
         }
-        File root = new File(resourcePath);
-        File expDir = new File(root, Constants.CORE_EXPANSIONS);
-        File scriptOut = new File(expDir, Constants.CORE_SCRIPT_PATH);
-        File cdbOut = new File(expDir, Constants.CORE_PACK_CDB_DIR);
-        List<File> archives = new ArrayList<>();
-        if (AppsSettings.get().isReadExpansions()) {
-            collectScriptArchives(root, archives);
-            collectScriptArchives(expDir, archives);
-            archives.sort((a, b) -> a.getName().toLowerCase(Locale.ROOT)
-                    .compareTo(b.getName().toLowerCase(Locale.ROOT)));
-        }
-        // 已删除的包 / 关闭读取扩展：先按标记清单清掉孤儿物化产物（空列表=全清）
-        int pruned = pruneOrphanPacks(archives, scriptOut, cdbOut);
-        int lua = 0;
-        int cdb = 0;
-        for (File pack : archives) {
-            int[] n = extractPackContents(pack, scriptOut, cdbOut);
-            lua += n[0];
-            cdb += n[1];
-        }
-        if (lua + cdb + pruned > 0) {
-            Log.i(TAG, "扩展卡包物化完成：" + lua + " 个 lua、" + cdb + " 个 cdb、"
-                    + pruned + " 项清理 → " + expDir.getAbsolutePath());
-        }
-    }
-
-    /** 收集目录下的卡包压缩包（.zip/.ypk，排除主脚本包 scripts.zip 与非普通文件）。 */
-    private static void collectScriptArchives(File dir, List<File> out) {
-        if (dir == null || !dir.isDirectory()) {
-            return;
-        }
-        File[] files = dir.listFiles(f -> f.isFile()
-                && !Constants.CORE_SCRIPTS_ZIP.equalsIgnoreCase(f.getName())
-                && (f.getName().toLowerCase(Locale.ROOT).endsWith(".zip")
-                || f.getName().toLowerCase(Locale.ROOT).endsWith(".ypk")));
-        if (files != null) {
-            for (File f : files) {
-                out.add(f);
+        for (File dir : new File[]{new File(resourcePath),
+                new File(resourcePath, Constants.CORE_EXPANSIONS)}) {
+            File[] files = dir.listFiles(f -> f.isFile() && isPackName(f.getName()));
+            if (files != null) {
+                out.addAll(Arrays.asList(files));
             }
         }
+        out.sort((a, b) -> a.getName().toLowerCase(Locale.ROOT)
+                .compareTo(b.getName().toLowerCase(Locale.ROOT)));
+        return out;
+    }
+
+    /** 是否卡包档案：zip/ypk，且不是主资源档案 pics.zip / scripts.zip，也不是隐藏临时档。 */
+    private static boolean isPackName(String name) {
+        if (name.startsWith(".")) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.equals(Constants.CORE_PICS_ZIP) || lower.equals(Constants.CORE_SCRIPTS_ZIP)) {
+            return false;
+        }
+        return lower.endsWith(".zip") || lower.endsWith(Constants.YPK_FILE_EX);
     }
 
     /**
-     * 物化单个卡包：.lua 条目（script/ 前缀或顶层散 lua，经 {@link #scriptRelOf} 归一）
-     * 解到 scriptOut，全部 *.cdb 条目解到 cdbOut（命名 {@code <包名>_<序号>.cdb}，保证
-     * 按名升序即按包字典序）。逐包 v2 标记命中指纹则整体跳过；旧版单行标记指纹
-     * 一致时脚本走快速路径（盘上已存在则不重写）；成功后按新清单覆写
-     * 标记，并删除旧清单中本次不再生成的产物（包内文件被移除时同步清理）。
-     *
-     * @return {@code {本次落盘 lua 数, 本次落盘 cdb 数}}，跳过/失败时为 {0, 0}
+     * 卡包档案指纹：包名 + 大小 + mtime 串接。任一个包被新增、删除或就地覆写都会变化，
+     * 用于触发 {@code reloadCards}（native 重扫档案）。
      */
-    private static int[] extractPackContents(File pack, File scriptOut, File cdbOut) {
-        int[] ret = new int[2];
-        if ((!scriptOut.exists() && !scriptOut.mkdirs())
-                || (!cdbOut.exists() && !cdbOut.mkdirs())) {
-            Log.w(TAG, "无法创建卡包物化目录: " + scriptOut.getAbsolutePath() + " / "
-                    + cdbOut.getAbsolutePath());
-            return ret;
+    private static String packsFingerprint(String resourcePath) {
+        StringBuilder sb = new StringBuilder(128);
+        for (File f : collectPacks(resourcePath)) {
+            sb.append(f.getName()).append(':').append(f.length())
+                    .append(':').append(f.lastModified()).append(';');
         }
-        File marker = new File(scriptOut, ".mark_" + pack.getName());
-        List<String> oldLines = readMarkerLines(marker);
-        String fpLine = PACK_MARK_PREFIX + zipFingerprint(pack);
-        if (!oldLines.isEmpty() && fpLine.equals(oldLines.get(0))) {
-            return ret;
+        return sb.toString();
+    }
+
+    /**
+     * 一次性回收旧版“卡包物化”落地产物（native 现已就地读档案，残留副本会以最高优先级
+     * 盖住档案里的新内容）：
+     * <ol>
+     *   <li>按 {@code <expansions>/script/.mark_<包名>} 清单删除当初解出的脚本与 cdb
+     *      ——包已被删除的孤儿标记也照清单回收；</li>
+     *   <li>再补一轮“内容逐字节等同包内同名条目”的清扫，覆盖更早期无清单标记的残留；
+     *      手工调试用的差异文件一律保留；</li>
+     *   <li>删除标记文件本身；{@code <expansions>/cdb/} 是物化专用目录（散 cdb 档落在
+     *      {@code expansions/} 根），整体清空。</li>
+     * </ol>
+     * 仅在进程内首次引导时执行，失败只记日志，不阻断任何流程。
+     */
+    private static synchronized void pruneLegacyMaterialized(String resourcePath) {
+        if (sLegacyPruned || resourcePath == null || resourcePath.isEmpty()) {
+            return;
         }
-        // v1 快速路径：旧版单行标记且指纹一致（脚本已按同包内容全量解出）时，
-        // lua 条目盘上存在则只记入清单不重写，仅补物化 cdb——消除升级后首轮
-        // 全量重解所有包脚本阻塞 startDuel 闸门、猜拳后发牌卡数秒的问题
-        boolean scriptsAssumedDone = oldLines.size() == 1
-                && !oldLines.get(0).startsWith(PACK_MARK_PREFIX)
-                && oldLines.get(0).equals(zipFingerprint(pack));
-        List<String> newLines = new ArrayList<>();
-        newLines.add(fpLine);
-        Set<String> seen = new HashSet<>();
-        int luaCount = 0;
-        int cdbCount = 0;
-        int cdbIdx = 0;
-        ZipFile zf = null;
-        boolean ok = false;
+        sLegacyPruned = true;
         try {
-            zf = new ZipFile(pack);
-            String scriptCanonical = scriptOut.getCanonicalPath();
-            String cdbCanonical = cdbOut.getCanonicalPath();
-            Enumeration<? extends ZipEntry> entries = zf.entries();
-            while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
-                if (entry.isDirectory()) {
-                    continue;
-                }
-                String name = entry.getName().replace('\\', '/');
-                String lower = name.toLowerCase(Locale.ROOT);
-                String line;
-                File out;
-                String canonicalBase;
-                if (lower.endsWith(".lua")) {
-                    // 条目布局归一：script/x.lua 与 ./script/x.lua 取尾段、顶层散 x.lua
-                    // 直取；其余目录（pics/ 等）嵌套路径一律不入扩展脚本目录
-                    String rel = scriptRelOf(name);
-                    if (rel == null || rel.isEmpty()) {
-                        continue;
-                    }
-                    line = "s:" + rel;
-                    if (scriptsAssumedDone) {
-                        File done = new File(scriptOut, rel);
-                        if (done.isFile()) {
-                            if (seen.add(line)) {
-                                newLines.add(line);
-                            }
-                            continue;
+            File expDir = new File(resourcePath, Constants.CORE_EXPANSIONS);
+            File scriptDir = new File(expDir, Constants.CORE_SCRIPT_PATH);
+            File cdbDir = new File(expDir, Constants.CORE_PACK_CDB_DIR);
+            File[] marks = scriptDir.listFiles(f -> f.isFile()
+                    && f.getName().startsWith(MARK_PREFIX));
+            int deleted = 0;
+            if (marks != null && marks.length > 0) {
+                for (File mark : marks) {
+                    // v2 标记带 s:/d: 清单；v1 标记只有单行指纹，无清单可依
+                    for (String line : readMarkerLines(mark)) {
+                        File f = resolveMarkerEntry(line, scriptDir, cdbDir);
+                        if (f != null && f.isFile() && f.delete()) {
+                            deleted++;
                         }
                     }
-                    out = new File(scriptOut, rel);
-                    canonicalBase = scriptCanonical;
-                } else if (lower.endsWith(".cdb")) {
-                    // 包内 cdb 全部物化：薄 JNI 引擎只认实体文件，卡片数据缺失
-                    // (type=0) 时规则层直接拒绝召唤/发动——这是"只能盖放"的根因
-                    line = "d:" + pack.getName() + "_" + (cdbIdx++) + ".cdb";
-                    out = new File(cdbOut, line.substring(2));
-                    canonicalBase = cdbCanonical;
-                } else {
-                    continue;
-                }
-                // 防 zip slip：目标必须落在对应物化目录内
-                if (!out.getCanonicalPath().startsWith(canonicalBase + File.separator)) {
-                    Log.w(TAG, "跳过非法条目: " + pack.getName() + "!" + name);
-                    continue;
-                }
-                File parent = out.getParentFile();
-                if (parent != null && !parent.exists() && !parent.mkdirs()) {
-                    continue;
-                }
-                try (InputStream is = zf.getInputStream(entry);
-                        OutputStream os = new FileOutputStream(out)) {
-                    byte[] buf = new byte[65536];
-                    int n;
-                    while ((n = is.read(buf)) > 0) {
-                        os.write(buf, 0, n);
+                    if (mark.delete()) {
+                        deleted++;
                     }
                 }
-                if (lower.endsWith(".lua")) {
-                    luaCount++;
-                } else {
-                    cdbCount++;
-                }
-                if (seen.add(line)) {
-                    newLines.add(line);
-                }
             }
-            ok = true;
-        } catch (IOException e) {
-            Log.e(TAG, "物化扩展卡包失败: " + pack.getAbsolutePath(), e);
-        } finally {
-            if (zf != null) {
-                try {
-                    zf.close();
-                } catch (IOException e) {
-                    // ignore
-                }
+            deleted += pruneMaterializedCopies(scriptDir);
+            deleted += pruneDirContents(cdbDir);
+            if (deleted > 0) {
+                Log.i(TAG, "已回收旧版卡包物化残留 " + deleted + " 项（现改为档案直读）");
             }
-            if (ok) {
-                // 包内被移除的旧产物：按上一版清单删除本次未再生成的条目
-                for (String line : oldLines) {
-                    if (line.startsWith(PACK_MARK_PREFIX) || newLines.contains(line)) {
-                        continue;
-                    }
-                    File stale = resolveMarkerEntry(line, scriptOut, cdbOut);
-                    if (stale != null && stale.isFile() && stale.delete()) {
-                        Log.i(TAG, "清理包内已移除产物: " + stale.getName());
-                    }
-                }
-                writeMarkerLines(marker, newLines);   // 标记未落盘则下次仍重解，自愈
-                ret[0] = luaCount;
-                ret[1] = cdbCount;
-            }
+        } catch (Throwable t) {
+            Log.w(TAG, "清理旧版卡包物化残留失败（不影响档案直读）", t);
         }
-        return ret;
     }
 
     /**
-     * 清理孤儿物化产物：物化标记 {@code .mark_<包名>} 对应的卡包已不在存活列表
-     * （包被删除 / {@code isReadExpansions} 关闭传入空列表）时，按其清单删除物化
-     * 出的脚本与 cdb，再删除标记本身。
-     *
-     * @return 删除的产物文件数
+     * 无清单可依的历史残留兜底：删除 {@code <expansions>/script/} 下与任一存活卡包内同名
+     * 条目<b>逐字节相同</b>的散 lua（相同⇒必然是当初物化出来的副本）；内容有差异的文件
+     * 视为手工调试覆写，保留。返回删除数。
      */
-    private static int pruneOrphanPacks(List<File> alive, File scriptOut, File cdbOut) {
-        File[] marks = scriptOut.listFiles(f -> f.isFile()
-                && f.getName().startsWith(".mark_")
-                && (f.getName().toLowerCase(Locale.ROOT).endsWith(".zip")
-                || f.getName().toLowerCase(Locale.ROOT).endsWith(".ypk")));
-        if (marks == null || marks.length == 0) {
+    private static int pruneMaterializedCopies(File scriptDir) {
+        File[] loose = scriptDir.listFiles(f -> f.isFile()
+                && !f.getName().startsWith(MARK_PREFIX)
+                && f.getName().toLowerCase(Locale.ROOT).endsWith(".lua"));
+        if (loose == null || loose.length == 0) {
             return 0;
         }
-        Set<String> aliveNames = new HashSet<>();
-        for (File f : alive) {
-            aliveNames.add(f.getName().toLowerCase(Locale.ROOT));
+        // 包名升序遍历、后包覆写前包，与物化当年的覆写次序一致
+        List<File> packs = collectPacks(scriptDir.getParentFile().getParent());
+        Map<String, long[]> baseline = new HashMap<>();
+        for (File pack : packs) {
+            ZipFile zf = null;
+            try {
+                zf = new ZipFile(pack);
+                Enumeration<? extends ZipEntry> entries = zf.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry e = entries.nextElement();
+                    if (e.isDirectory()) {
+                        continue;
+                    }
+                    String rel = scriptRelOf(e.getName());
+                    if (rel == null) {
+                        continue;
+                    }
+                    baseline.put(rel, new long[]{e.getSize(), e.getCrc()});
+                }
+            } catch (IOException ex) {
+                // 档案读不到就不据此判定，保守跳过该包
+            } finally {
+                if (zf != null) {
+                    try {
+                        zf.close();
+                    } catch (IOException ignored) {
+                        // ignore
+                    }
+                }
+            }
         }
         int deleted = 0;
-        for (File m : marks) {
-            String packName = m.getName().substring(".mark_".length());
-            if (aliveNames.contains(packName.toLowerCase(Locale.ROOT))) {
-                continue;
+        for (File f : loose) {
+            long[] ref = baseline.get(f.getName());
+            if (ref == null || f.length() != ref[0]) {
+                continue;   // 大小都不等，必然不是物化副本
             }
-            for (String line : readMarkerLines(m)) {
-                File f = resolveMarkerEntry(line, scriptOut, cdbOut);
-                if (f != null && f.isFile() && f.delete()) {
+            if (crc32Equals(f, ref[1])) {
+                if (f.delete()) {
                     deleted++;
                 }
             }
-            m.delete();
         }
         return deleted;
     }
 
-    /** 把清单行（s:脚本相对路径 / d:物化 cdb 文件名）解析为物化产物文件。 */
-    private static File resolveMarkerEntry(String line, File scriptOut, File cdbOut) {
-        if (line.startsWith("s:")) {
-            return new File(scriptOut, line.substring(2));
+    /** 逐个读文件算 CRC32 与档案条目比对（一次性迁移，代价可接受）。 */
+    private static boolean crc32Equals(File f, long expectedCrc) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        try (InputStream is = new FileInputStream(f)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                crc.update(buf, 0, n);
+            }
+        } catch (IOException e) {
+            return false;
         }
-        if (line.startsWith("d:")) {
-            return new File(cdbOut, line.substring(2));
+        return crc.getValue() == expectedCrc;
+    }
+
+    /** 清空目录内全部文件（不删目录本身，避免权限/并发问题）；返回删除数。 */
+    private static int pruneDirContents(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return 0;
         }
-        return null;
+        int n = 0;
+        for (File f : files) {
+            if (f.isDirectory()) {
+                n += pruneDirContents(f);
+                if (f.delete()) {
+                    n++;
+                }
+            } else if (f.delete()) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**
-     * lua 条目路径归一：大小写不敏感查找 "script/" 段取尾段（兼容 script/、./script/、
+     * 档案条目布局归一：大小写不敏感查找 "script/" 段取尾段（兼容 script/、./script/、
      * 任意前缀 script/ 布局），顶层散 lua（无目录段）直取；其余目录下的文件返回 null。
      */
     private static String scriptRelOf(String name) {
-        int idx = indexOfIgnoreCase(name, "script/");
-        if (idx >= 0) {
-            return name.substring(idx + "script/".length());
+        String path = name.replace('\\', '/');
+        while (path.startsWith("./")) {
+            path = path.substring(2);
         }
-        if (name.indexOf('/') < 0) {
-            return name;
+        int idx = indexOfIgnoreCase(path, "script/");
+        if (idx >= 0) {
+            return path.substring(idx + "script/".length());
+        }
+        if (path.indexOf('/') < 0 && path.toLowerCase(Locale.ROOT).endsWith(".lua")) {
+            return path;
         }
         return null;
     }
@@ -605,9 +458,15 @@ public final class NativeScriptBootstrap {
         return -1;
     }
 
-    private static String readMarker(File marker) {
-        List<String> lines = readMarkerLines(marker);
-        return lines.isEmpty() ? null : lines.get(0);
+    /** 把清单行（s:脚本相对路径 / d:物化 cdb 文件名）解析为物化产物文件。 */
+    private static File resolveMarkerEntry(String line, File scriptDir, File cdbDir) {
+        if (line.startsWith("s:")) {
+            return new File(scriptDir, line.substring(2));
+        }
+        if (line.startsWith("d:")) {
+            return new File(cdbDir, line.substring(2));
+        }
+        return null;
     }
 
     /** 读标记全部行（UTF-8，逐行 trim、跳过空行）；缺失/异常返回空列表。 */
@@ -631,26 +490,11 @@ public final class NativeScriptBootstrap {
         return out;
     }
 
-    private static void writeMarker(File marker, String fingerprint) {
-        List<String> lines = new ArrayList<>(1);
-        lines.add(fingerprint);
-        writeMarkerLines(marker, lines);
+    private static String sizeOrMissing(File f) {
+        return f.isFile() ? f.length() + "B" : "缺失";
     }
 
-    /** 覆写标记全部行（UTF-8，每行一文件）；父目录自动创建。 */
-    private static void writeMarkerLines(File marker, List<String> lines) {
-        File parent = marker.getParentFile();
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
-            return;
-        }
-        try (BufferedWriter w = new BufferedWriter(new OutputStreamWriter(
-                new FileOutputStream(marker), StandardCharsets.UTF_8))) {
-            for (String line : lines) {
-                w.write(line);
-                w.newLine();
-            }
-        } catch (IOException e) {
-            Log.w(TAG, "写入卡包物化标记失败", e);
-        }
+    private static int countOf(List<?> list) {
+        return list == null ? 0 : list.size();
     }
 }

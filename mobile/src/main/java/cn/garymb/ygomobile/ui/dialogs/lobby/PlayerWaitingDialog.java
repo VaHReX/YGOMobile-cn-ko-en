@@ -1,4 +1,5 @@
 package cn.garymb.ygomobile.ui.dialogs.lobby;
+import cn.garymb.ygomobile.game.engine.GameEngine;
 import cn.garymb.ygomobile.ui.dialogs.deck.DeckSelectorDialog;
 
 import android.content.Context;
@@ -40,7 +41,6 @@ import cn.garymb.ygomobile.render.field.TextureLoader;
 import cn.garymb.ygomobile.ui.dialogs.duel.YesOrNoDialog;
 import cn.garymb.ygomobile.utils.DeckUtil;
 import cn.garymb.ygomobile.utils.DraggablePopupHelper;
-import cn.garymb.ygomobile.utils.ImePopupAdjuster;
 import ocgcore.DataManager;
 import ocgcore.LimitManager;
 import ocgcore.StringManager;
@@ -182,8 +182,15 @@ public class PlayerWaitingDialog extends PlayerWaitingDialogMid {
         }
 
         String title = mStringManager.getSystemString(1725, "卡组验证失败");
+        // 同屏只保留一张卡组校验失败询问：先关旧窗再弹新窗，并登记到 deckErrorDialog，
+        // 由等待界面的退出/隐藏路径随弹窗一起关闭（不点“确定”直接点“退出”时不再残留）
+        dismissDeckErrorDialog();
         YesOrNoDialog dialog = new YesOrNoDialog(context);
-        dialog.setTitle(title).setMessage(errorDesc);
+        deckErrorDialog = dialog;
+        dialog.setTitle(title).setMessage(errorDesc)
+                .setOnDismissListener(() -> {
+                    if (deckErrorDialog == dialog) deckErrorDialog = null;
+                });
         dialog.show();
     }
     // === 静态入口：由 YGOProActivity 调用（直连/人机直接进入玩家等待界面） ===
@@ -209,6 +216,10 @@ public class PlayerWaitingDialog extends PlayerWaitingDialogMid {
     public static void showPlayerWaitingForBotHost(YGOProActivity activity) {
         activity.hideGameUI();
         final String playerName = Constants.PlayerName;
+        // 人机 TAG 为 4 席位（房主 + 队友 AI + 对手 AI×2），建主时已把 duelMode 预写入 engine.gameMode，
+        // 据此展开队友席位区（与 LAN 建主 showPlayerWaiting(nickname, tagMode) 同一路径）
+        final GameEngine engine = activity.getEngine();
+        final boolean tagMode = engine != null && engine.getGameMode() == YGOProtocol.MODE_TAG;
         View anchor = activity.getDialogContainer();
         anchor.post(() -> {
             if (activity.isFinishing() || activity.isDestroyed()) return;
@@ -217,6 +228,7 @@ public class PlayerWaitingDialog extends PlayerWaitingDialogMid {
             dialog.setOnDismissListener(() -> activity.getMainMenuDialog().restoreMainMenu());
             dialog.show(anchor);
             dialog.setPlayerName(0, playerName);
+            dialog.setTagPlayersVisible(tagMode);
 		});
     }
 
@@ -235,7 +247,7 @@ public class PlayerWaitingDialog extends PlayerWaitingDialogMid {
             dialog.setOnDismissListener(() -> activity.getMainMenuDialog().restoreMainMenu());
             dialog.show(anchor);
             dialog.setPlayerName(0, playerName);
-            final cn.garymb.ygomobile.game.engine.GameEngine engine = activity.getEngine();
+            final GameEngine engine = activity.getEngine();
             dialog.setSoloMode(engine != null && engine.soloMode);
         });
     }

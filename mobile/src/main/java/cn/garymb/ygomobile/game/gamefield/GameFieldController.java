@@ -145,6 +145,8 @@ public class GameFieldController extends GameFieldControllerBase {
         if (engine == null) return;
         if (engine.getField() != null) engine.getField().clearSelectionVisuals();
         engine.clearCommandFlags();
+        // 指示物取除会话随决斗结束一并收口（否则 isCounterSelecting 残留会吃掉后续场上点击）
+        select.finishCounterSelect();
         if (viewController != null) {
             viewController.clearHighlight();
             viewController.invalidate();
@@ -164,6 +166,66 @@ public class GameFieldController extends GameFieldControllerBase {
         select.abortSelectSessions();
     }
 
+    // === 卡片点击选中态的手势级取消（用户规格）===
+
+    /**
+     * 本次手势的「落在决斗场之外」候选：各非决斗场派发点（Activity 派发点与弹窗包装层）在
+     * ACTION_DOWN 登记；主线程单点读写，volatile 仅为防 JIT 提升旧读。
+     */
+    private static volatile boolean sOutsideCandidate;
+    /** 决斗场视图是否接住了本次手势的按下：其自身拾取已按命中卡片/空格决定选中态，外部不得再取消 */
+    private static volatile boolean sFieldGotDown;
+
+    /** 决斗场视图收到按下（控制器 OnTouchListener 的 ACTION_DOWN）：本手势归决斗场自己处理 */
+    public static void notifyFieldViewDown() {
+        sFieldGotDown = true;
+    }
+
+    /**
+     * 「卡片以外」的派发点（Activity.dispatchTouchEvent 与弹窗包装层 DragFrameLayout 都经此，
+     * 后者接管的下按事件不经 Activity 派发点，需双挂同一逻辑，与聊天输入框失焦同口径）登记
+     * 本次手势为取消候选；结算见 {@link #onOutsideGestureUp}。
+     */
+    public static void onOutsideGestureDown() {
+        sOutsideCandidate = true;
+        sFieldGotDown = false;
+    }
+
+    /**
+     * 手势落定（抬手/被取消）时结算：本次手势没进决斗场才真正取消卡片选中态并收起状态气泡。
+     * <p>之所以不在按下瞬间就取消：点卡片时 DOWN 会把选中态抹掉、抬手拾取又重新置起，手卡
+     * 抬升补间（{@code FieldCardRenderer.updateHandLift}，约 83ms 走完）会先降后升形成抖动；
+     * 而决斗场内的点击无论命中卡片还是空白，拾取已自行置位/清空选中态，外部再插手反而多余。
+     */
+    public static void onOutsideGestureUp(android.app.Activity act, int action) {
+        if (action != android.view.MotionEvent.ACTION_UP
+                && action != android.view.MotionEvent.ACTION_CANCEL) {
+            return;
+        }
+        boolean candidate = sOutsideCandidate;
+        boolean fieldGot = sFieldGotDown;
+        sOutsideCandidate = false;
+        sFieldGotDown = false;
+        if (!candidate || fieldGot) return;
+        // 经公开 getter 取控制器（fieldCtl 字段为包级私有，不在同包的本类无法直读）
+        GameFieldController ctl = act instanceof YGOProActivity
+                ? ((YGOProActivity) act).getFieldCtl() : null;
+        if (ctl != null) ctl.cancelCardClickSelection();
+    }
+
+    /**
+     * 取消卡片被选中状态（用户规格）：金色呼吸外框、手卡抬升（降回与其他手卡同高的常规位置）、
+     * 关联图标标记与卡片状态气泡一并收起。
+     */
+    public void cancelCardClickSelection() {
+        GameFieldView view = viewController != null ? viewController.getView() : null;
+        if (view != null) {
+            view.clearClickSelection();
+            viewController.invalidate();
+        }
+        hideFieldStatusTip();
+    }
+
     public void hide() {
         // 决斗/回放离场即释放场面：清空 GameField 数据，下次进入不再残留上一场卡片局面
         //（showMainMenu/returnToLanMain/quitReplay 等入口均只在非决斗中状态触达本方法）
@@ -178,6 +240,8 @@ public class GameFieldController extends GameFieldControllerBase {
         if (layoutChatMessages != null) layoutChatMessages.setVisibility(View.GONE);
         if (cmdMenuDialog != null) cmdMenuDialog.dismiss();
         if (select.isCardSelecting) select.endCardSelect();
+        // 离场同样结束指示物取除会话，不下发任何应答（会话随局面作废）
+        select.finishCounterSelect();
         // 离场：取消未触发的临时提示到时隐藏，收起覆盖层提示带（hideDuelHint 会 pullHintFromOverlay）
         if (hideHintRunnable != null) mainHandler.removeCallbacks(hideHintRunnable);
         hideDuelHint();
@@ -292,6 +356,19 @@ public class GameFieldController extends GameFieldControllerBase {
         select.beginUnselectCardSelect(items, selectableCount, min, max, finishable, cancelable);
     }
 
+    /**
+     * 开启场上指示物取除会话（MSG_SELECT_COUNTER）：对齐 gframe 桌面版——候选卡已在引擎解析
+     * 消息时标为可选（黄色虚线），玩家直接在场地上点卡逐个取除并组应答，不再弹选择窗
+     */
+    public void beginCounterSelect() {
+        select.beginCounterSelect();
+    }
+
+    /** 当前是否处于指示物取除询问的场上点卡会话（点击路由由 Activity 侧判断是否需要弹卡详） */
+    public boolean isCounterSelecting() {
+        return select.isCounterSelecting;
+    }
+
     public boolean finishCardSelect() {
         return select.finishCardSelect();
     }
@@ -330,7 +407,7 @@ public class GameFieldController extends GameFieldControllerBase {
     }
 
     /** 录像打开即全部可见：把聊天时间线全部 0xF1 帧体一次性预载入消息记录·聊天tab（主线程转发 FieldChatBoard） */
-    public void preloadReplayChat(java.util.List<byte[]> bodies) {
+    public void preloadReplayChat(List<byte[]> bodies) {
         if (chat != null) chat.preloadReplayChat(bodies);
     }
 
@@ -394,6 +471,21 @@ public class GameFieldController extends GameFieldControllerBase {
         Log.d(TAG, "Card click: p=" + player + " loc=" + location + " seq=" + sequence);
         if (engine == null) return;
         GameFieldView fieldView = viewController != null ? viewController.getView() : null;
+        // 指示物取除询问（MSG_SELECT_COUNTER）：点卡即取除一个指示物（对齐 event_handler.cpp
+        // L1536-1556 的场上直接点卡），不弹命令菜单也不走选卡会话；取满后自行组 uint16 数组应答。
+        // 卡详仍按询问期间点卡的既有规格即时刷新（同 C++ 桌面端悬停即出卡详）
+        if (select.isCounterSelecting) {
+            ClientCard counted = engine.getField().getCard(player, location, sequence);
+            select.handleCounterClick(player, location, sequence);
+            if (counted != null && counted.displayCode() > 0) {
+                if (fieldView != null) {
+                    fieldView.post(() -> activity.showCardInfoPanel(counted));
+                } else {
+                    activity.showCardInfoPanel(counted);
+                }
+            }
+            return;
+        }
         if (select.isCardSelecting) {
             // 先于会话应答捕获被点击卡与点击瞬间的「可选」状态：只选 1 张的会话（超量叠放、
             // 单对象选取等）本次点击即自动确认，endCardSelect 的 clearSelect 会把候选的

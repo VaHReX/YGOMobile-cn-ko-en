@@ -22,6 +22,7 @@ import android.widget.LinearLayout;
 import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -36,6 +37,7 @@ import java.util.Map;
 import java.util.Set;
 
 import cn.garymb.ygomobile.AppsSettings;
+import cn.garymb.ygomobile.audio.SoundManager;
 import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.YGOProActivity;
 import cn.garymb.ygomobile.game.engine.GameEngine;
@@ -179,20 +181,30 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
         return this;
     }
 
-    /** 列表选项内容容器（dialog_game_select 的 layout_options），由 setOptionsContentView() 初始化 */
+    /** 把本弹窗的窗口层级提到所有弹窗之上（知会窗用，保证「确定」不被其他弹窗压住而点不到） */
+    public YesOrNoDialog setTopmostLayer(boolean topmost) {
+        this.topmostLayer = topmost;
+        return this;
+    }
+
+    /** 列表选项内容容器（{@link #setOptionsContentView()} 现造的可滚动纵向容器） */
     protected LinearLayout optionsContainer;
 
     /**
-     * 采用“列表选择”内容视图（复用 dialog_game_select 布局）：隐藏其标题/提示/底部按钮，
-     * 仅保留 layout_options 选项容器；随后通过 {@link #addOption} 逐项添加按钮。
+     * 采用“列表选项”内容：只造一条可滚动的选项容器（不整块借用 dialog_game_select——那块自带
+     * 面板底衬与 16dp 内边距，嵌进本弹窗的 sdialogl 框里会双层套框，其 minWidth 280dp 也与本
+     * 弹窗内容宽冲突），标题与按钮仍由本弹窗承担；随后经 {@link #addOption} 逐项添加按钮。
      */
     public YesOrNoDialog setOptionsContentView() {
-        View content = LayoutInflater.from(DialogScale.wrap(context)).inflate(R.layout.dialog_game_select, null);
-        content.findViewById(R.id.tv_select_title).setVisibility(View.GONE);
-        content.findViewById(R.id.tv_select_hint).setVisibility(View.GONE);
-        content.findViewById(R.id.layout_select_buttons).setVisibility(View.GONE);
-        optionsContainer = content.findViewById(R.id.layout_options);
-        return setContentView(content);
+        Context themed = DialogScale.wrap(context);
+        ScrollView scroll = new ScrollView(themed);
+        scroll.setVerticalScrollBarEnabled(false);
+        optionsContainer = new LinearLayout(themed);
+        optionsContainer.setOrientation(LinearLayout.VERTICAL);
+        optionsContainer.setLayoutParams(new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+        scroll.addView(optionsContainer);
+        return setContentView(scroll);
     }
 
     /**
@@ -244,9 +256,12 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
         Button btnPositive = root.findViewById(R.id.btn_yes_no_positive);
         Button btnNegative = root.findViewById(R.id.btn_yes_no_negative);
 
-        // 卡片图片（dialog_yes_or_no 新结构：iv_yes_no_card_image 直接作为消息行左侧子视图）
+        // 卡图堆栈（dialog_yes_or_no 结构：ll_yes_no_card_stack 直接作为消息行左侧子视图，
+        // 首张 iv_yes_no_card_image 常驻、其余按 message 中的卡名动态叠压追加）
         LinearLayout contentRow = (LinearLayout) scrollView.getParent();
-        ImageView cardImageView = root.findViewById(R.id.iv_yes_no_card_image);
+        // 内容纵列（消息行与连锁卡图行的共同父层）：自定义内容也追加到这里
+        LinearLayout contentBlock = (LinearLayout) contentRow.getParent();
+        LinearLayout cardStack = root.findViewById(R.id.ll_yes_no_card_stack);
 
         // 连锁卡片横向列表（ll_chain_card_list 位于 hsv_yes_no_chain_cards 内，同行消息区右侧）
         HorizontalScrollView chainCardsScrollView = root.findViewById(R.id.hsv_yes_no_chain_cards);
@@ -262,20 +277,11 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
 
         // ── Content area ─────────────────────────────────────────
         boolean hasChainCards = chainCards != null && !chainCards.isEmpty();
-        // 攻击宣言/直接攻击等连锁询问：cardCode 可能为 0（无 MSG_CHAINING），
-        // 回退按消息文本首个 [XXX] 卡名解析攻击者卡码，使左侧仍显示其卡图
-        int effectiveCardCode = cardCode > 0 ? cardCode : firstBracketedCardCode(
-                message != null ? message.toString() : null);
-        boolean showCardImage = effectiveCardCode > 0 && cardNameInMessage(effectiveCardCode);
-        if (showCardImage) {
-            cardImageView.setVisibility(View.VISIBLE);
-            new ImageLoader().bindImage(cardImageView, effectiveCardCode, ImageLoader.Type.small);
-            bindCardDetailClick(cardImageView, effectiveCardCode);
-        } else {
-            cardImageView.setVisibility(View.GONE);
-            bindCardDetailClick(cardImageView, 0);
-        }
-                
+        // 左侧卡图（用户规格）：message 中出现多个卡名时全部出图，横向排列且每张压住前一张
+        // 的 1/3，之后才显示消息文本；无卡名时整个堆栈隐藏。攻击宣言/直接攻击等时点没有
+        // MSG_CHAINING（cardCode=0），堆栈内按文本里的 [XXX] 卡名逐个回退解析，故左侧仍出图。
+        buildMentionedCardStack(cardStack);
+
         tvMessage.setText(colorizeBracketedCardNames(message));
         if (messageBgColor != 0) {
             tvMessage.setBackgroundColor(messageBgColor);
@@ -309,7 +315,6 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
                 chainCardList.addView(cardItemView);
             }
             // 连锁列表独立成一行：放在内容区（消息行所在纵向 LinearLayout）下方、按钮区上方全宽展示
-            LinearLayout contentBlock = (LinearLayout) contentRow.getParent();
             if (chainCardsScrollView.getParent() == contentRow) {
                 contentRow.removeView(chainCardsScrollView);
             }
@@ -322,6 +327,17 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
             }
         } else {
             chainCardsScrollView.setVisibility(View.GONE);
+        }
+
+        // ── 自定义内容区（选项列表 / 多选卡片列表等）───────────────────────
+        // setContentView 注入的视图必须真挂进布局：早前只拿 customContentView 判断要不要按钮，
+        // 却从未 addView，于是列表类弹窗只剩标题与按钮、内容整块看不见（用户反馈的“虚影”）。
+        // 挂在消息行与连锁卡图行之后、按钮区之前（同一内容纵列内逐段往下排）。
+        if (customContentView != null && customContentView.getParent() == null) {
+            LinearLayout.LayoutParams contentLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            contentLp.topMargin = (int) (6 * density);
+            contentBlock.addView(customContentView, contentLp);
         }
 
         // ── Button area ──────────────────────────────────────────
@@ -390,8 +406,16 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
             return false;
         });
         popupWindow.setAnimationStyle(R.style.PopupCenterAnimation);
+        // 层级置顶：子窗口的层按类型偏移量比较（ATTACHED_DIALOG 高于默认的 PANEL），不受显示先后影响，
+        // 故知会窗恒在其他弹窗之上（修复加入房间失败等知会窗被大厅/局域网弹窗遮挡无法关闭）
+        if (topmostLayer) {
+            popupWindow.setWindowLayoutType(WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG);
+        }
         popupWindow.setOnDismissListener(() -> {
             sShowingDialogs.remove(this);
+            // EFFECT_YN 询问窗关闭（应答/被新询问接力关闭/决斗结束）：摸掉本窗置入的
+            // 卡角呼吸绿点引用，绿点与询问同存续
+            clearAskedEffectCard();
             // 对话框隐藏后恢复决斗场阶段按钮
             if (context instanceof YGOProActivity) {
                 ((YGOProActivity) context).notifyGameDialogHidden(this);
@@ -445,12 +469,12 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
                 // 对齐 C++ SoundManager::PlayDialogSound：询问/确认类（wQuery/wSurrender/
                 // wOptions/wAN* 等）弹 question 音效，纯消息类（wMessage）弹 info 音效
                 if (context instanceof YGOProActivity) {
-                    cn.garymb.ygomobile.audio.SoundManager sm =
+                    SoundManager sm =
                             ((YGOProActivity) context).getSoundManager();
                     if (sm != null) {
                         sm.playSoundEffect(type == TYPE_YES_NO
-                                ? cn.garymb.ygomobile.audio.SoundManager.SFX.QUESTION
-                                : cn.garymb.ygomobile.audio.SoundManager.SFX.INFO);
+                                ? SoundManager.SFX.QUESTION
+                                : SoundManager.SFX.INFO);
                     }
                 }
                 if (popupWindow.isShowing()) {
@@ -494,20 +518,21 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
                         ? R.color.holo_blue_bright : R.color.holo_orange_bright));
     }
     /** 是/否确认弹窗（MSG_SELECT_YESNO / MSG_SELECT_EFFECTYN）：是=1 否=0 */
-    public static void showYesNoQuery(YGOProActivity activity, String message) {
-        showYesNoQuery(activity, message, 0, null, -1);
+    public static YesOrNoDialog showYesNoQuery(YGOProActivity activity, String message) {
+        return showYesNoQuery(activity, message, 0, null, -1);
     }
 
     /** 是/否确认弹窗（可带卡名着色）：cardCode>0 且 cardName 非空时按卡片类型着色 */
-    public static void showYesNoQuery(YGOProActivity activity, String message, int cardCode, String cardName) {
-        showYesNoQuery(activity, message, cardCode, cardName, -1);
+    public static YesOrNoDialog showYesNoQuery(YGOProActivity activity, String message, int cardCode, String cardName) {
+        return showYesNoQuery(activity, message, cardCode, cardName, -1);
     }
 
     /**
      * 是/否确认弹窗：selectingPlayer 为协议 selecting_player（被询问 seat，0/1），
      * 仅纯单人模式据此加「询问-玩家名」标题提示；传 -1 表示不加。
+     * 返回建好的窗实例供 EFFECT_YN 工厂追加被询问卡登记（setAskedEffectCard）。
      */
-    public static void showYesNoQuery(YGOProActivity activity, String message, int cardCode,
+    public static YesOrNoDialog showYesNoQuery(YGOProActivity activity, String message, int cardCode,
                                       String cardName, int selectingPlayer) {
         // 单窗询问：弹新询问窗前关闭仍在显示的全部旧询问窗（含上一条连锁询问的残留窗），
         // 保证同屏至多一个询问，纯单人模式按协议顺序先当前回合玩家、后对方逐个询问
@@ -532,6 +557,7 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
         panel(activity).hideCancelOrFinishButton();
         applySoloAskHint(activity, dialog, selectingPlayer);
         dialog.show();
+        return dialog;
     }
 
     /**
@@ -568,7 +594,7 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
         }
         int selectingPlayer = data.get() & 0xFF; // selecting_player
         int code = data.getInt();
-        data.get();                        // c（控制者）
+        int controller = data.get() & 0xFF;      // c（发动卡控制者，协议 seat）
         int location = data.get() & 0xFF;  // l
         int sequence = data.get() & 0xFF;  // s
         data.get();                        // flag
@@ -596,7 +622,10 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
             String raw = dm.getDesc(desc, "");
             message = raw.isEmpty() ? "是否发动「" + cardName + "」的效果？" : raw;
         }
-        showYesNoQuery(activity, message, code, cardName, selectingPlayer);
+        showYesNoQuery(activity, message, code, cardName, selectingPlayer)
+                // 用户规格：诱发效果被询问是否发动时，被询问的卡角显示呼吸绿点，
+                // 点该卡或点本窗卡图都出对应序号段落发光（登记段落文档序+留存归属坐标）
+                .setAskedEffectCard(controller, code, location, sequence, desc);
     }
 
     /** SIDE 换卡组：列出卡组目录下的 .ydk 供选择，选中后交 ShowDialogUtil 载入并发送 */
@@ -632,7 +661,8 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
     /**
      * 连锁是/否询问窗（对齐 gframe wQuery + stQMessage）：不再罗列可发动卡片按钮，改由场上高亮卡片承载点击发动。
      * 「是」进入场上点击模式，「否」放弃连锁；chainQueryDialog 保留引用以支持「取消操作」重新弹出。
-     * cardCode>0 且询问文本（event_string）含该卡名时，消息行左侧 iv_yes_no_card_image 显示发动中的卡片图案；
+     * cardCode>0 或询问文本（event_string）含卡名时，消息行左侧 ll_yes_no_card_stack 按卡名
+     * 出现顺序叠压显示全部卡图（每张压住前一张的 1/3）；
      * chainItems 非空时右侧 ll_chain_card_list 横向展示可以连锁的卡片。
      */
     public static void showChainQuery(YGOProActivity activity, String queryText,
@@ -735,38 +765,51 @@ public class YesOrNoDialog extends YesOrNoDialogBase {
         dialog.show();
     }
 
-    /** MSG_SELECT_COUNTER：列出 1..counterCount 供选择取除总数（playerop.cpp L608-637） */
-    public static void showCounterSelectDialog(YGOProActivity activity, ByteBuffer data) {
-        if (data == null || data.remaining() < 6) {
-            activity.sendResponseInt(0);
+    // MSG_SELECT_COUNTER（取除指示物）不再经弹窗应答：对齐 gframe 桌面版由玩家在场上直接
+    // 点卡逐个取除（候选登记见 MessageUIHandler.applyCounterCandidates，点卡与应答见
+    // FieldSelectManager.handleCounterClick），入口由 ShowDialogUtil.showCounterSelectDialog 转给场上会话。
+
+    /** 当前在显的知会窗（对位 C++ wMessage）：多条知会（MSG_SHOW_HINT、自定义消息、
+     *  连接与卡组错误）逐个弹会众叠并各自响一声 info，故新知会替换旧窗，同屏至多一个 */
+    private static YesOrNoDialog currentNotice;
+
+    /**
+     * 知会弹窗（对齐 C++ {@code Game::addMessageBox} 与 HINT_MESSAGE 的 wMessage：正文 +
+     * 单个「确定」键，键文取 sysString 1211；弹出时由 {@link #show(View)} 既有分支经
+     * PlayDialogSound 语义响 INFO 音效）。点「确定」即关闭（btnPositive 自带 dismiss）。
+     * <p>
+     * 决斗 UI 未显示时（主菜单连不上服务器、启动 AI 失败等）退化为 Toast：wMessage 的
+     * 落点是决斗场区域，菜单态下那块区域未布局、弹窗会看不见，但 INFO 音效仍按 C++ 响。
+     */
+    public static void showMessageDialog(YGOProActivity activity, String text) {
+        if (activity == null || text == null || text.isEmpty()) return;
+        dismissNoticeDialog();
+        View region = gameDialogRegion(activity);
+        if (region == null || !region.isShown()) {
+            Toast.makeText(activity, text, Toast.LENGTH_LONG).show();
+            SoundManager sm = activity.getSoundManager();
+            if (sm != null) sm.playSoundEffect(SoundManager.SFX.INFO);
             return;
         }
-        data.get();                                    // selecting_player
-        int counterType = data.getShort() & 0xFFFF;
-        int counterCount = data.getShort() & 0xFFFF;
-        int cardCount = data.get() & 0xFF;
-        final List<Integer> cardCounters = new ArrayList<>();
-        for (int i = 0; i < cardCount && data.remaining() >= 9; i++) {
-            data.getInt();
-            data.get();
-            data.get();
-            data.get();
-            cardCounters.add(data.getShort() & 0xFFFF);
-        }
-        if (cardCounters.isEmpty() || counterCount <= 0) {
-            activity.sendResponseInt(0);
-            return;
-        }
-        DataManager dm = DataManager.get();
-        String title = dm.formatSystemString(204, "请取除%d个 [%s]", counterCount, dm.getCounterName(counterType));
         YesOrNoDialog dialog = new YesOrNoDialog(activity);
-        dialog.setTitle(title).setOptionsContentView();
-        for (int i = 1; i <= counterCount; i++) {
-            final int val = i;
-            dialog.addOption(String.valueOf(i), YGOUtil.c(R.color.option_bg_blue), () -> sendCounterResponse(activity, cardCounters, val));
-        }
-        dialog.setCancelable(false).setCenterInView(gameDialogRegion(activity));
+        currentNotice = dialog;
+        dialog.setMessage(text)
+                .setType(TYPE_MESSAGE)
+                .setPositiveButtonText(sysText(1211, "确定"))
+                .setCancelable(false)
+                .setCenterInView(region)
+                .setTopmostLayer(true)
+                .setOnDismissListener(() -> {
+                    if (currentNotice == dialog) currentNotice = null;
+                });
         dialog.show();
+    }
+
+    /** 退出对战 / 决斗结束 / 撤回瞬间收口知会窗（由 ShowDialogUtil.dismissOpenGameDialogs 调用） */
+    public static void dismissNoticeDialog() {
+        YesOrNoDialog dialog = currentNotice;
+        currentNotice = null;
+        if (dialog != null) dialog.dismiss();
     }
 
 }

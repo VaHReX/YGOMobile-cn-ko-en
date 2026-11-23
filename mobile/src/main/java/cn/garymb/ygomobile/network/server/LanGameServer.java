@@ -2,6 +2,7 @@ package cn.garymb.ygomobile.network.server;
 
 import android.util.Log;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -13,6 +14,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 
 import cn.garymb.ygomobile.Constants;
@@ -31,8 +33,9 @@ import cn.garymb.ygomobile.utils.CrashHandler;
  *       以 {@code room} 的房名/HostInfo 组 72 字节 {@code HostPacket} 单播回请求者 IP:7921，
  *       与客户端 {@code LanDiscoveryManager.parseHostPacket} 严格对偶；</li>
  *   <li>引擎：{@link #start} 绑定监听并拉起 accept 线程<b>之后</b>在后台引导
- *       {@link OcgDuelEngine}（解压脚本 + 读 cards.cdb）：握手/加入/大厅聊天不依赖引擎，
- *       老设备解压慢不再阻塞 TCP 监听导致 WindBot 探测超时；开局时
+ *       {@link OcgDuelEngine}（直读卡包 zip/ypk 档案 + 读 cards.cdb，全程不解压）：
+ *       握手/加入/大厅聊天不依赖引擎，
+ *       老设备扫档案慢不再阻塞 TCP 监听导致 WindBot 探测超时；开局时
  *       {@link ServerDuel#startDuel} 经幂等引导闸门等待引擎就绪。</li>
  * </ul>
  *
@@ -73,6 +76,26 @@ public final class LanGameServer implements YGOProtocol {
 
     /** 后台引擎引导已成功（失败时保持 false，开局闸门会重试引导）。 */
     private volatile boolean engineBootDone;
+
+    /** 聊天 “/ai [卡组名]” 命令的拉起实现（由 ConnectionManager 注入）：主机端在本机拉起人机入房，卡组名为空时随机。 */
+    public interface ChatBotLauncher {
+        void onChatAiCommand(String deckName, int lflist);
+    }
+
+    private volatile ChatBotLauncher chatBotLauncher;
+
+    /** 注入聊天 “/ai” 命令拉人机的实现（本地建主时由 ConnectionManager 设置）。 */
+    public void setChatBotLauncher(ChatBotLauncher launcher) {
+        this.chatBotLauncher = launcher;
+    }
+
+    /** 房间内收到 “/ai” 命令：转给注入的拉起实现（携带房间禁卡表哈希）；未注入（非本机建主）时忽略。 */
+    void requestChatBot(String deckName, int lflist) {
+        ChatBotLauncher launcher = chatBotLauncher;
+        if (launcher != null) {
+            launcher.onChatAiCommand(deckName, lflist);
+        }
+    }
 
     /**
      * 启动服务器：打开 TCP/UDP 监听、拉起后台线程，随后在后台引导引擎。
@@ -122,11 +145,11 @@ public final class LanGameServer implements YGOProtocol {
             }
             Log.i(TAG, "局域网主机已启动，端口 " + serverPort);
             // 引擎引导改在监听就绪后进行：建房/加入/大厅聊天（含 WindBot 连入）全程不依赖
-            // 引擎，只有真正开局才需要；首次解压 scripts.zip/卡包脚本与加载 cdb 在老设备上
+            // 引擎，只有真正开局才需要；首次扫档案建索引与加载 cdb 在老设备上
             // 可达数秒，若像在监听前同步执行，TCP 端口迟迟不 bind，握手会被 WindBot 探测
             // 超时赶在前面。引导失败不在此反馈：{@link ServerDuel#startDuel} 开局闸门会
             // 重试并兜底终止开局；与预热/其它建主路径并发时 ensureEngineReady 同步幂等，
-            // 不会重复解压/重复 init。
+            // 不会重复清理/重复 init。
             if (!engineBootDone) {
                 Thread boot = new Thread(this::bootstrapEngineInBackground, "LanEngineBoot");
                 boot.setDaemon(true);
@@ -137,9 +160,9 @@ public final class LanGameServer implements YGOProtocol {
         }
     }
 
-    /** 引导引擎：确保 script/ 已解压并加载卡片数据库。
+    /** 引导引擎：确保脚本与卡数据可读（全部档案直读：卡包 zip/ypk + scripts.zip + cards.cdb）。
      * 经 {@link NativeScriptBootstrap#ensureEngineReady()} 幂等引导：相同资源根目录仅首次
-     * 真正 {@code OcgDuelEngine.init}（解压脚本+加载 cdb，耗时数秒），后续建主直接命中缓存，
+     * 真正 {@code OcgDuelEngine.init}（扫档案建索引+加载 cdb），后续建主直接命中缓存，
      * 消除“每次建主都重载引擎”的4~5秒延迟（对齐 C++ gframe 启动时一次性加载、多次建主复用）。
      * 监听已开启后才在后台执行，开局需求由 {@link ServerDuel#startDuel} 的同步闸门等待。 */
     private boolean bootstrapEngine() {
@@ -284,19 +307,31 @@ public final class LanGameServer implements YGOProtocol {
     // 生命周期 / 执行器投递
     // ==================================================================
 
-    /** 投递一个任务到单线程房间执行器；执行器已停止时静默丢弃。 */
+    /**
+     * 投递一个任务到单线程房间执行器；执行器已停止时静默丢弃。
+     * <p>{@code isShutdown} 与 {@code execute} 之间存在竞态：{@code stopServer}/{@code cleanup} 在
+     * 另一线程（UI 线程退出对战、断线重连）shutdown 执行器，收包线程刚过完检查就撞上线程池的
+     * AbortPolicy 抛出 {@link RejectedExecutionException}。该异常会顺着 {@code sink.onDisconnect}
+     * 穿透 ServerConnection 的 readLoop finally，使 closeQuietly 不执行（socket 泄漏）并弄死读线程，
+     * 故检查之后仍必须兜住。
+     */
     public void post(Runnable task) {
         ExecutorService exec = roomExecutor;
         if (exec == null || exec.isShutdown()) {
             return;
         }
-        exec.execute(() -> {
-            try {
-                task.run();
-            } catch (Throwable t) {
-                Log.e(TAG, "房间任务异常", t);
-            }
-        });
+        try {
+            exec.execute(() -> {
+                try {
+                    task.run();
+                } catch (Throwable t) {
+                    Log.e(TAG, "房间任务异常", t);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // 主机正在停止：房间与连接都已在销毁，本任务已无对象可投递（与上面的静默丢弃同口径）
+            Log.d(TAG, "房间任务被拒（主机正在停止），丢弃: " + e.getMessage());
+        }
     }
 
     /** 停止监听：不再接受新连接与新发现请求（对局中调用），已连接的房间继续运行。 */
@@ -355,10 +390,21 @@ public final class LanGameServer implements YGOProtocol {
         return room;
     }
 
-    /** 房间第二名玩家（人机模式下的 AI）是否已入座，供启动端做加入超时判定。 */
-    public boolean isSecondPlayerJoined() {
+    /**
+     * 人机模式所需 AI 席位是否已全部入座：房主占 seats[0]，AI 依序占 seats[1..botCount]，
+     * 单局/比赛 botCount=1，TAG botCount=3。供启动端做加入超时判定。
+     */
+    public boolean isBotSeatsJoined(int botCount) {
         GameRoom r = room;
-        return r != null && r.players[1] != null;
+        if (r == null) {
+            return false;
+        }
+        for (int seat = 1; seat <= botCount; seat++) {
+            if (seat >= r.players.length || r.players[seat] == null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** 房间已建好且房主已入座（环回客户端 CTOS_CREATE_GAME 处理完成），
@@ -366,6 +412,26 @@ public final class LanGameServer implements YGOProtocol {
     public boolean isRoomReady() {
         GameRoom r = room;
         return r != null && r.hostPlayer != null;
+    }
+
+    /**
+     * 标记“本房间稍后入座的对席是本机拉起的人机”（由 {@code ConnectionManager} 在广播启动 WindBot 前调用）：
+     * 它不实现 {@code MSG_RELOAD_FIELD}，服务端将改用整局重放为它重同步局面（见 {@code GameRoomBase#peerNeedsReplayResync}）。
+     * <p>投递到房间执行器，与 JOIN_GAME/开局串行，不会与入席判定争抢；本标记不依赖对席何时连入，
+     * 取用方在撤回时按席位当场解析。
+     */
+    public void markPeerNeedsReplayResync() {
+        post(() -> {
+            GameRoom r = room;
+            if (r == null) {
+                Log.w(TAG, "人机房间标记失败：房间尚未建好（撤回将退回 reload 重同步）");
+                return;
+            }
+            if (!r.peerNeedsReplayResync) {
+                r.peerNeedsReplayResync = true;
+                Log.i(TAG, "人机房间：对席撤回后改用整局重放重同步（WindBot 不接受 MSG_RELOAD_FIELD）");
+            }
+        });
     }
 
     private void cleanup() {
@@ -381,7 +447,7 @@ public final class LanGameServer implements YGOProtocol {
         listening = false;
     }
 
-    private static void closeQuietly(java.io.Closeable c) {
+    private static void closeQuietly(Closeable c) {
         if (c != null) {
             try {
                 c.close();

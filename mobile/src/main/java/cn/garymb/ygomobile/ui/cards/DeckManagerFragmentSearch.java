@@ -1,7 +1,6 @@
 package cn.garymb.ygomobile.ui.cards;
 
 import static android.content.Context.CLIPBOARD_SERVICE;
-import static cn.garymb.ygomobile.Constants.ORI_DECK;
 import static cn.garymb.ygomobile.Constants.YDK_FILE_EX;
 import static cn.garymb.ygomobile.core.IrrlichtBridge.ACTION_SHARE_FILE;
 
@@ -81,6 +80,7 @@ import cn.garymb.ygomobile.base.BaseFragemnt;
 import cn.garymb.ygomobile.bean.Deck;
 import cn.garymb.ygomobile.bean.DeckInfo;
 import cn.garymb.ygomobile.bean.DeckType;
+import cn.garymb.ygomobile.bean.events.CardFavoriteChangedEvent;
 import cn.garymb.ygomobile.bean.events.CardInfoEvent;
 import cn.garymb.ygomobile.bean.events.DeckDeleteEvent;
 import cn.garymb.ygomobile.bean.events.DeckFile;
@@ -158,7 +158,8 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
     protected void onCardLongClick(View view, Card cardInfo, int pos) {
         // 长按搜索结果列表中的卡片：收起左侧结果抽屉，在手指位置生成可拖动的浮动卡片，
         // 松手后根据停留位置插入主卡组/额外卡组/副卡组（校验与提示在handleDeckCardDropped中处理）
-        if (cardInfo == null || isPackMode || mDeckDragHelper == null || mDeckDragHelper.isDragging()) {
+        // 只读分类（人机卡组/卡包展示）不起拖，与决斗内编辑器把搜索结果卡片拖拽置为只读同口径
+        if (cardInfo == null || !isDeckEditable() || mDeckDragHelper == null || mDeckDragHelper.isDragging()) {
             return;
         }
         int[] loc = new int[2];
@@ -184,17 +185,33 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
         }
     }
 
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onCardFavoriteChanged(CardFavoriteChangedEvent event) {
+        // 收藏夹增删后（任何入口）：收藏列表显示中则重新拉取并按当前排序规则重排、重建分段
+        if (mCardSearcher != null && mCardSearcher.isShowFavorite()) {
+            mCardSearcher.showFavorites(false);
+        }
+    }
+
     @Override
     public void onSearchResult(List<Card> cardInfos, boolean isHide) {
-        tv_result_count.setText(String.valueOf(cardInfos.size()));
+        // 关键词搜索与收藏列表直接交搜索线程的原样顺序（含完全命中卡名置顶），
+        // 由 fillSearchResultList 按本页档位决定要不要重排（第 0 档保持原样）
+        showSearchResultCards(cardInfos, isHide);
+    }
+
+    /**
+     * 结果填入 + 顶部计数 + 抽屉展示。卡包展示的原始顺序就是卡包顺序本身，
+     * 也不会在第 0 档被套上其它规则
+     */
+    private void showSearchResultCards(List<Card> cardInfos, boolean isHide) {
+        // 关键词以搜索面板当前输入为准：重置后为空就要把上一次的关键词清掉，
+        // 否则重排时仍会按旧关键词把完全同名的卡置顶（用户报的残留问题）
         String keyword = mCardSearcher.getCurrentKeyword();
-        if (keyword != null && !keyword.isEmpty()) {
-            currentCardSearchMessage = keyword;
-        }
+        currentCardSearchMessage = keyword == null ? "" : keyword;
 
         mCardListAdapter.setSearchKeyword(currentCardSearchMessage);
-        mCardListAdapter.set(cardInfos);
-        mCardListAdapter.notifyDataSetChanged();
+        fillSearchResultList(cardInfos);
         if (!cardInfos.isEmpty()) {
             mListView.smoothScrollToPosition(0);
         }
@@ -204,6 +221,10 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
 
     @Override
     public void onItemClick(View view, int pos) {
+        // 批量勾选模式：卡组网格上的点击只切换勾选，不再弹卡片详情
+        if (mDeckBatchController != null && mDeckBatchController.onDeckCardTap(pos)) {
+            return;
+        }
         if (isShowDrawer()) {
             return;
         }
@@ -212,12 +233,20 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
 
     @Override
     public void onItemLongClick(View view, int pos) {
+        // 卡组网格的另一条长按链（GestureDetector）：与 ItemTouchHelperPlus 那条同走控制器，
+        // 同一手势两条先后到达由控制器的 300ms 防抖只认第一次；进模式与模式内删除同样在内分流
+        if (mDeckBatchController != null) {
+            mDeckBatchController.onDeckCardLongPress(pos);
+        }
     }
 
     @Override
     public void onItemDoubleClick(View view, int pos) {
         //拖拽中，就不显示
         if (isShowDrawer()) {
+            return;
+        }
+        if (mDeckBatchController != null && mDeckBatchController.isBatchMode()) {
             return;
         }
         if (Constants.DECK_SINGLE_PRESS_DRAG) {
@@ -296,17 +325,18 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
                         addMainCard(cardInfo);
                     }
                 });
-
-                // 设置回调函数，当卡片收藏状态改变时触发
-                mCardDetail.setCallBack((card, favorite) -> {
-                    if (mCardSearcher.isShowFavorite()) {
-                        mCardSearcher.showFavorites(false);
-                    }
-                });
+                // 收藏变化统一由 CardFavoriteChangedEvent 通知收藏列表重排
             }
 
-            // 显示添加按钮
-            mCardDetail.showAdd();
+            // 添加按钮：只读分类（人机卡组/卡包展示）收起“加入主/副卡组”两键，
+            // 与决斗内编辑器只读/卡包态置灰保存、清空、排序、删除同口径；
+            // 必须走 hideAdd 而不是“不调 showAdd”：mShowAdd 一旦置真，setCardInfo 会按它
+            // 重新把两键拉回可见，只靠默认态盖不住上一次的显示残留
+            if (isDeckEditable()) {
+                mCardDetail.showAdd();
+            } else {
+                mCardDetail.hideAdd();
+            }
 
             // 初始化对话框（如果尚未初始化）
             if (mDialog == null) {
@@ -352,7 +382,10 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
 
     protected void showCardList(List<Card> cardList, boolean sort) {
         if (!cardList.isEmpty()) {
-            onSearchResult(sort ? mCardLoader.sort(cardList) : cardList, false);//根据情况不同，判断是否调用CardLoader的sort方法排序List<Card>
+            // 关联卡片与卡包展示都先走移动端固定序 mCardLoader.sort（怪兽→连接→魔法→陷阱、高星在前），
+            // 与第 0 档分割线的分段键一致；不能直接保留卡包的收集号原序，否则同段卡不相邻、分段会重复出现。
+            // 顶部规则下拉选攻/守/名称/时间时再由 applySortRule 在其上按当前档重排。
+            showSearchResultCards(mCardLoader.sort(cardList), false);
             //sort为true代表点击“关联卡片”按钮（卡包展示为false），以当前卡片名作为关键词计入搜索历史
             if (sort && mCardDetail != null && mCardDetail.getCardInfo() != null) {
                 mCardSearcher.recordHistoryKeyword(mCardDetail.getCardInfo().Name);
@@ -369,6 +402,10 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
      * @return 添加成功返回true，添加失败返回false
      */
     protected boolean addSideCard(Card cardInfo) {
+        // 只读分类（人机卡组/卡包展示）不受理加卡
+        if (blockEditIfReadonlyDeck()) {
+            return false;
+        }
         // 检查卡片添加限制
         if (checkLimit(cardInfo)) {
             // 执行添加卡片操作
@@ -392,6 +429,10 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
      * @return 添加成功返回true，否则返回false
      */
     protected boolean addMainCard(Card cardInfo) {
+        // 只读分类（人机卡组/卡包展示）不受理加卡
+        if (blockEditIfReadonlyDeck()) {
+            return false;
+        }
         // 检查卡片添加限制
         if (checkLimit(cardInfo)) {
             boolean rs;
@@ -426,6 +467,10 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
         if (card == null || target == null) {
             return;
         }
+        // 兜底拦截：只读分类本不起拖，仍有路径递来落点时按统一文案提示并丢弃本次插入
+        if (blockEditIfReadonlyDeck()) {
+            return;
+        }
         // 卡片数量/积分限制校验（失败原因已由checkLimit内部toast）
         if (!checkLimit(card)) {
             return;
@@ -441,7 +486,7 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
     }
 
     /**
-     * 根据拖拽插入失败原因toast提示
+     * 根据拖拽插入失败原因（单卡拖入与整组搬运共用） toast 提示
      */
     protected void showDragInsertFailToast(DeckAdapater.DragInsertResult result) {
         int msgRes;
@@ -471,6 +516,82 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
         YGOUtil.showTextToast(getString(msgRes));
     }
 
+    /**
+     * 批量模式下整组拖动落在卡区内的结果处理：成功则退出批量模式并补一次卡组历史快照，
+     * 失败则按具体原因 toast（整组搬运要么全部生效、要么全部作废，作废时保留批量模式便于重试）。
+     */
+    protected void handleBatchMoveResult(DeckAdapater.DragInsertResult result) {
+        if (result == DeckAdapater.DragInsertResult.SUCCESS) {
+            //与批量删除同口径：整组搬运落定后立即退出批量勾选模式
+            if (mDeckBatchController != null) {
+                mDeckBatchController.exitBatchMode();
+            }
+            addDeckToHistory(mDeckAdapater.getCurrentState());
+            updateUndoRedoButtonVisibility();
+        } else {
+            showBatchMoveFailToast(result);
+        }
+    }
+
+    /**
+     * 批量整组搬运失败原因 toast：与单卡拖入同一批文案，但张数上限按常量带参格式化
+     */
+    protected void showBatchMoveFailToast(DeckAdapater.DragInsertResult result) {
+        switch (result) {
+            case WRONG_PLACE_MAIN:
+                YGOUtil.showTextToast(getString(R.string.tip_drag_extra_in_main));
+                break;
+            case WRONG_PLACE_EXTRA:
+                YGOUtil.showTextToast(getString(R.string.tip_drag_normal_in_extra));
+                break;
+            case MAIN_FULL:
+                YGOUtil.showTextToast(getString(R.string.tip_drag_main_full, Constants.DECK_MAIN_MAX));
+                break;
+            case EXTRA_FULL:
+                YGOUtil.showTextToast(getString(R.string.tip_drag_extra_full, Constants.DECK_EXTRA_MAX));
+                break;
+            case SIDE_FULL:
+                YGOUtil.showTextToast(getString(R.string.tip_drag_side_full, Constants.DECK_SIDE_MAX));
+                break;
+            default:
+                YGOUtil.showTextToast(R.string.add_card_tip_fail);
+                break;
+        }
+    }
+
+    /**
+     * 批量模式下删除当前全部已勾选的卡，三个入口共用：直接点击垃圾桶键、拖到垃圾桶
+     * 所在行松手、批量模式内再次长按卡片。删除不弹二次确认（回退已由历史兼顾），
+     * 删完立即退出批量模式并把新状态计入撤销/重做历史。
+     */
+    protected void performBatchDelete() {
+        if (mDeckAdapater == null || !mDeckAdapater.isBatchMode()) {
+            return;
+        }
+        // 只读分类进不了批量模式（见 isBatchModeAllowed），三个删除入口本已一起失效；
+        // 这里再兜一道，避免垃圾桶键在模式位与卡组切换的夹缝里把删卡动作落到只读卡组上
+        if (!isDeckEditable()) {
+            return;
+        }
+        if (!mDeckAdapater.hasBatchChecked()) {
+            //直接点了垃圾桶但还没勾选任何卡：给明确反馈，并保留批量模式让用户继续勾选
+            YGOUtil.showTextToast(getString(R.string.batch_delete_none));
+            return;
+        }
+        int removed = mDeckAdapater.batchDeleteChecked();
+        //无论实际删了几张，都按用户规格退出批量勾选模式
+        if (mDeckBatchController != null) {
+            mDeckBatchController.exitBatchMode();
+        }
+        if (removed <= 0) {
+            return;
+        }
+        //删卡计入卡组历史，可用刚出现的 undo 直接回退
+        addDeckToHistory(mDeckAdapater.getCurrentState());
+        updateUndoRedoButtons();
+        YGOUtil.showTextToast(getString(R.string.batch_delete_done, removed));
+    }
+
     public void askBeforeQuit() {
         File ydk = mDeckAdapater.getYdkFile();
         if (ydk != null && ydk.exists()) {
@@ -491,6 +612,11 @@ public abstract class DeckManagerFragmentSearch extends DeckManagerFragmentDeck 
 
     @Override
     public boolean onBackPressed() {
+        // 批量勾选模式优先：返回键只用于退出批量模式（清空勾选与浮层），不关抽屉也不退页面
+        if (mDeckBatchController != null && mDeckBatchController.isBatchMode()) {
+            mDeckBatchController.exitBatchMode();
+            return true;
+        }
         if (mDrawerLayout.isDrawerOpen(Constants.CARD_RESULT_GRAVITY)) {
             mDrawerLayout.closeDrawer(Constants.CARD_RESULT_GRAVITY);
         } else if (mDrawerLayout.isDrawerOpen(Constants.CARD_SEARCH_GRAVITY)) {

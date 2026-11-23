@@ -1,7 +1,6 @@
 package cn.garymb.ygomobile.ui.cards;
 
 import static android.content.Context.CLIPBOARD_SERVICE;
-import static cn.garymb.ygomobile.Constants.ORI_DECK;
 import static cn.garymb.ygomobile.Constants.YDK_FILE_EX;
 import static cn.garymb.ygomobile.core.IrrlichtBridge.ACTION_SHARE_FILE;
 
@@ -21,6 +20,7 @@ import android.graphics.drawable.RotateDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Log;
@@ -38,7 +38,6 @@ import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.Spinner;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -93,8 +92,9 @@ import cn.garymb.ygomobile.ui.activities.WebActivity;
 import cn.garymb.ygomobile.ui.adapters.CardListAdapter;
 import cn.garymb.ygomobile.ui.adapters.SimpleSpinnerAdapter;
 import cn.garymb.ygomobile.ui.cards.deck.DeckAdapater;
+import cn.garymb.ygomobile.ui.cards.deck.DeckBatchEditController;
 import cn.garymb.ygomobile.ui.cards.deck.DeckDragDropHelper;
-import cn.garymb.ygomobile.ui.cards.deck.DeckItem;
+import cn.garymb.ygomobile.ui.cards.deck.DeckHistory;
 import cn.garymb.ygomobile.ui.cards.deck.DeckItemTouchHelper;
 import cn.garymb.ygomobile.ui.cards.deck.DeckItemType;
 import cn.garymb.ygomobile.ui.cards.deck.DeckLayoutManager;
@@ -110,6 +110,7 @@ import cn.garymb.ygomobile.ui.plus.AOnGestureListener;
 import cn.garymb.ygomobile.ui.plus.DefaultOnBoomListener;
 import cn.garymb.ygomobile.ui.plus.DialogPlus;
 import cn.garymb.ygomobile.ui.plus.VUiKit;
+import cn.garymb.ygomobile.ui.widget.SectionDividerDecoration;
 import cn.garymb.ygomobile.utils.BitmapUtil;
 import cn.garymb.ygomobile.utils.DeckUtil;
 import cn.garymb.ygomobile.utils.FileUtils;
@@ -138,7 +139,12 @@ import ocgcore.enums.LimitType;
  */
 public abstract class DeckManagerFragmentBase extends BaseFragemnt implements RecyclerViewItemListener.OnItemListener, OnItemDragListener, YGODeckDialogUtil.OnDeckMenuListener, CardLoader.CallBack, CardSearcher.CallBack {
     protected static final String TAG = "DeckManagerFragment";
-    public static List<MyOnlineDeckDetail> originalData; // 保存原始数据
+    /**
+     * 在线卡组缓存：声明处即初始化（类加载阶段完成，线程间可见性可靠）。
+     * 所有写入均在主线程执行：synchronizeDecks 的缓存更新经 updateOriginalDataCache
+     * 切主线程，避免与列表 UI 的遍历读取并发（ArrayList 非线程安全）。
+     */
+    public static List<MyOnlineDeckDetail> originalData = new ArrayList<>(); // 保存原始数据
     protected final AppsSettings mSettings = AppsSettings.get();
     public DeckAdapater mDeckAdapater;
     protected DrawerLayout mDrawerLayout;
@@ -148,6 +154,23 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     protected CardManager mCardManager;
     protected PackManager mPackManager;
     protected CardListAdapter mCardListAdapter;
+    /**
+     * 搜索结果排序规则按钮（与左抽屉顶部计数同一行）：位序与编辑器同款，
+     * 0=星数 / 1=攻击 / 2=守备 / 3=名称 / 4=时间（按卡包发售日期从早到晚），
+     * resultSortReversed 为真时按该规则反向排；只影响本页结果列的展现顺序
+     */
+    protected int resultSortSel;
+    protected boolean resultSortReversed;
+    /**
+     * 搜索结果展现模式切换按钮（与左抽屉顶部计数同一行）：默认列表，点一下换宫格
+     * （只卡图与禁限/起源点角标）；图标始终表示当前模式，见 {@link #refreshResultViewModeIcon()}
+     */
+    protected ImageButton btnResultViewMode;
+    /**
+     * 搜索结果抽屉顶部的发售日期时间轴接线：跨度取自卡包管理器里全部卡片的发售日期，
+     * 两端滑块决定结果只保留日期落在中间的卡
+     */
+    protected CardReleaseDateFilter mReleaseDateFilter;
     protected boolean isLoad = false;
     protected int screenWidth;
     long exitLasttime = 0;
@@ -157,27 +180,80 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     //region ui onCreate/onDestroy
     protected RecyclerView mRecyclerView;
     protected BaseActivity mContext;
-    // 历史记录列表，用于存储卡组状态
-    protected final List<DeckInfo> deckHistory = new ArrayList<>();
-    // 当前历史记录索引
-    protected int historyIndex = -1;
+    /**
+     * 卡组撤销/重做历史：进程内单例，与决斗内卡组编辑器 DeckEditorManager 共用同一份快照列表；
+     * 以当前 ydk 文件路径为归属 key，换卡组文件时由 DeckHistory#bindDeck 自动清零。
+     */
+    protected final DeckHistory deckHistory = DeckHistory.get();
     protected boolean isPackMode;
     protected File mPreLoadFile;//预加载卡组，用于外部打开ydk文件或通过卡组广场预览卡组时，值为file。当未通过预加载打开ydk（打开卡组时），值为null
     protected DeckItemTouchHelper mDeckItemTouchHelper;
     // 搜索结果卡片长按拖拽到卡组的浮层拖拽辅助
     protected DeckDragDropHelper mDeckDragHelper;
+    // 卡组网格长按进入的批量勾选模式（点击勾选 / 按住整组拖动）
+    protected DeckBatchEditController mDeckBatchController;
     protected TextView tv_add_1, tv_deck, tv_credit_limit, tv_credit_remain, tv_result_count, tv_credit_count;
     protected LinearLayout ll_genesys_scoreboard;
     protected AppCompatSpinner mCardSearchLimitSpinner;
     protected CardDetail mCardDetail;
     protected DialogPlus mDialog, builderShareLoading;
     protected ImageButton btnUndo, btnRedo;
+    /** 批量勾选模式的垃圾桶删除键，与 undo/redo 同处一行（该行同时也是整组拖动的删除落点区） */
+    protected ImageButton btnBatchDelete;
+    /** 批量勾选模式的退出键：垃圾桶右侧，点击清空全部勾选并退出批量模式（取代原先挡住卡片的提示 toast） */
+    protected Button btnBatchExit;
+    /** undo/redo/垃圾桶所在行：批量拖动悬停在该矩形内松手即批量删除（退出键在本行矩形之外，不受影响） */
+    protected View layoutUndoRedo;
+    /**
+     * 悬停在删除区上时垃圾桶图标的放大倍数。48dp 的键放大到 1.3 倍占 62.4dp（每侧外溢 7.2dp），
+     * 配合 fragment_deck_cards.xml 自 layout_deck_undo_redo 往上几层放开的 clipChildren 能完整画圆；
+     * 再大就会越接近屏幕下缘而被窗口裁掉。
+     */
+    private static final float DELETE_ZONE_HIGHLIGHT_SCALE = 1.3f;
+    /**
+     * 共享卡组历史监听：除刷新 undo/redo 可用态外，还承担与决斗内卡组编辑器的实时联动——
+     * 对方切换卡组则本页跟随切换（有未保存修改先弹确认），对方改了内容则本页以会话为准刷新。
+     * <p>
+     * 广播在发起方的 UI 回调栈内同步抵达，本页的卡组重建挂到下一轮消息再做，
+     * 不在对侧 notifyDeckChanged 中途重入其视图树。
+     */
+    private final DeckHistory.Listener historyListener = new DeckHistory.Listener() {
+        @Override
+        public void onDeckHistoryChanged() {
+            updateUndoRedoButtonVisibility();
+        }
+
+        @Override
+        public void onDeckKeyChanged(String key, int publisher) {
+            if (publisher == DeckHistory.PUBLISHER_DECK_PAGE) return;
+            applyRemoteDeckSwitch(key);
+        }
+
+        @Override
+        public void onDeckContentChanged(String key, int publisher) {
+            if (publisher == DeckHistory.PUBLISHER_DECK_PAGE) return;
+            applyRemoteDeckContent();
+        }
+    };
+    /** 联动消息的投递容器，onDestroyView 时整体清空，避免视图销毁后回调陈旧实例 */
+    private final Handler mDeckSyncHandler = new Handler(Looper.getMainLooper());
+    /**
+     * 卡组载入序号：每发起一次载入自增，异步读盘回调只在序号未变时才落地。
+     * 没有这道门，“决斗内切卡组 → 本页 loadDeckFromFile 异步读盘”途中又收到对方的
+     * 内容同步时，迟到的旧读盘结果会把同步好的卡组再覆盖回去。
+     */
+    protected int deckLoadSeq;
     protected String currentCardSearchMessage = "";
 
 
     protected View layoutView;
 
     public static List<MyOnlineDeckDetail> getOriginalData() {
+        // 在线备份页可能在主卡组管理页尚未创建时打开（登录后同步同样会写该缓存）：
+        // 懒初始化避免 synchronizeDecks / 列表刷新在字段未初始化时空指针
+        if (originalData == null) {
+            originalData = new ArrayList<>();
+        }
         return originalData;
     }
 
@@ -247,12 +323,26 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
 
         mListView = layoutView.findViewById(R.id.list_cards);
 
-
-        // 设置卡片列表适配器并启用滑动删除功能
+        // 搜索结果列的展现模式按本页设置项初始化（用户规格：三页各存各的开关，未设置过走原列表），
+        // 顶部计数行的按钮可切成宫格（只留卡图与禁限/起源点角标，列数按宽度自适应），
+        // 两种展现都保留加卡键与行上的卡名/属性/攻守信息（宫格态则由卡详与长按拖动加卡）
         mCardListAdapter = new CardListAdapter(getContext(), activity.getImageLoader());
         mCardListAdapter.setShowAddButtons(true); // 显示添加按钮
+        // 宫格固定每行 4 个（用户规格）：本页结果抽屉宽度不固定，自适应会多出一列
+        mCardListAdapter.setGridSpanCount(Constants.DECK_MANAGE_RESULT_GRID_SPAN);
+        mCardListAdapter.setGridLayout(isResultGridPreferred());
         mListView.setLayoutManager(new FastScrollLinearLayoutManager(getContext()));
         mListView.setAdapter(mCardListAdapter);
+        // 结果列表/宫格的分段说明：列表按每张卡、宫格按整行分段（切换布局后不用重挂）
+        mListView.addItemDecoration(new SectionDividerDecoration(getContext(), mCardListAdapter));
+        // 顶部计数同一行的排序规则按钮与展现模式切换
+        setupResultSortButtons();
+        btnResultViewMode = layoutView.findViewById(R.id.btn_result_view_mode);
+        btnResultViewMode.setOnClickListener(v -> toggleResultViewMode());
+        refreshResultViewModeIcon();
+        // 初始化态可能是宫格（从设置读回），行 LM 必须当场换掉；
+        // 列数在宽度未量出时先给 1 列兜底，下一次填结果数据时再复核
+        applyResultLayout();
 
         // 设置各类监听器
         setListeners();
@@ -266,8 +356,19 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
         mCardLoader.setCallBack(this);
 
         // 初始化卡片搜索器及其回调接口
-        mCardSearcher = new CardSearcher(layoutView.findViewById(R.id.nav_view_list), mCardLoader);
+        View cardSearchPanel = layoutView.findViewById(R.id.nav_view_list);
+        mCardSearcher = new CardSearcher(cardSearchPanel, mCardLoader);
         mCardSearcher.setCallBack(this);
+        // 收藏星标位于搜索结果抽屉顶行（计数/宫格切换/排序同排），筛选面板里已没有该按钮，得交进来
+        mCardSearcher.bindFavoriteButton(layoutView.findViewById(R.id.btn_my_fav));
+        // 筛选条件抽屉（右侧）的容器铺满整屏且背景透明：抽屉在显时落在筛选面板以外的触点若无人消费，
+        // ViewGroup 会把同一次按下继续下发给下层兄弟（搜索结果列表抽屉）与内容层（功能菜单/搜索/
+        // 搜索结果列表按钮），形成点击穿透（用户规格：抽屉在显时禁止穿透）。容器自身的消费只发生在
+        // 面板子树没接住事件时，故面板内控件与列表滚动照常响应；抽屉收起时容器被 DrawerLayout 摆到
+        // 屏外并置 INVISIBLE，收不到触点，不影响收起态下的下层点击与边缘拉出抽屉的手势
+        if (cardSearchPanel != null && cardSearchPanel.getParent() instanceof View) {
+            ((View) cardSearchPanel.getParent()).setOnTouchListener((v, event) -> true);
+        }
 
         //初始化genesys计分板
         ll_genesys_scoreboard = layoutView.findViewById(R.id.ll_genesys_scoreboard);
@@ -278,6 +379,14 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
         // 查找底部卡组名称展示区域的文本控件
         tv_deck = layoutView.findViewById(R.id.tv_deck);
         tv_result_count = layoutView.findViewById(R.id.result_count);
+        // 搜索结果抽屉顶部的发售日期时间轴（接线见 CardReleaseDateFilter）：
+        // 过滤后按同一排序档位重排，并复核一次列表布局
+        mReleaseDateFilter = new CardReleaseDateFilter(
+                layoutView.findViewById(R.id.release_date_bar),
+                mCardListAdapter, tv_result_count,
+                () -> resultSortSel,
+                this::applyResultLayout);
+        mReleaseDateFilter.refreshRange();
 
         // 初始化右侧抽屉的条件搜索禁卡表下拉框并设置背景颜色
         mCardSearchLimitSpinner = mCardSearcher.findViewById(R.id.sp_limit_list);
@@ -314,6 +423,58 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
 
         // 添加RecyclerView的点击监听器
         mRecyclerView.addOnItemTouchListener(new RecyclerViewItemListener(mRecyclerView, this));
+
+        // 初始化卡组网格的批量勾选模式控制器（挂在 RecyclerView 上观察手势，
+        // 与上面的点击监听共存：只有“按住已勾选卡移动超过阈值”时才接管本次手势）
+        mDeckBatchController = new DeckBatchEditController(activity, mRecyclerView, mDeckAdapater,
+                new DeckBatchEditController.Callback() {
+                    @Override
+                    public boolean isBatchModeAllowed() {
+                        // 卡包展示与人机（AI）分类均为只读卡组：不开批量模式，
+                        // 于是长按勾选、整组搬运、垃圾桶批量删除一起失效
+                        return isDeckEditable();
+                    }
+
+                    @Override
+                    public boolean isDeckCardDragging() {
+                        // 单卡拖拽已经真的移动起来了：本次手势是「拖卡」而不是「按住不动」。
+                        // RecyclerViewItemListener 那条长按链在拖拽被 ItemTouchHelper 接管后
+                        // 再也收不到后续事件，它的定时器不能取消，仍会按按下那一刻的旧坐标到点
+                        // 回调长按，必须靠这个信号在批量模式入口当场拒绝
+                        return mDeckItemTouchHelper != null && mDeckItemTouchHelper.isCardDragging();
+                    }
+
+                    @Override
+                    public void onBatchModeChanged(boolean enabled) {
+                        //批量模式决定了本行“undo/redo 与垃圾桶/退出键”的互斥显隐
+                        updateUndoRedoButtonVisibility();
+                    }
+
+                    @Override
+                    public void onBatchMoved(DeckAdapater.DragInsertResult result,
+                                             DeckDragDropHelper.DropTarget target) {
+                        handleBatchMoveResult(result);
+                    }
+
+                    @Override
+                    public void onBatchDeleteRequested() {
+                        performBatchDelete();
+                    }
+
+                    @Override
+                    public void onBatchDeleteZoneHoverChanged(boolean inside) {
+                        applyDeleteZoneHighlight(inside);
+                    }
+                });
+        mDeckBatchController.install();
+        // 卡片真的被拖起来那一瞬间（位移首次超过长按手抖容差）：当场撤销本次手势误入的批量勾选模式。
+        // 拖拽期间控制器自己的 onInterceptTouchEvent 再也看不到 MOVE（事件流已被 ItemTouchHelper 独占），
+        // 所以只能由拖拽回调这一侧主动报；撤销走不整表重建的路径，不会打断正跟着手指的那次拖卡
+        mDeckItemTouchHelper.setOnDragMovedListener(() -> {
+            if (mDeckBatchController != null) {
+                mDeckBatchController.rollbackGestureBatchMode();
+            }
+        });
 
         // 初始化弹出菜单按钮及相关导航按钮点击事件
         initBoomMenuButton(layoutView.findViewById(R.id.bmb));
@@ -352,13 +513,29 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
                     requireActivity().getSupportFragmentManager(), this, 0, null);
         });
 
-        // 初始化撤销/重做按钮
+        // 初始化撤销/重做按钮，并在同一行右侧接上批量模式的垃圾桶删除键与退出多选键
         btnUndo = layoutView.findViewById(R.id.btn_undo);
         animRotate(btnUndo);
         btnRedo = layoutView.findViewById(R.id.btn_redo);
         animRotate(btnRedo);
         btnUndo.setOnClickListener(v -> undo());
         btnRedo.setOnClickListener(v -> redo());
+        layoutUndoRedo = layoutView.findViewById(R.id.layout_deck_undo_redo);
+        btnBatchDelete = layoutView.findViewById(R.id.btn_deck_batch_delete);
+        animRotate(btnBatchDelete);
+        btnBatchDelete.setOnClickListener(v -> performBatchDelete());
+        // 退出键：清空全部勾选并退出批量模式（与返回键、批量删除后的自动退出同一条收口路径）
+        btnBatchExit = layoutView.findViewById(R.id.btn_deck_batch_exit);
+        btnBatchExit.setOnClickListener(v -> {
+            if (mDeckBatchController != null) {
+                mDeckBatchController.exitBatchMode();
+            }
+        });
+        // 整组拖动的“拖到此处删除”落点：指向 undo/redo/垃圾桶所在行（不含右侧退出键）
+        mDeckBatchController.setDeleteZone(layoutUndoRedo);
+        // 历史为两个编辑器共用的单例，对方新增快照时本面也需刷新按钮可用态
+        deckHistory.addListener(historyListener);
+        applyBatchButtonsVisibility();
 
         mContext = (BaseActivity) getActivity();
 
@@ -426,14 +603,87 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
                 _file = new File(path);
             }
         }
-        // 检查原始卡组目录是否存在且当前卡组目录文件数量较少时，启动权限获取活动
-        File oriDeckFiles = new File(ORI_DECK);
-        File deckFiles = new File(AppsSettings.get().getDeckDir());
-        if (oriDeckFiles.exists() && deckFiles.list().length <= 1) {
-            mContext.startPermissionsActivity();
-        }
+        // 存储权限改为按需申请（备份/还原卡组、选头像/卡背/背景等真正访问外部文件时），
+        // 不再在进入卡组管理页时提前弹出权限页
         // 初始化卡组数据
         init(_file);
+    }
+
+    /**
+     * 搜索结果排序规则按钮：装项与样式由 {@link CardListAdapter#setupSortButtons}
+     * 统一装配（与卡查页同一份），比较器与决斗内卡组编辑器同源；
+     * 切换只对当前结果重排，不重新发起搜索
+     */
+    private void setupResultSortButtons() {
+        CardListAdapter.setupSortButtons(layoutView.findViewById(R.id.ll_result_sort),
+                resultSortSel, resultSortReversed, (sortSel, reversed) -> {
+                    resultSortSel = sortSel;
+                    resultSortReversed = reversed;
+                    resortSearchResults();
+                });
+    }
+
+    /**
+     * 结果列表填入数据与刷新：先记住搜索线程交来的原始顺序，再按本页当前档位填入，
+     * 最后复核一次展现布局。第 0 档（星数）就是改造前的原样顺序（含关键词完全命中置顶），
+     * 卡包展示的原始顺序就是卡包顺序本身，因此也不会被打乱
+     */
+    protected void fillSearchResultList(List<Card> cards) {
+        if (mCardListAdapter == null) return;
+        mCardListAdapter.setRawCards(cards);
+        mCardListAdapter.setSortReversed(resultSortReversed);
+        mCardListAdapter.applySortRule(resultSortSel);
+        // 时间轴：卡包数据比页面晚读完是常态，每次填结果都复核一次跨度（已就绪则不动滑块）；
+        // 顶部计数按过滤后的条数刷新
+        if (mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+            mReleaseDateFilter.updateResultCount();
+        }
+        applyResultLayout();
+    }
+
+    /** 排序规则变更后只重排当前结果，不重新搜索：以适配器里记下的原始顺序为底 */
+    protected void resortSearchResults() {
+        if (mCardListAdapter == null) return;
+        mCardListAdapter.setSortReversed(resultSortReversed);
+        mCardListAdapter.applySortRule(resultSortSel);
+        applyResultLayout();
+    }
+
+    /**
+     * 按当前展现模式装配列表布局（宫格列数随宽度自适应）：布局管理器与列数变化都会
+     * requestLayout，故 post 到本轮布局之外；宽度还没量出来时适配器先给 1 列兜底
+     */
+    protected void applyResultLayout() {
+        if (mListView == null || mCardListAdapter == null) return;
+        mListView.post(() -> mCardListAdapter.applyListLayout(mListView));
+    }
+
+    /** 本页上一次的展现模式开关（与卡查页、决斗内卡组编辑器各存一份） */
+    protected boolean isResultGridPreferred() {
+        return mSettings.getIntSettings(Constants.PREF_DECK_MANAGE_RESULT_GRID,
+                Constants.PREF_DEF_RESULT_GRID) == 1;
+    }
+
+    /**
+     * 切换搜索结果展现模式（列表/宫格）并同步按钮图标：模式由点击当场切换，
+     * 条目布局与布局管理器必须同一帧换完（toggleListLayout 里成对处理），
+     * 不能走 applyResultLayout 的 post 路径，否则中间会有一帧宫格条目配在线性布局上、
+     * 卡图被拉成满宽的大图；而点击回调本身不在布局过程中，可以直接换 LM；
+     * 开关结果写回本页设置项供下次初始化
+     */
+    protected void toggleResultViewMode() {
+        if (mCardListAdapter == null) return;
+        boolean grid = mCardListAdapter.toggleListLayout(mListView);
+        mSettings.saveIntSettings(Constants.PREF_DECK_MANAGE_RESULT_GRID, grid ? 1 : 0);
+        refreshResultViewModeIcon();
+    }
+
+    /** 展现模式按钮的图标即当前模式：宫格→宫格图标，列表→列表图标 */
+    protected void refreshResultViewModeIcon() {
+        if (btnResultViewMode == null || mCardListAdapter == null) return;
+        btnResultViewMode.setImageResource(mCardListAdapter.isGridLayout()
+                ? R.drawable.ic_view_grid_24 : R.drawable.ic_view_list_24);
     }
 
     /**
@@ -486,11 +736,31 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     }
 
     @Override
+    public void onHiddenChanged(boolean hidden) {
+        super.onHiddenChanged(hidden);
+        // 底部页签切走：HomeActivity.switchFragment 以 hide 本页使根视图 GONE，而搜索面板（抽屉内的
+        // CardSearcher）的关键词记录下拉是独立窗体不会随之消失，会卡在切换后的页面上，
+        // 故本页退场时主动收起自己那份下拉
+        if (hidden && mCardSearcher != null) {
+            mCardSearcher.dismissKeywordDropdown();
+        }
+        // 切回本页（页签用 hide/show 切换，不走 onUserVisible）：复核一次时间轴跨度，
+        // 卡包数据可能在本页隐藏期间才读完
+        if (!hidden && mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+        }
+    }
+
+    @Override
     public void onFirstUserVisible() {
     }
 
     @Override
     public void onUserVisible() {
+        // 切回本页时复核时间轴跨度：卡包数据可能在页面隐藏期间才读完
+        if (mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+        }
     }
 
     @Override
@@ -520,10 +790,19 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
 
     @Override
     public void onDestroyView() {
+        // 共享历史与联动广播常驻，视图销毁时必须摘除监听并清空待投递消息，
+        // 否则随 Fragment 重建会累积指向已销毁视图树的旧回调
+        mDeckSyncHandler.removeCallbacksAndMessages(null);
+        deckHistory.removeListener(historyListener);
         // 视图销毁时取消进行中的浮动卡片拖拽，避免浮层残留在根布局上
         if (mDeckDragHelper != null) {
             mDeckDragHelper.cancel();
             mDeckDragHelper = null;
+        }
+        // 同理摘除批量勾选控制器并收起整组拖动的浮层
+        if (mDeckBatchController != null) {
+            mDeckBatchController.uninstall();
+            mDeckBatchController = null;
         }
         super.onDestroyView();
     }
@@ -535,35 +814,13 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
 
     @Override
     public void onDragLongPress(int pos) {
-        // 检查位置索引有效性
-        if (pos < 0) return;
-        if (Constants.DEBUG)
-            Log.d(TAG, "delete " + pos);
-        // 获取要删除的卡组项
-        DeckItem deckItem = mDeckAdapater.getItem(pos);
-        if (deckItem == null || deckItem.getCardInfo() == null) {
-            return;
+        // 卡组网格长按语义（用户规格：长按当场触发，不是抬手才触发）：未在批量模式时
+        // “进入批量勾选模式并勾上该卡”，已在模式时“删除已勾选的整组卡”，两种行为均在
+        // DeckBatchEditController#onDeckCardLongPress 内分流；按住又起拖的撤销也在控制器里按
+        // 「本次手势刚进模式」标志位做（见 rollbackGestureBatchMode）
+        if (mDeckBatchController != null) {
+            mDeckBatchController.onDeckCardLongPress(pos);
         }
-        // 根据设置决定删除方式：弹窗确认删除 或 直接显示删除头部视图
-        if (mSettings.isDialogDelete()) {
-            // 创建并显示删除确认对话框
-            DialogPlus dialogPlus = new DialogPlus(getContext());
-            dialogPlus.setTitle(R.string.question);
-            dialogPlus.setMessage(getString(R.string.delete_card, deckItem.getCardInfo().Name));
-            dialogPlus.setMessageGravity(Gravity.CENTER_HORIZONTAL);
-            dialogPlus.setLeftButtonListener((dlg, v) -> {
-                dlg.dismiss();
-                mDeckItemTouchHelper.remove(pos);
-            });
-            dialogPlus.show();
-        } else {
-            mDeckItemTouchHelper.remove(pos);
-            // 直接显示删除头部视图
-            mDeckAdapater.showHeadView();
-        }
-        // 添加到历史记录
-        addDeckToHistory(mDeckAdapater.getCurrentState());
-
     }
 
     @Override
@@ -593,13 +850,106 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
         }
     }
 
+    /**
+     * 当前卡组是否可编辑：人机（AI）卡组分类与卡包展示分类只供查看，拖拽改序、加卡、删卡一律禁用。
+     * <p>
+     * 判定按当前 ydk 路径即时推导（见 {@link DeckAdapater#isEditable()}），口径与决斗内卡组编辑器
+     * DeckEditorManager 的 isReadonly/isPackMode 及 {@code DeckHistory#isOutsideSyncScope} 同源：
+     * “不参与跨编辑器同步”与“不可编辑”始终按同一批目录规则走，不随目录改动而偏离。
+     */
+    protected boolean isDeckEditable() {
+        return mDeckAdapater != null && mDeckAdapater.isEditable();
+    }
+
+    /**
+     * 由用户动作直接发起的编辑入口共用的拦截：只读分类（人机卡组/卡包展示）toast
+     * “请勿更改此分类下的卡组”并返回 true，调用方据此中止本次动作；可编辑时返回 false 放行。
+     */
+    protected boolean blockEditIfReadonlyDeck() {
+        if (isDeckEditable()) {
+            return false;
+        }
+        YGOUtil.showTextToast(R.string.donot_edit_Deck);
+        return true;
+    }
+
+    /**
+     * 整组拖动悬停在删除区（undo/redo/垃圾桶行）上时放大垃圾桶图标，离开则还原。
+     * 放大走 View 自身的 scale（以中心为基准），背景旋转环随之变大；图标本体在
+     * 48dp 槽位内不被裁剪，外层已逐级放开 clipChildren。
+     */
+    protected void applyDeleteZoneHighlight(boolean inside) {
+        if (btnBatchDelete == null) return;
+        float scale = inside ? DELETE_ZONE_HIGHLIGHT_SCALE : 1f;
+        btnBatchDelete.animate().scaleX(scale).scaleY(scale).setDuration(120).start();
+    }
+
+    /**
+     * 垃圾桶删除键与退出键的批量模式显隐：垃圾桶非批量模式 GONE 不占行宽，退出键则改走
+     * INVISIBLE 常驻占位（用户规格），使本行在进出多选模式时不左右跳动；
+     * 顺便把图标缩放态还原，避免上一轮拖动的悬停放大残留。
+     * <p>
+     * 进入批量模式时显式拉回可点与置顶：本行与卡组网格同属一个 FrameLayout，
+     * 只靠 XML 属性在某些 ROM 上会被当成装饰视图而不接点击，而垃圾桶本身就是
+     * “直接点它批量删除”的第三个入口，这里保证它一定能接住点击。
+     */
+    protected void applyBatchButtonsVisibility() {
+        boolean batch = mDeckBatchController != null && mDeckBatchController.isBatchMode();
+        if (btnBatchDelete != null) {
+            if (batch) {
+                btnBatchDelete.setVisibility(View.VISIBLE);
+                btnBatchDelete.setEnabled(true);
+                btnBatchDelete.setClickable(true);
+                btnBatchDelete.bringToFront();
+            } else {
+                btnBatchDelete.setVisibility(View.GONE);
+                applyDeleteZoneHighlight(false);
+            }
+        }
+        if (btnBatchExit != null) {
+            btnBatchExit.setVisibility(batch ? View.VISIBLE : View.INVISIBLE);
+        }
+    }
+
+    /**
+     * 决斗内卡组编辑器切换到另一份卡组：本页也跟着切到同一份。投递到下一轮消息再做，
+     * 不站在对侧的广播调用栈里重建本页视图（实现见链下游 Deck 层，与 loadDeckFromFile /
+     * setCurDeck 等卡组载入逻辑同处）。
+     */
+    protected void applyRemoteDeckSwitch(String path) {
+        mDeckSyncHandler.post(() -> onRemoteDeckSwitch(path));
+    }
+
+    /**
+     * 决斗内卡组编辑器改了当前卡组内容：本页以共享会话游标处的内容为准刷新自身。
+     */
+    protected void applyRemoteDeckContent() {
+        mDeckSyncHandler.post(this::onRemoteDeckContent);
+    }
+
+    /** 以下两个钩子由 DeckManagerFragmentDeck 实现（卡组载入与历史已在该类，联动归同一处） */
+    abstract void onRemoteDeckSwitch(String path);
+    abstract void onRemoteDeckContent();
+
+    /**
+     * 搜索结果浮层卡片是否正被拖拽（起拖 → 松手/取消之间）。
+     * <p>
+     * 拖拽期间两扇抽屉被 {@code DeckDragDropHelper} 置为 LOCK_MODE_LOCKED_CLOSED，而 DrawerLayout
+     * 的 openDrawer 不看锁定模式（锁定只掐断手势拦截）：续搜/收藏刷新这类异步回调此刻若把抽屉拉开，
+     * 抽屉会在浮动卡片底下重新滑出、并在松手解锁后停在展开态盖住刚插入的卡组网格。
+     * 故所有「程序化开抽屉」的入口都先问一句（数据照常填，只是不抢开抽屉）。
+     */
+    protected boolean isCardDragInFlight() {
+        return mDeckDragHelper != null && mDeckDragHelper.isDragging();
+    }
+
     protected void showSearch(boolean autoClose) {
         if (mDrawerLayout.isDrawerOpen(Constants.CARD_RESULT_GRAVITY)) {
             mDrawerLayout.closeDrawer(Constants.CARD_RESULT_GRAVITY);
         }
         if (autoClose && mDrawerLayout.isDrawerOpen(Constants.CARD_SEARCH_GRAVITY)) {
             mDrawerLayout.closeDrawer(Constants.CARD_SEARCH_GRAVITY);
-        } else if (isLoad) {
+        } else if (isLoad && !isCardDragInFlight()) {
             mDrawerLayout.openDrawer(Constants.CARD_SEARCH_GRAVITY);
         }
     }
@@ -607,13 +957,17 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     //region load deck
 
     protected void showResult(boolean autoClose) {
+        // 打开搜索结果抽屉前复核一次时间轴跨度（卡包数据可能刚读完）
+        if (mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+        }
         if (mDrawerLayout.isDrawerOpen(Constants.CARD_SEARCH_GRAVITY)) {
             mDrawerLayout.closeDrawer(Constants.CARD_SEARCH_GRAVITY);
         }
         if (autoClose && mDrawerLayout.isDrawerOpen(Constants.CARD_RESULT_GRAVITY)) {
             mDrawerLayout.closeDrawer(Constants.CARD_RESULT_GRAVITY);
             //showNewbieGuide("searchResult");
-        } else if (isLoad) {
+        } else if (isLoad && !isCardDragInFlight()) {
             mDrawerLayout.openDrawer(Constants.CARD_RESULT_GRAVITY);
         }
     }
@@ -626,6 +980,7 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     abstract void undo();
     abstract void redo();
     abstract void updateUndoRedoButtonVisibility();
+    abstract void updateUndoRedoButtons();
     abstract void refreshDeckCreditCount();
     abstract int getCreditCount(DeckInfo deckinfo);
     abstract List<File> getYdkFiles();
@@ -635,6 +990,8 @@ public abstract class DeckManagerFragmentBase extends BaseFragemnt implements Re
     abstract void animRotate(View view);
     abstract void showNewbieGuide(String scene);
     abstract void handleDeckCardDropped(Card card, DeckDragDropHelper.DropTarget target);
+    abstract void handleBatchMoveResult(DeckAdapater.DragInsertResult result);
+    abstract void performBatchDelete();
     abstract void onCardClick(View view, Card cardInfo, int pos);
     abstract void onCardLongClick(View view, Card cardInfo, int pos);
 

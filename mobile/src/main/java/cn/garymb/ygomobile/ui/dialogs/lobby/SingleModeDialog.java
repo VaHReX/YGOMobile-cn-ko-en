@@ -7,12 +7,16 @@ import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.text.TextPaint;
+import android.text.TextUtils;
 import android.util.DisplayMetrics;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -27,18 +31,21 @@ import com.google.android.material.tabs.TabLayout;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.YGOProActivity;
 import cn.garymb.ygomobile.game.engine.GameEngine;
 import cn.garymb.ygomobile.lite.R;
+import cn.garymb.ygomobile.network.YGOProtocol;
 import cn.garymb.ygomobile.ui.adapters.SimpleListAdapter;
 import cn.garymb.ygomobile.ui.adapters.SimpleSpinnerAdapter;
 import cn.garymb.ygomobile.ui.adapters.SimpleSpinnerItem;
 import cn.garymb.ygomobile.utils.BotUtil;
 import cn.garymb.ygomobile.utils.DraggablePopupHelper;
 import cn.garymb.ygomobile.utils.PuzzleUtil;
+import cn.garymb.ygomobile.utils.SharedPreferenceUtil;
 import cn.garymb.ygomobile.utils.YGOUtil;
 import ocgcore.DataManager;
 import ocgcore.StringManager;
@@ -62,8 +69,12 @@ public class SingleModeDialog {
     private final StringManager mStringManager = DataManager.get().getStringManager();
 
     public interface OnSingleModeListener {
-        void onStartBotDuel(String botCommand, String deckFile,
-                            int duelRule, boolean noCheckDeck, boolean noShuffleDeck);
+        /** 人机建主：duelRule/noCheckDeck/noShuffleDeck 取自人机页设置，duelMode 为协议 mode（0 单局 / 1 比赛 / 2 TAG），
+         *  startLP/startHand/drawCount 为开局参数（非法输入由面板回落默认值）；
+         *  botCommands/deckFiles 按下标一一对应待拉起的人机席位（TAG 为 3 席，顺序即席位顺序） */
+        void onStartBotDuel(List<String> botCommands, List<String> deckFiles,
+                            int duelRule, boolean noCheckDeck, boolean noShuffleDeck,
+                            int duelMode, int startLP, int startHand, int drawCount);
 
         void onStartSingleMode(String luaFilePath, boolean noShuffleToDeck);
 
@@ -78,6 +89,40 @@ public class SingleModeDialog {
     private String selectedDeckPath = "";
     private String selectedDeckCategory = "";
     private String selectedDeckName = "";
+
+    /** TAG 需拉起的 AI 席位数（P2/P3/P4）与对应的列表席位标记 */
+    private static final int TAG_BOT_SEATS = 3;
+    private static final String[] BOT_SEAT_MARKS = {"②", "③", "④"};
+    /** 决斗模式联动初始基本分：TAG 两队四人每人 8000→合计 16000，其余赛型 8000 */
+    private static final String TAG_START_LP = "16000";
+    private static final String NORMAL_START_LP = "8000";
+    /** P2 卡组按钮多行文字的最大/最小字号（sp）：按按钮尺寸自适应缩小，避免长卡组名被截断 */
+    private static final float BOT_DECK_TEXT_MAX_SP = 10f;
+    private static final float BOT_DECK_TEXT_MIN_SP = 5f;
+    /** 人机席位（②③④）逐席选定的卡组：同一 AI 占多席时可各选一套 */
+    private final String[] botSeatDeckPaths = {"", "", ""};
+    private final String[] botSeatDeckNames = {"", "", ""};
+    private final String[] botSeatDeckCategories = {"", "", ""};
+    /** P2 卡组按钮当前逐席显示文本（用于尺寸变化时重新适配字号） */
+    private final List<String> botDeckButtonLines = new ArrayList<>();
+    /** TAG 复选顺序：下标即席位序（0→队友席 P2、1/2→对手席 P3/P4），元素为 botList 下标 */
+    private final List<Integer> botSelectionOrder = new ArrayList<>();
+    /** 人机列表显示顺序：元素为 botList 原始下标（收藏项按原相对顺序置前，其余保持原顺序） */
+    private final List<Integer> botDisplayIndices = new ArrayList<>();
+    // show() 中注入的人机页引用，供复选态与席位标记刷新使用
+    private List<BotUtil.BotInfo> tagBotList;
+    private List<String> tagBotBaseNames;
+    private SimpleListAdapter tagBotAdapter;
+    /** 人机列表视图：reshow 时据此判断当前是否停在人机页并重排收藏 */
+    private ListView tagBotListView;
+    /** 当前单选人机的 botList 原始下标（-1 未选）：reshow 重排后据此恢复高亮 */
+    private int selectedBotIndex = -1;
+    private Button tagBtnSelectDeck;
+    private Button tagBtnStart;
+    /** P2 卡组单元（提示文字 + 按钮）：仅在选中支持自选卡组的人机时整块显示 */
+    private View tagBotDeckCell;
+    /** 人机列表当前是否处于 TAG 复选态 */
+    private boolean tagListMode;
 
     public SingleModeDialog(Context context, OnSingleModeListener listener) {
         this.context = context;
@@ -108,6 +153,17 @@ public class SingleModeDialog {
         CheckBox chkNoCheckDeck = customView.findViewById(R.id.chk_no_check_deck);
         CheckBox chkNoShuffleDeck = customView.findViewById(R.id.chk_no_shuffle_deck);
         CheckBox chkReturnToTop = customView.findViewById(R.id.chk_return_to_top);
+        // 人机开局参数（仅人机页显示）：初始基本分与 P2 卡组选择同行，初始手卡数与每回合抽卡同行，
+        // 决斗模式与规则选择同走行3（残局页只保留行3 的“回卡顶”复选框）
+        View layoutBotStartLp = customView.findViewById(R.id.layout_bot_start_lp);
+        View layoutBotHandDraw = customView.findViewById(R.id.layout_bot_hand_draw);
+        View layoutBotDuelMode = customView.findViewById(R.id.layout_bot_duel_mode);
+        View layoutBotRule = customView.findViewById(R.id.layout_bot_rule);
+        View layoutBotP2Deck = customView.findViewById(R.id.layout_bot_p2_deck);
+        Spinner spinnerBotDuelMode = customView.findViewById(R.id.bot_spinner_duel_mode);
+        EditText botEtStartLp = customView.findViewById(R.id.bot_et_start_lp);
+        EditText botEtStartHand = customView.findViewById(R.id.bot_et_start_hand);
+        EditText botEtDrawCount = customView.findViewById(R.id.bot_et_draw_count);
         // 人机/残局设置项与按钮文字统一复用 gframe 既有系统字符串（对齐 game.cpp tabBot / wSingle）：
         // 1382 人机信息：(tvBotInfoHeader) / 1384 AI只出剪刀(chkBotHand) / 1229 不检查卡组 / 1230 不洗切卡组
         // / 1238 不洗切时回卡组改为回顶端 / 1211 确定(btnStartBot) / 1210 退出(btnBotCancel)
@@ -121,6 +177,15 @@ public class SingleModeDialog {
         Button btnExitBot = customView.findViewById(R.id.btn_exit_bot);
         btnStartBotDuel.setText(mStringManager.getSystemString(1211, "确定"));
         btnExitBot.setText(mStringManager.getSystemString(1210, "退出"));
+        // 参数标签复用 gframe 建主页系统串：1231 初始基本分 / 1232 初始手卡 / 1233 每回合抽卡 /
+        // 1227 决斗模式 / 1236 规则；P2 卡组无对应系统串，改走 Android 资源多语言
+        setSysText(customView, R.id.bot_tv_start_lp_label, 1231, "初始基本分：");
+        setSysText(customView, R.id.bot_tv_start_hand_label, 1232, "初始手卡数：");
+        setSysText(customView, R.id.bot_tv_draw_count_label, 1233, "每回合抽卡：");
+        setSysText(customView, R.id.bot_tv_duel_mode_label, 1227, "决斗模式：");
+        setSysText(customView, R.id.bot_tv_rule_label, 1236, "规则：");
+        View tvP2DeckLabel = customView.findViewById(R.id.bot_tv_p2_deck_label);
+        if (tvP2DeckLabel instanceof TextView) ((TextView) tvP2DeckLabel).setText(R.string.bot_p2_deck_label);
 
         // 纯单人模式(左右互搏)控件：布局对齐 CreateHostDialog，去掉 solo 勾选/主机名/主机密
         Spinner soloSpinnerBanlist = customView.findViewById(R.id.solo_spinner_banlist);
@@ -136,15 +201,26 @@ public class SingleModeDialog {
         Button soloBtnCancel = customView.findViewById(R.id.solo_btn_cancel);
         applySoloStrings(customView, soloBtnConfirm, soloBtnCancel);
 
+        // 行3 两个下拉统一走 SimpleSpinnerAdapter 同一配置（颜色/下拉背景/字号），保证并列时观感一致
         List<SimpleSpinnerItem> ruleItems = new ArrayList<>();
         ruleItems.add(new SimpleSpinnerItem(5, mStringManager.getSystemString(1264, "大师规则（2020）")));
         ruleItems.add(new SimpleSpinnerItem(4, mStringManager.getSystemString(1263, "新大师规则")));
         ruleItems.add(new SimpleSpinnerItem(3, mStringManager.getSystemString(1262, "大师规则3")));
 
-        SimpleSpinnerAdapter ruleAdapter = new SimpleSpinnerAdapter(context);
+        SimpleSpinnerAdapter ruleAdapter = newBotSpinnerAdapter();
         ruleAdapter.set(ruleItems);
         spinnerRule.setAdapter(ruleAdapter);
         spinnerRule.setSelection(0);
+
+        // 决斗模式三项与建主页/纯单人页同口径（系统串 1244/1245/1246），选中值即协议 HostInfo.mode
+        List<SimpleSpinnerItem> duelModeItems = new ArrayList<>();
+        duelModeItems.add(new SimpleSpinnerItem(0, mStringManager.getSystemString(1244, "单局模式")));
+        duelModeItems.add(new SimpleSpinnerItem(1, mStringManager.getSystemString(1245, "比赛模式")));
+        duelModeItems.add(new SimpleSpinnerItem(2, mStringManager.getSystemString(1246, "TAG")));
+        SimpleSpinnerAdapter duelModeAdapter = newBotSpinnerAdapter();
+        duelModeAdapter.set(duelModeItems);
+        spinnerBotDuelMode.setAdapter(duelModeAdapter);
+        spinnerBotDuelMode.setSelection(0);
 
         // 纯单人页四个下拉复用 CreateHostDialog 的初始化（禁限卡表/规则/卡片允许/决斗模式）
         CreateHostDialog.configureSpinners(context, soloSpinnerBanlist, soloSpinnerRule,
@@ -164,8 +240,54 @@ public class SingleModeDialog {
 
         final SimpleListAdapter botAdapter = new SimpleListAdapter(context);
         botAdapter.set(botNames);
+        // 人机条目左侧收藏星标：收藏记录存 SharedPreference，每次刷新按收藏重排（收藏项置顶、取消后回原位）；
+        // 需在首次布局前启用，避免列表复用池里混用两种条目布局
+        botAdapter.setFavoriteNames(SharedPreferenceUtil.getFavoriteBotNames());
+        botAdapter.setOnFavoriteClickListener((name, displayPosition) -> {
+            boolean favorite = !SharedPreferenceUtil.getFavoriteBotNames().contains(name);
+            SharedPreferenceUtil.setBotFavorite(name, favorite);
+            botAdapter.setFavoriteNames(SharedPreferenceUtil.getFavoriteBotNames());
+            // 重排后按原始下标把单选/复选高亮映射回新位置
+            refreshBotListDisplay(selectedPosition[0]);
+            // 收藏重排会把条目移出当前视口（收藏置顶 / 取消后回原位），而列表视口不跟随：
+            // 不提示时用户会以为刚操作的人机“不见了”，故明确告知它去往了哪里
+            Toast.makeText(context, context.getString(
+                            favorite ? R.string.bot_favorite_added : R.string.bot_favorite_removed, name),
+                    Toast.LENGTH_SHORT).show();
+        });
         final SimpleListAdapter puzzleAdapter = new SimpleListAdapter(context);
         puzzleAdapter.set(puzzleNames);
+
+        // TAG 复选时选中项末尾右对齐显示 ②③④ 席位标记（选择顺序即 P2/P3/P4 顺序，
+        // 不足 3 席按已选顺序循环补位）；标记列布局须在首次布局前启用
+        botSelectionOrder.clear();
+        tagBotList = botList;
+        tagBotBaseNames = botNames;
+        tagBotAdapter = botAdapter;
+        tagBotListView = lvBotList;
+        tagBtnSelectDeck = btnSelectDeck;
+        tagBtnStart = btnStartBotDuel;
+        tagBotDeckCell = layoutBotP2Deck;
+        // 卡组按钮文字随按钮宽高变化重新适配字号（首次布局、横竖屏切换）
+        btnSelectDeck.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> fitBotDeckButtonTextSize());
+        applyBotListSelectMode(false, -1);
+        // 选 TAG 时初始基本分自动改为 16000（两队四人、每人 8000），选其他赛型回到 8000；
+        // 同时切换人机列表的单选/复选态（TAG 需选 1~3 个 AI 填三个席位）
+        spinnerBotDuelMode.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                boolean tag = isTagDuelMode(spinnerBotDuelMode);
+                botEtStartLp.setText(tag ? TAG_START_LP : NORMAL_START_LP);
+                if (currentMode[0] == 0) {
+                    // 切赛制保留已选条目：单选项转为 TAG 的 ② 席位，反之亦然
+                    selectedPosition[0] = applyBotListSelectMode(tag, selectedPosition[0]);
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
 
         // 半宽三页签文字易溢出：Material 1.12 的 TabView 会在测量时重套文本外观，
         // tabTextAppearance 在自定义视图上不起作用；故用自定义 TextView 作页签，并在 makeTabView 中
@@ -182,13 +304,16 @@ public class SingleModeDialog {
 
         lvBotList.setAdapter(botAdapter);
         tvBotDesc.setText(mStringManager.getSystemString(1382, "请选择一个AI查看信息"));
-        btnSelectDeck.setVisibility(View.INVISIBLE);
         btnStartBotDuel.setEnabled(false);
         btnStartBotDuel.setTextColor(YGOUtil.c(R.color.grayDark2));
-        spinnerRule.setVisibility(View.VISIBLE);
+        layoutBotRule.setVisibility(View.VISIBLE);
+        layoutBotDuelMode.setVisibility(View.VISIBLE);
         chkAiOnlyScissors.setVisibility(View.VISIBLE);
         chkNoCheckDeck.setVisibility(View.VISIBLE);
         chkNoShuffleDeck.setVisibility(View.VISIBLE);
+        // 开局参数只服务人机建主，残局页整块隐藏
+        layoutBotStartLp.setVisibility(View.VISIBLE);
+        layoutBotHandDraw.setVisibility(View.VISIBLE);
         // 初始即人机模式（首个 tab）：残局专属"不洗切时回卡顶"复选框直接隐藏，
         // 无需等到切到残局再切回人机才触发隐藏逻辑
         chkReturnToTop.setVisibility(View.GONE);
@@ -196,20 +321,66 @@ public class SingleModeDialog {
         layoutBotPuzzle.setVisibility(View.VISIBLE);
         layoutSolo.setVisibility(View.GONE);
 
-        loadLastDeckInfo(btnSelectDeck);
+        loadLastDeckInfo();
 
         btnSelectDeck.setOnClickListener(v -> {
+            // 需要卡组的席位（按席位顺序）：单选赛型至多 1 席；TAG 下 P2 可能补位占 2~3 席
+            final List<Integer> slots = deckSeatSlots(selectedPosition[0]);
+            if (slots.isEmpty()) {
+                return;
+            }
             DeckSelectorDialog deckDialog = new DeckSelectorDialog(context);
             deckDialog.setDisableOperationButtons(true);
+            if (tagListMode) {
+                // TAG（含 P2 只占 1 席的情形）：对话框逐席选择，分类/卡组条目尾部标出席位号；
+                // 单局/比赛为普通单选，不加任何席位标记
+                String[] marks = new String[slots.size()];
+                String[] paths = new String[slots.size()];
+                String[] names = new String[slots.size()];
+                String[] categories = new String[slots.size()];
+                for (int i = 0; i < slots.size(); i++) {
+                    int slot = slots.get(i);
+                    marks[i] = BOT_SEAT_MARKS[slot];
+                    paths[i] = botSeatDeckPaths[slot];
+                    names[i] = botSeatDeckNames[slot];
+                    categories[i] = botSeatDeckCategories[slot];
+                }
+                deckDialog.setSeatSelection(marks, paths, names, categories);
+            }
             deckDialog.setOnDeckSelectedListener(new DeckSelectorDialog.OnDeckSelectedListener() {
 
                 @Override
                 public void onDeckSelected(String deckPath, String deckName, String categoryName) {
+                    // 单选：只服务首个（也唯一的）席位
+                    int slot = slots.get(0);
+                    botSeatDeckPaths[slot] = deckPath;
+                    botSeatDeckNames[slot] = deckName;
+                    botSeatDeckCategories[slot] = categoryName;
                     selectedDeckPath = deckPath;
                     selectedDeckName = deckName;
                     selectedDeckCategory = categoryName;
                     AppsSettings.get().setLastDeckPath(deckPath);
-                    updateDeckButtonText(btnSelectDeck);
+                    updateBotDeckButton(selectedPosition[0]);
+                }
+
+                @Override
+                public void onSeatDecksSelected(List<String> deckPaths, List<String> deckNames,
+                                                List<String> categoryNames) {
+                    // 多席位：三个列表按下标对应 slots 顺序
+                    for (int i = 0; i < slots.size() && i < deckPaths.size(); i++) {
+                        int slot = slots.get(i);
+                        botSeatDeckPaths[slot] = deckPaths.get(i) != null ? deckPaths.get(i) : "";
+                        botSeatDeckNames[slot] = i < deckNames.size() && deckNames.get(i) != null ? deckNames.get(i) : "";
+                        botSeatDeckCategories[slot] = i < categoryNames.size() && categoryNames.get(i) != null ? categoryNames.get(i) : "";
+                    }
+                    // 首个席位的卡组作为下次打开时的预填基准
+                    if (!deckPaths.isEmpty() && deckPaths.get(0) != null && !deckPaths.get(0).isEmpty()) {
+                        selectedDeckPath = deckPaths.get(0);
+                        selectedDeckName = deckNames.isEmpty() || deckNames.get(0) == null ? "" : deckNames.get(0);
+                        selectedDeckCategory = categoryNames.isEmpty() || categoryNames.get(0) == null ? "" : categoryNames.get(0);
+                        AppsSettings.get().setLastDeckPath(selectedDeckPath);
+                    }
+                    updateBotDeckButton(selectedPosition[0]);
                 }
 
                 @Override
@@ -220,18 +391,43 @@ public class SingleModeDialog {
         });
 
         lvBotList.setOnItemClickListener((parent, view, position, id) -> {
-            selectedPosition[0] = position;
-            btnStartBotDuel.setEnabled(true);
-            btnStartBotDuel.setTextColor(YGOUtil.c(R.color.white));
             if (currentMode[0] == 0) {
-                botAdapter.setSelectedPosition(position);
-                puzzleAdapter.setSelectedPosition(-1);
-                if (position >= 0 && position < botList.size()) {
-                    BotUtil.BotInfo bot = botList.get(position);
-                    tvBotDesc.setText(bot.description != null ? bot.description : "");
-                    btnSelectDeck.setVisibility(bot.supportsDeckSelection ? View.VISIBLE : View.INVISIBLE);
+                // 列表按收藏重排过：显示位置需换算回 botList 原始下标，选择状态一律记原始下标；
+                // 适配器的高亮位置仍用显示位置
+                int botIndex = botIndexOf(position);
+                if (botIndex < 0) return;
+                if (tagListMode) {
+                    // TAG 复选：点已选项即取消；已选满 3 个时先提示取消方式，不接受新选择
+                    if (botSelectionOrder.contains(botIndex)) {
+                        botSelectionOrder.remove((Integer) botIndex);
+                        botAdapter.setItemSelected(position, false);
+                    } else if (botSelectionOrder.size() >= TAG_BOT_SEATS) {
+                        Toast.makeText(context, R.string.bot_tag_max_select, Toast.LENGTH_SHORT).show();
+                        return;
+                    } else {
+                        botSelectionOrder.add(botIndex);
+                        botAdapter.setItemSelected(position, true);
+                    }
+                    // 单选高亮与复选背景互斥：TAG 下只走复选背景，席位号取首个已选项供描述区显示
+                    botAdapter.setSelectedPosition(-1);
+                    puzzleAdapter.setSelectedPosition(-1);
+                    selectedPosition[0] = botSelectionOrder.isEmpty() ? -1 : botSelectionOrder.get(0);
+                } else {
+                    selectedPosition[0] = botIndex;
+                    botAdapter.setSelectedPosition(position);
+                    puzzleAdapter.setSelectedPosition(-1);
                 }
+                if (selectedPosition[0] >= 0 && selectedPosition[0] < botList.size()) {
+                    BotUtil.BotInfo bot = botList.get(selectedPosition[0]);
+                    tvBotDesc.setText(bot.description != null ? bot.description : "");
+                }
+                // 选择结构变化（单选换人/复选增减）后按当前席位重新基线填充逐席卡组
+                seedBotSeatDecks(selectedPosition[0]);
+                refreshBotListDisplay(selectedPosition[0]);
             } else {
+                selectedPosition[0] = position;
+                btnStartBotDuel.setEnabled(true);
+                btnStartBotDuel.setTextColor(YGOUtil.c(R.color.white));
                 puzzleAdapter.setSelectedPosition(position);
                 botAdapter.setSelectedPosition(-1);
                 if (position >= 0 && position < puzzleList.size()) {
@@ -263,13 +459,18 @@ public class SingleModeDialog {
                     tvBotDesc.setText(mStringManager.getSystemString(1382, "请选择一个AI查看信息"));
                     // 人机页：信息标题用 1382 人机信息：
                     if (tvBotInfoHeader != null) tvBotInfoHeader.setText(mStringManager.getSystemString(1382, "人机信息："));
-                    btnSelectDeck.setVisibility(View.INVISIBLE);
                     btnStartBotDuel.setEnabled(false);
                     btnStartBotDuel.setTextColor(YGOUtil.c(R.color.grayDark2));
-                    spinnerRule.setVisibility(View.VISIBLE);
+                    layoutBotRule.setVisibility(View.VISIBLE);
+                    layoutBotDuelMode.setVisibility(View.VISIBLE);
                     chkAiOnlyScissors.setVisibility(View.VISIBLE);
                     chkNoCheckDeck.setVisibility(View.VISIBLE);
                     chkNoShuffleDeck.setVisibility(View.VISIBLE);
+                    // 人机页显示开局参数（行3 的决斗模式随本行一同显示）
+                    layoutBotStartLp.setVisibility(View.VISIBLE);
+                    layoutBotHandDraw.setVisibility(View.VISIBLE);
+                    // 切回人机页按当前赛制重设列表选择方式（保留当前单选态，无选中时即清空）
+                    selectedPosition[0] = applyBotListSelectMode(isTagDuelMode(spinnerBotDuelMode), selectedPosition[0]);
                     // 残局专属选项在人机模式隐藏
                     chkReturnToTop.setVisibility(View.GONE);
                 } else {
@@ -279,15 +480,22 @@ public class SingleModeDialog {
                     tvBotDesc.setText("选择一个残局开始挑战。");
                     // 残局页：信息标题改用 1352 主要信息（对齐 game.cpp tabSingle 的 GetSysString(1352)）
                     if (tvBotInfoHeader != null) tvBotInfoHeader.setText(mStringManager.getSystemString(1352, "主要信息："));
-                    btnSelectDeck.setVisibility(View.INVISIBLE);
+                    // 残局页：P2 卡组单元与开局参数一并隐藏
                     btnStartBotDuel.setEnabled(false);
                     btnStartBotDuel.setTextColor(YGOUtil.c(R.color.grayDark2));
-                    // 残局模式：规则下拉与"回卡顶"复选框同行，下拉直接隐藏（GONE）让复选框占满整行，
+                    // 残局模式：行3 的决斗模式与规则整块隐藏（GONE）让“回卡顶”复选框占满整行，
                     // 避免半行留白并保证较长文本完整显示
-                    spinnerRule.setVisibility(View.GONE);
+                    layoutBotRule.setVisibility(View.GONE);
+                    layoutBotDuelMode.setVisibility(View.GONE);
                     chkAiOnlyScissors.setVisibility(View.GONE);
                     chkNoCheckDeck.setVisibility(View.GONE);
                     chkNoShuffleDeck.setVisibility(View.GONE);
+                    // 残局不经局域网建房，开局参数（基本分/卡组）隐藏；
+                    // 行2（手卡/抽卡）用 INVISIBLE 而非 GONE：保留该行权重占位，
+                    // 使行4 的确定/退出按钮与人机模式同高同位（三种模式按钮位置一致）
+                    layoutBotStartLp.setVisibility(View.GONE);
+                    layoutBotHandDraw.setVisibility(View.INVISIBLE);
+                    layoutBotP2Deck.setVisibility(View.GONE);
                     chkReturnToTop.setVisibility(View.VISIBLE);
                 }
             }
@@ -332,7 +540,7 @@ public class SingleModeDialog {
         popupWindow.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         popupWindow.setOutsideTouchable(false);
         // 纯单人页含初始LP/起手/抽卡三个可编辑 EditText：PopupWindow 必须 focusable=true
-        // 才能拿到输入焦点并唤起输入法（对齐同带输入框的 AnnounceCardDialog/ReplaySaveDialog；
+        // 才能拿到输入焦点并唤起输入法（对齐同带输入框的 AnnounceCardDialog/EditTextDialog；
         // focusable=false 时窗口不接收按键，点 EditText 无法弹出输入法、无法修改文本）
         popupWindow.setFocusable(true);
         popupWindow.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
@@ -352,29 +560,50 @@ public class SingleModeDialog {
 
         btnStartBotDuel.setOnClickListener(v -> {
             if (currentMode[0] == 0) {
-                if (selectedPosition[0] >= botList.size()) {
+                if (!tagListMode && selectedPosition[0] >= botList.size()) {
+                    // TAG 走复选集判定（下方按已选列表循环补位），此处只管单选赛型的未选择拦截
                     Toast.makeText(context, mStringManager.getSystemString(1421, "无效的AI选择"), Toast.LENGTH_SHORT).show();
                     return;
                 }
 
-                BotUtil.BotInfo selectedBot = botList.get(selectedPosition[0]);
-                String botCommand = selectedBot.command;
-                // 参考 menu_handler.cpp BUTTON_BOT_START：勾选后为 WindBot 追加 Hand 参数
-                if (chkAiOnlyScissors.isChecked()) {
-                    botCommand += " Hand=1";
-                }
-                // 仅支持自选卡组(SELECT_DECKFILE)的 AI 才把所选卡组作为 P2 卡组传出，
-                // 其余 AI 使用其在bot.conf 中通过 Deck= 指定的内置卡组。
-                String deckFile = selectedBot.supportsDeckSelection ? selectedDeckPath : "";
                 int duelRule = (int) SimpleSpinnerAdapter.getSelect(spinnerRule);
                 boolean noCheckDeck = chkNoCheckDeck.isChecked();
                 boolean noShuffleDeck = chkNoShuffleDeck.isChecked();
+                // 开局参数：决斗模式选中值即协议 mode；三项数值非法（空/非数字）时回到默认 8000/5/1
+                int duelMode = (int) SimpleSpinnerAdapter.getSelect(spinnerBotDuelMode);
+                int startLP = CreateHostDialog.parseIntSafe(botEtStartLp.getText().toString(), 8000);
+                int startHand = CreateHostDialog.parseIntSafe(botEtStartHand.getText().toString(), 5);
+                int drawCount = CreateHostDialog.parseIntSafe(botEtDrawCount.getText().toString(), 1);
+
+                // 待拉起的人机席位命令与卡组：单局/比赛 1 席，TAG 3 席（复选顺序即席位顺序，
+                // 不足 3 个时按已选顺序循环补位，与列表 ②③④ 标记同口径）
+                boolean aiOnlyScissors = chkAiOnlyScissors.isChecked();
+                List<String> botCommands = new ArrayList<>();
+                List<String> deckFiles = new ArrayList<>();
+                if (duelMode == YGOProtocol.MODE_TAG) {
+                    if (botSelectionOrder.isEmpty()) {
+                        Toast.makeText(context, mStringManager.getSystemString(1421, "无效的AI选择"), Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    int selected = botSelectionOrder.size();
+                    for (int k = 0; k < TAG_BOT_SEATS; k++) {
+                        appendBotSeat(botList.get(botSelectionOrder.get(k % selected)), aiOnlyScissors, k,
+                                botCommands, deckFiles);
+                    }
+                } else {
+                    if (selectedPosition[0] >= botList.size()) {
+                        Toast.makeText(context, mStringManager.getSystemString(1421, "无效的AI选择"), Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    appendBotSeat(botList.get(selectedPosition[0]), aiOnlyScissors, 0, botCommands, deckFiles);
+                }
 
                 // 人机对战建主：内部跳转关闭本弹窗并抑制 dismiss → restoreMainMenu，
                 // 否则主菜单会在玩家等待界面上层误显示
                 hideForNavigation();
                 if (listener != null) {
-                    listener.onStartBotDuel(botCommand, deckFile, duelRule, noCheckDeck, noShuffleDeck);
+                    listener.onStartBotDuel(botCommands, deckFiles, duelRule, noCheckDeck, noShuffleDeck,
+                            duelMode, startLP, startHand, drawCount);
                 }
             } else {
                 if (selectedPosition[0] >= puzzleList.size()) {
@@ -455,6 +684,243 @@ public class SingleModeDialog {
         if (tv != null) tv.setText(mStringManager.getSystemString(sysIdx, def));
     }
 
+    /** 行3 两个下拉（决斗模式/规则）的统一适配器配置：白字 + 列表背景下拉 + 同一字号 */
+    private SimpleSpinnerAdapter newBotSpinnerAdapter() {
+        SimpleSpinnerAdapter adapter = new SimpleSpinnerAdapter(context);
+        adapter.setColor(Color.WHITE);
+        adapter.setDropDownBackgroundColor(YGOUtil.c(R.color.ygopro_list_background));
+        adapter.setTextSize(10f);
+        return adapter;
+    }
+
+    /** 决斗模式是否为 TAG：决定人机列表进入复选态与初始基本分默认值 */
+    private static boolean isTagDuelMode(Spinner spinnerDuelMode) {
+        return (int) SimpleSpinnerAdapter.getSelect(spinnerDuelMode) == YGOProtocol.MODE_TAG;
+    }
+
+    /** 参考 menu_handler.cpp BUTTON_BOT_START：勾选"AI只出剪刀"时为 WindBot 追加 Hand=1 参数 */
+    private static String botCommandOf(BotUtil.BotInfo bot, boolean aiOnlyScissors) {
+        String command = bot.command != null ? bot.command : "";
+        return aiOnlyScissors ? command + " Hand=1" : command;
+    }
+
+    /** 追加一个待拉起的人机席位：仅支持自选卡组(SELECT_DECKFILE)的 AI 带走该席位所选卡组，其余用 bot.conf 内置卡组 */
+    private void appendBotSeat(BotUtil.BotInfo bot, boolean aiOnlyScissors, int seatSlot,
+                               List<String> botCommands, List<String> deckFiles) {
+        botCommands.add(botCommandOf(bot, aiOnlyScissors));
+        boolean takeDeck = bot.supportsDeckSelection && seatSlot >= 0 && seatSlot < botSeatDeckPaths.length;
+        deckFiles.add(takeDeck ? botSeatDeckPaths[seatSlot] : "");
+    }
+
+    /**
+     * 切换人机列表选择方式（单选 ⇄ TAG 复选），切换时**保留已选条目**：
+     * 进入 TAG 时把当前单选项作为复选首位（即 ② 席位）；离开 TAG 时把原 ② 席位（复选序首位）
+     * 保留为单选，且单选卡组自动改为 ② 席位已选的卡组。
+     *
+     * @param selectedPosition 当前单选位置（botList 原始下标；TAG 复选下传首个已选项或 -1）
+     * @return 切换后应使用的单选位置（botList 原始下标）
+     */
+    private int applyBotListSelectMode(boolean tagMode, int selectedPosition) {
+        tagListMode = tagMode;
+        int keep;
+        if (tagMode) {
+            // 单选 → 复选：已选项占据 ② 席位，其余人机席位按循环补位规则自动填
+            keep = selectedPosition;
+            botSelectionOrder.clear();
+            if (keep >= 0) {
+                botSelectionOrder.add(keep);
+            }
+        } else {
+            // 复选 → 单选：保留 ② 席位，单选卡组同步改为 ② 席位已选的卡组（未选则为空）
+            keep = botSelectionOrder.isEmpty() ? -1 : botSelectionOrder.get(0);
+            botSelectionOrder.clear();
+            selectedDeckPath = botSeatDeckPaths[0];
+            selectedDeckName = botSeatDeckNames[0];
+            selectedDeckCategory = botSeatDeckCategories[0];
+        }
+        // 清一次复选集合再按需开启，避免上一轮复选高亮残留；高亮位置由 refreshBotListDisplay
+        // 按原始下标统一映射（收藏重排后原位置已失效）
+        tagBotAdapter.setMultiSelectMode(false);
+        tagBotAdapter.clearMultiSelection();
+        tagBotAdapter.setMultiSelectMode(tagMode);
+        seedBotSeatDecks(keep);
+        refreshBotListDisplay(keep);
+        return keep;
+    }
+
+    /**
+     * 当前选择下需要卡组的席位槽（0=②、1=③、2=④）：单选赛型只有选中的人机支持自选卡组时
+     * 才需一席；TAG 下 P2 被复选并因补位占多席时，它要落的每个席位各需一份卡组。
+     */
+    private List<Integer> deckSeatSlots(int selectedPosition) {
+        List<Integer> slots = new ArrayList<>();
+        if (tagBotList == null) return slots;
+        if (!tagListMode) {
+            if (selectedPosition >= 0 && selectedPosition < tagBotList.size()
+                    && tagBotList.get(selectedPosition).supportsDeckSelection) {
+                slots.add(0);
+            }
+            return slots;
+        }
+        int n = botSelectionOrder.size();
+        if (n == 0) return slots;
+        for (int k = 0; k < TAG_BOT_SEATS; k++) {
+            int idx = botSelectionOrder.get(k % n);
+            if (idx >= 0 && idx < tagBotList.size() && tagBotList.get(idx).supportsDeckSelection) {
+                slots.add(k);
+            }
+        }
+        return slots;
+    }
+
+    /**
+     * 按当前选择重填逐席卡组：需要卡组的席位用上一次选定/最后使用的卡组作基线，其余席位清空。
+     * 仅在「选择结构发生变化」时调用（选人机条目、切赛制/切页签），避免冲掉玩家刚逐席选好的卡组。
+     */
+    private void seedBotSeatDecks(int selectedPosition) {
+        List<Integer> slots = deckSeatSlots(selectedPosition);
+        for (int k = 0; k < TAG_BOT_SEATS; k++) {
+            boolean need = slots.contains(k);
+            botSeatDeckPaths[k] = need ? selectedDeckPath : "";
+            botSeatDeckNames[k] = need ? selectedDeckName : "";
+            botSeatDeckCategories[k] = need ? selectedDeckCategory : "";
+        }
+    }
+
+    /**
+     * 刷新 P2 卡组单元：没选中支持自选卡组的人机时整块（提示文字 + 按钮）隐藏；
+     * 否则逐席位一行显示（仅 TAG 下带 ②/③/④ 席位号，单局/比赛不加标记），并自适应字号。
+     */
+    private void updateBotDeckButton(int selectedPosition) {
+        if (tagBotDeckCell == null || tagBtnSelectDeck == null) return;
+        List<Integer> slots = deckSeatSlots(selectedPosition);
+        tagBotDeckCell.setVisibility(slots.isEmpty() ? View.GONE : View.VISIBLE);
+        botDeckButtonLines.clear();
+        String uncatName = context.getString(R.string.category_Uncategorized);
+        for (int slot : slots) {
+            String name = botSeatDeckNames[slot];
+            String text;
+            if (name == null || name.isEmpty()) {
+                text = mStringManager.getSystemString(1254, "选择卡组");
+            } else {
+                String category = botSeatDeckCategories[slot];
+                text = (category != null && !category.isEmpty() && !category.equals(uncatName))
+                        ? category + "/" + name : name;
+            }
+            botDeckButtonLines.add((tagListMode ? BOT_SEAT_MARKS[slot] + " " : "") + text);
+        }
+        tagBtnSelectDeck.setText(TextUtils.join("\n", botDeckButtonLines));
+        tagBtnSelectDeck.setSingleLine(false);
+        fitBotDeckButtonTextSize();
+    }
+
+    /**
+     * 按按钮实际宽高把逐席位文本缩到能完整显示（不再截断）：行宽与总行高两方向取更严的那个缩放，
+     * 字号限制在 [BOT_DECK_TEXT_MIN_SP, BOT_DECK_TEXT_MAX_SP]；布局未完成时先按最大字号，等布局回调再适配。
+     */
+    private void fitBotDeckButtonTextSize() {
+        if (tagBtnSelectDeck == null) return;
+        int availW = tagBtnSelectDeck.getWidth()
+                - tagBtnSelectDeck.getPaddingLeft() - tagBtnSelectDeck.getPaddingRight();
+        int availH = tagBtnSelectDeck.getHeight()
+                - tagBtnSelectDeck.getPaddingTop() - tagBtnSelectDeck.getPaddingBottom();
+        int lines = botDeckButtonLines.size();
+        if (availW <= 0 || availH <= 0 || lines == 0) {
+            tagBtnSelectDeck.setTextSize(TypedValue.COMPLEX_UNIT_SP, BOT_DECK_TEXT_MAX_SP);
+            return;
+        }
+        TextPaint paint = tagBtnSelectDeck.getPaint();
+        paint.setTextSize(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP,
+                BOT_DECK_TEXT_MAX_SP, context.getResources().getDisplayMetrics()));
+        float maxLineWidth = 0f;
+        for (String line : botDeckButtonLines) {
+            maxLineWidth = Math.max(maxLineWidth, paint.measureText(line));
+        }
+        float lineHeight = paint.getFontMetrics().bottom - paint.getFontMetrics().top;
+        float byWidth = maxLineWidth <= 0f ? 1f : availW / maxLineWidth;
+        float byHeight = availH / (lineHeight * lines);
+        float scale = Math.min(1f, Math.min(byWidth, byHeight));
+        float sizeSp = Math.max(BOT_DECK_TEXT_MIN_SP, BOT_DECK_TEXT_MAX_SP * scale);
+        tagBtnSelectDeck.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
+    }
+
+    /**
+     * 刷新人机列表与按钮态：先按收藏重排（收藏项置顶，取消后回原位）；TAG 下选中项末尾右对齐
+     * 显示 ②③④ 席位标记（不足 3 席按已选顺序循环补位，故只选 1 个时它同时带 ②③④）；
+     * P2 卡组单元仅当选中支持自选卡组的人机时整块（提示文字 + 按钮）显示；
+     * 确定按钮按“TAG 已选 1~3 个 / 其余赛型已单选 1 个”点亮。
+     */
+    private void refreshBotListDisplay(int selectedPosition) {
+        selectedBotIndex = selectedPosition;
+        // 收藏重排：收藏项按原相对顺序置前，其余保持 bot.conf 原顺序（取消收藏即回到原位置）
+        rebuildBotDisplayOrder();
+        int selected = botSelectionOrder.size();
+        int count = botDisplayIndices.size();
+        // 条目文本按显示顺序排列；席位标记仍按原始下标计算再落到对应显示位置（单选赛型下全为空串）
+        List<String> names = new ArrayList<>(count);
+        List<String> marks = new ArrayList<>(count);
+        for (int botIndex : botDisplayIndices) {
+            names.add(tagBotBaseNames.get(botIndex));
+            marks.add(tagListMode ? botSeatMarks(botIndex, selected) : "");
+        }
+        // 单选位置与复选集合均记原始下标，重排后需换算成新的显示位置
+        List<Integer> selectedPositions = new ArrayList<>(selected);
+        if (tagListMode) {
+            for (int botIndex : botSelectionOrder) {
+                int display = botDisplayPositionOf(botIndex);
+                if (display >= 0) selectedPositions.add(display);
+            }
+        }
+        tagBotAdapter.setDisplayState(names, marks,
+                tagListMode ? -1 : botDisplayPositionOf(selectedPosition), selectedPositions);
+
+        // P2 卡组单元：与所选人机是否支持自选卡组联动，并逐席位刷新按钮文字
+        updateBotDeckButton(selectedPosition);
+
+        boolean canStart = tagListMode ? selected > 0 : selectedPosition >= 0;
+        tagBtnStart.setEnabled(canStart);
+        tagBtnStart.setTextColor(YGOUtil.c(canStart ? R.color.white : R.color.grayDark2));
+    }
+
+    /** 该 AI 因复选顺序将占据的人机席位号标记（P2→②、P3→③、P4→④），未被选中返回空串 */
+    private String botSeatMarks(int listIndex, int selectionSize) {
+        if (selectionSize <= 0 || !botSelectionOrder.contains(listIndex)) return "";
+        StringBuilder marks = new StringBuilder();
+        for (int k = 0; k < TAG_BOT_SEATS; k++) {
+            if (botSelectionOrder.get(k % selectionSize) == listIndex) {
+                marks.append(BOT_SEAT_MARKS[k]);
+            }
+        }
+        return marks.toString();
+    }
+
+    /**
+     * 按收藏状态重建人机列表显示顺序：收藏项按原相对顺序置前，其余保持原顺序；
+     * 取消收藏后条目自然回到它在 bot.conf 中的原本位置。
+     */
+    private void rebuildBotDisplayOrder() {
+        botDisplayIndices.clear();
+        if (tagBotBaseNames == null) return;
+        Set<String> favorites = SharedPreferenceUtil.getFavoriteBotNames();
+        for (int i = 0; i < tagBotBaseNames.size(); i++) {
+            if (favorites.contains(tagBotBaseNames.get(i))) botDisplayIndices.add(i);
+        }
+        for (int i = 0; i < tagBotBaseNames.size(); i++) {
+            if (!favorites.contains(tagBotBaseNames.get(i))) botDisplayIndices.add(i);
+        }
+    }
+
+    /** 列表显示位置 → botList 原始下标（越界返回 -1） */
+    private int botIndexOf(int displayPosition) {
+        return displayPosition >= 0 && displayPosition < botDisplayIndices.size()
+                ? botDisplayIndices.get(displayPosition) : -1;
+    }
+
+    /** botList 原始下标 → 列表显示位置（收藏重排后位置会变；-1 或不存在返回 -1） */
+    private int botDisplayPositionOf(int botIndex) {
+        return botIndex < 0 ? -1 : botDisplayIndices.indexOf(botIndex);
+    }
+
     /** 半宽三页签专用页签视图：显式应用 styles.xml 的 bot_duel_tab_layout 文字外观
      * （字号/加粗/非全大写均由该样式决定），颜色仍随选中态切换白/grayDark2 */
     private TextView makeTabView(CharSequence label) {
@@ -470,26 +936,11 @@ public class SingleModeDialog {
         return tv;
     }
 
-    private void loadLastDeckInfo(Button btnSelectDeck) {
+    private void loadLastDeckInfo() {
         AppsSettings settings = AppsSettings.get();
         selectedDeckCategory = settings.getLastCategory();
         selectedDeckName = settings.getLastDeckName();
         selectedDeckPath = settings.getLastDeckPath();
-        updateDeckButtonText(btnSelectDeck);
-    }
-
-    private void updateDeckButtonText(Button btnSelectDeck) {
-        if (selectedDeckName != null && !selectedDeckName.isEmpty()) {
-            String uncatName = context.getString(R.string.category_Uncategorized);
-            if (selectedDeckCategory != null && !selectedDeckCategory.isEmpty()
-                    && !selectedDeckCategory.equals(uncatName)) {
-                btnSelectDeck.setText(selectedDeckCategory + "/" + selectedDeckName);
-            } else {
-                btnSelectDeck.setText(selectedDeckName);
-            }
-        } else {
-            btnSelectDeck.setText(mStringManager.getSystemString(1254, "选择卡组"));
-        }
     }
 
     public void dismiss() {
@@ -514,6 +965,11 @@ public class SingleModeDialog {
     /** 重新显示此前隐藏的对话框：不重新 inflate/不重读 bot、残局列表，回到关闭前选择状态 */
     public void reshow(View anchorView) {
         if (popupWindow == null || draggableHelper == null || popupWindow.isShowing()) return;
+        // 收藏记录可能在关闭期间由其他入口（如 /ai 呼叫弹窗）变更：停在人机页时重排一次，
+        // 保证每次显示收藏项都置顶；残局页不动，避免误把 P2 卡组单元重新显示出来
+        if (tagBotListView != null && tagBotListView.getAdapter() == tagBotAdapter) {
+            refreshBotListDisplay(selectedBotIndex);
+        }
         draggableHelper.showPopup(popupWindow, anchorView);
     }
 
@@ -552,22 +1008,37 @@ public class SingleModeDialog {
 
         SingleModeDialog dialog = new SingleModeDialog(activity, new SingleModeDialog.OnSingleModeListener() {
             @Override
-            public void onStartBotDuel(String botCommand, String deckFile,
-                                       int duelRule, boolean noCheckDeck, boolean noShuffleDeck) {
+            public void onStartBotDuel(List<String> botCommands, List<String> deckFiles,
+                                       int duelRule, boolean noCheckDeck, boolean noShuffleDeck,
+                                       int duelMode, int startLP, int startHand, int drawCount) {
                 GameEngine engine = activity.getEngine();
                 engine.setBotMode(true);
                 engine.setPlayerName(Constants.PlayerName);
-                // 1. 建立局域网主机：参数对齐 duelclient.cpp 中 bot_mode 的 CTOS_CreateGame
-                //    rule=5(放开卡池) mode=0(单局) lflist=0 LP=8000 起手=5 抽卡=1 无时限；
-                //    duel_rule / no_check_deck / no_shuffle_deck 取自人机对战面板设置
-                engine.startLocalServerWithSettings(0, 5, 0, duelRule,
+                // 1. 建立局域网主机：参数对齐 duelclient.cpp 中 bot_mode 的 CTOS_CreateGame，
+                //    lflist=0（无禁限）/ rule=5(放开卡池) / 时限固定 0（人机页不提供回合时间）；
+                //    duel_rule / no_check_deck / no_shuffle_deck / mode / LP / 起手 / 抽卡 均取自人机页面板
+                engine.startLocalServerWithSettings(0, 5, duelMode, duelRule,
                         noCheckDeck, noShuffleDeck,
-                        8000, 5, 1, 0,
+                        startLP, startHand, drawCount, 0,
                         "Bot Game", "");
+                // 房主建主时已掌握全部房间设置：预写入引擎缓存并置 hasJoinRoomInfoCache，
+                // 使等待界面就绪即刷新房间信息，并据 duelMode 打开 TAG 的 4 席位 UI
+                engine.gameLflist = 0;
+                engine.gameRule = 5;
+                engine.gameMode = duelMode;
+                engine.field.dInfo.duelRule = duelRule;
+                engine.gameNoCheckDeck = noCheckDeck ? 1 : 0;
+                engine.gameNoShuffleDeck = noShuffleDeck ? 1 : 0;
+                engine.gameStartLp = startLP;
+                engine.gameStartHand = startHand;
+                engine.gameDrawCount = drawCount;
+                engine.gameTimeLimit = 0;
+                engine.hasJoinRoomInfoCache = true;
                 // 2. 切换进入 LAN 界面的 player waiting 页面（作为主机）
                 PlayerWaitingDialog.showPlayerWaitingForBotHost(activity);
-                // 3. 启动 WindBot 连接本地主机并加入；deckFile 为 P2 指定卡组
-                engine.launchWindBot("127.0.0.1", 7911, botCommand, deckFile);
+                // 3. 启动 WindBot 连接本地主机并依次入座；两个列表按下标一一对应，
+                //    单局/比赛 1 个、TAG 3 个（队友席 + 对手两席）
+                engine.launchWindBot("127.0.0.1", 7911, botCommands, deckFiles);
             }
 
             @Override

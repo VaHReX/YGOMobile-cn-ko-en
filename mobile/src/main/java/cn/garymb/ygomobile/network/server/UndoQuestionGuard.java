@@ -26,9 +26,9 @@ final class UndoQuestionGuard implements YGOProtocol {
 
     /**
      * 撤回成功后把回退后的局面一次性推给全体（对齐“全量重载场地位”语义）：
-     * ① MSG_RELOAD_FIELD 广播双方与观战；② Mzone/Szone/Hand/Grave/Extra 各自 refresh，沿用既有
-     * 遮蔽语义（Mzone 用 {@link DuelAnalyzer#RESYNC_MZONE_FLAG} 额外携素材卡码；Extra 走双视角，
-     * 因为 reload 不写姿态与卡码，堆顶表侧卡的身份与朝向只能靠这次刷新送到对手与观战侧）；
+     * ① MSG_RELOAD_FIELD 广播双方与观战；② Mzone/Szone/Hand/Grave/Removed/Extra 各自 refresh，沿用既有
+     * 遮蔽语义（Mzone 用 {@link DuelAnalyzer#RESYNC_MZONE_FLAG} 额外携素材卡码；Extra 与 Removed 走双视角，
+     * 因为 reload 不写它们的姿态与卡码，堆顶表侧卡与表侧除外卡的身份、朝向只能靠这次刷新送到双方与观战侧）；
      * ③ 引擎处于卡组翻转态（天变地异）时补发 MSG_REVERSE_DECK + 双方 MSG_DECK_TOP，
      * 使正面朝上的卡组在回退后仍是正面朝上且顶卡可见卡图；④ 复位两席位
      * 状态并记下待重挂询问席位（{@link DuelAnalyzer#undoAskResponder}），询问由
@@ -38,6 +38,14 @@ final class UndoQuestionGuard implements YGOProtocol {
      */
     void resyncAfterUndo(byte[] reloadField) {
         analyzer.recordSuppressed = true;
+        // 整批 reload/refresh 对整局重放席位跳过（两个出站口共用这一个闸门，见 DuelViewBroadcaster#emit/sendToPlayer）
+        analyzer.undoResyncBurst = true;
+        for (ServerConnection sink : analyzer.undoReplaySinks) {
+            if (sink != null) {
+                Log.i(TAG, "undo 重同步：席位 " + sink.type
+                        + " 已靠整局重放回到回退点，reload/refresh 批不再发给它");
+            }
+        }
         try {
             analyzer.broadcastMsg(reloadField);
             // 素材卡码只可能来自这次 Mzone 刷新（reload 载荷不含），故此处用带 QUERY_OVERLAY_CARD
@@ -50,6 +58,10 @@ final class UndoQuestionGuard implements YGOProtocol {
             analyzer.refreshHand(1, DuelAnalyzer.REFRESH_HAND_FLAG, 0);
             analyzer.refreshGrave(0, DuelAnalyzer.REFRESH_GRAVE_FLAG, 0);
             analyzer.refreshGrave(1, DuelAnalyzer.REFRESH_GRAVE_FLAG, 0);
+            // 除外区必须一并刷：reload 只给张数、实况链路又从不为它发区域刷新，漏刷则撤回后
+            // 整个除外区停在无卡码无姿态的占位卡上，我方表侧除外的卡被画成卡背且点不出详情
+            analyzer.refreshRemovedResync(0, DuelAnalyzer.REFRESH_REMOVED_FLAG, 0);
+            analyzer.refreshRemovedResync(1, DuelAnalyzer.REFRESH_REMOVED_FLAG, 0);
             analyzer.refreshExtraResync(0, DuelAnalyzer.REFRESH_EXTRA_FLAG, 0);
             analyzer.refreshExtraResync(1, DuelAnalyzer.REFRESH_EXTRA_FLAG, 0);
             // 卡组翻面（天变地异）状态回退补齐：query_field_info 的 reload 载荷不携 core.deck_reversed，
@@ -69,10 +81,8 @@ final class UndoQuestionGuard implements YGOProtocol {
             }
             int responder = analyzer.room.lastResponse;
             byte[] terminal = analyzer.silentTerminal;
-            if (terminal == null || analyzer.room.players[responder] == null) {
-                return;
-            }
-            // 状态门复位：撤回可能把待应答席位从 A 转移到 B，A 的连接状态残留在 CTOS_RESPONSE/
+            // 状态门复位无条件先做（旧实现把它排在重挂可行性判定之后，一旦早退就连复位一起跳过）：
+            // 撤回可能把待应答席位从 A 转移到 B，A 的连接状态残留在 CTOS_RESPONSE/
             // CTOS_TIME_CONFIRM，其后的迟到应答能通过状态门被 getResponse 以 responder=dp.type 当作
             // B 的应答喂给引擎（轻则非法应答引发 MSG_RETRY 风暴，重则旧列表里的合法指令直接作用于
             // 新局面）。C++ WaitforResponse 无需处理，此复位是本工程撤回路径特有的补齐。
@@ -81,10 +91,26 @@ final class UndoQuestionGuard implements YGOProtocol {
                     pl.state = ServerConnection.STATE_NONE;
                 }
             }
+            if (terminal == null || responder < 0 || responder > 1
+                    || analyzer.room.duelPlayer(responder) == null) {
+                // 重挂落空不再静默 return：把这条询问的字节与当代次留在 liveQuestion 槽（静默重放
+                // 不写该槽，beginSilentReplay 又把它清空，否则 hasLiveAsk 恒假），使客户端
+                // CTOS_ASK_RESEND 与被吞应答的自愈入口（两者只读 liveQuestion）后续仍能把它补挂出去，
+                // 不至于两席位从此互等（症状：点卡弹不出发动/召唤/盖放菜单而墓地/除外照旧可看）
+                if (terminal != null) {
+                    analyzer.liveQuestion = terminal;
+                    analyzer.liveQuestionGeneration = analyzer.askGeneration;
+                }
+                Log.e(TAG, "undo resync: cannot re-hang question now, terminal="
+                        + (terminal == null ? "null" : String.valueOf(terminal[0] & 0xFF))
+                        + " responder=" + responder + ", left to ask-resend/self-heal");
+                return;
+            }
             // 询问不在此刻挂回，只记下席位交 hangUndoTerminalQuestion() 延后执行：状态复位到询问
             // 挂出之间留出一个往返窗口，被丢弃那一段里已在路上的应答全部落进 STATE_NONE 而被状态门丢弃
             analyzer.undoAskResponder = responder;
         } finally {
+            analyzer.undoResyncBurst = false;
             analyzer.recordSuppressed = false;
         }
     }
@@ -124,11 +150,17 @@ final class UndoQuestionGuard implements YGOProtocol {
     void hangUndoTerminalQuestion() {
         int responder = analyzer.undoAskResponder;
         analyzer.undoAskResponder = -1;
-        if (responder < 0 || responder >= analyzer.room.players.length) {
+        if (responder < 0 || responder > 1) {
             return;
         }
-        byte[] terminal = analyzer.silentTerminal;
-        ServerConnection dp = analyzer.room.players[responder];
+        // 捕获槽为空时退回 liveQuestion 兜底（重挂落空时留在该槽里的那条），但必须经
+        // hasLiveAsk() 代次配对把关（评审 Minor，与 rehangPendingQuestion/
+        // canRedeliverQuestion 同一闸门）：无把关时可能拿上一代次的旧题挂给新席位，
+        // 把回退前那段已被丢弃的询问错挂出去；代次不配则视同无兜底，宁等下一次自愈
+        byte[] terminal = analyzer.silentTerminal != null ? analyzer.silentTerminal
+                : (hasLiveAsk() ? analyzer.liveQuestion : null);
+        // responder 是引擎侧 player（TAG 即队伍）：经 duelPlayer 解为此刻应答复务的席位
+        ServerConnection dp = analyzer.room.duelPlayer(responder);
         if (terminal == null || dp == null) {
             return;
         }
@@ -178,10 +210,10 @@ final class UndoQuestionGuard implements YGOProtocol {
             return false;
         }
         int seat = analyzer.room.lastResponse;
-        if (seat < 0 || seat >= analyzer.room.players.length) {
+        if (seat < 0 || seat > 1) {
             return false;
         }
-        ServerConnection dp = analyzer.room.players[seat];
+        ServerConnection dp = analyzer.room.duelPlayer(seat);
         if (dp == null) {
             return false;
         }
@@ -201,10 +233,10 @@ final class UndoQuestionGuard implements YGOProtocol {
             return false;
         }
         int seat = analyzer.room.lastResponse;
-        if (seat < 0 || seat >= analyzer.room.players.length) {
+        if (seat < 0 || seat > 1) {
             return false;
         }
-        ServerConnection dp = analyzer.room.players[seat];
+        ServerConnection dp = analyzer.room.duelPlayer(seat);
         if (dp == null) {
             return false;
         }
@@ -297,6 +329,8 @@ final class UndoQuestionGuard implements YGOProtocol {
         analyzer.silentTurnCount = 0;
         analyzer.silentTurnPlayer = 0;
         analyzer.silentPhase = 0;
+        // 发动账本同步计数复位：重放前缀里有几条有效发动，撤回后客户端账本就该保留几条
+        analyzer.silentChainEvents = 0;
         analyzer.silent = true;
     }
 

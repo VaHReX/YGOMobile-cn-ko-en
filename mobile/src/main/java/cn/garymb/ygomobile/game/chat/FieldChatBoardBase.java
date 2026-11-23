@@ -40,12 +40,15 @@ abstract class FieldChatBoardBase {
 
     protected final GameFieldController ctl;
 
-    /** 每侧玩家聊天最大行数：超过 5 行向上滚动（清除第一条，最新一条落在最下行） */
-    protected static final int MAX_CHAT_LINES = 5;
+    /** 每侧玩家聊天最大行数：超过 3 行向上滚动（清除第一条，最新一条落在最下行）。
+     *  对齐 drawing.cpp DrawChatMsg L1551：决斗中玩家消息只取 chatMsg[0..2] 三个槽位
+     * （{@code if (i >= 3) continue;}），旧实现取 5 行明显多于桌面版 */
+    protected static final int MAX_CHAT_LINES = 3;
 
     /** 每侧聊天行数大于此值时，最早一条的在屏存活时长按 2 倍速消耗（提前一半即消失，
-     *  用户规格：刷屏时最早那条记录消失速度加快为现在的 2 倍） */
-    protected static final int CHAT_ACCELERATE_LINE_COUNT = 3;
+     *  用户规格：刷屏时最早那条记录消失速度加快为现在的 2 倍）。上限收到 3 行后本阈值
+     *  随之从 3 降到 2：否则 {@code size() > 3} 永不成立，刷屏加速规则在满屏时彻底失效 */
+    protected static final int CHAT_ACCELERATE_LINE_COUNT = 2;
 
     /**
      * 单条玩家聊天在屏存活时长（毫秒），超时后从最早一行开始自动清除——对齐
@@ -339,21 +342,24 @@ abstract class FieldChatBoardBase {
         return removed;
     }
     /** 构造一条血条下方聊天行 TextView（昵称前缀已由调用方拼好入 line）：9sp 白字 + 半透明黑底，
-     *  规格对齐 drawing.cpp chatColor[0..3] 玩家消息白色 / draw2DRectangle 0xa0000000 */
+     *  规格对齐 drawing.cpp chatColor[0..3] 玩家消息白色 / draw2DRectangle 0xa0000000。
+     *  <p>单行文本最多 3 行（旧 2 行会把长句截早），宽度取 WRAP_CONTENT：C++ 的黑底 rect 宽
+     *  = 文本宽 + 2（L1573/L1578），不是整行贯通；MATCH_PARENT 会让黑底一直铺到该侧带宽边缘，
+     *  与桌面版的「文本背景」观感不符（用户反馈）。 */
     protected TextView createChatRowView(TimedLine entry) {
         float density = ctl.activity.getResources().getDisplayMetrics().density;
         TextView tv = new TextView(ctl.activity);
         tv.setText(entry.text);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);   // 与系统弹幕/大厅聊天统一 9sp
         tv.setTextColor(YGOUtil.c(R.color.white));                     // chatColor[0..3] 玩家消息白色
-        tv.setMaxLines(2);
+        tv.setMaxLines(3);
         tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
         tv.setBackgroundColor(CHAT_BG_COLOR);            // 半透明黑底，对齐 drawing.cpp 0xa0000000
         int hPadding = (int) (3 * density);
         tv.setPadding(hPadding, 0, hPadding, 0);
         tv.setShadowLayer(1f, 1f, 1f, YGOUtil.c(R.color.black));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.bottomMargin = (int) (2 * density);
         tv.setLayoutParams(lp);
         return tv;
@@ -385,8 +391,54 @@ abstract class FieldChatBoardBase {
         // lines 已含全部在屏消息（pending 与 lines 同源），全量重挂后清 pending 防重复补挂
         (selfSide ? myChatPending : opChatPending).clear();
     }
+
+    /**
+     * 聊天输入框降回静置位、双方血条回到原处后，把血条下方各带重锚到当前实测血条位置
+     *（用户反馈：抬键盘期间发出的聊天会顶在屏幕顶端显示，输入框降回后位置不回位）。
+     * <p>两步：① 无论有无在屏内容先把实测锚点回灌为静置基准（否则抬高期间第一条记录无基准
+     * 可用，只能退回到被键盘压缩的实测值）；② 仅将真正错位的带重建到当前位置，带顶与实测
+     * 一致时直接跳过，避免每次 HUD/输入框布局变化都整列重建聊天行或重排弹幕带。
+     * 大厅聊天模式下不处理（其列表挂在视图树 layout_danmaku 内，随布局自然回位）。
+     */
+    public void repinFieldBands() {
+        if (lobbyChatMode || ctl.topInfoManager == null) return;
+        SpecEffectOverlay overlay = ctl.activity.getSpecOverlay();
+        if (overlay == null) return;
+        int[] me = ctl.topInfoManager.getLpBarRectInWindow(0);
+        int[] op = ctl.topInfoManager.getLpBarRectInWindow(1);
+        boolean meOk = me != null && me[2] > 0 && me[3] > 0;
+        boolean opOk = op != null && op[2] > 0 && op[3] > 0;
+        if (meOk) {
+            overlay.rememberBandAnchor(SpecEffectOverlay.BAND_SELF_CHAT, me[1] + me[3]);
+            overlay.rememberBandAnchor(SpecEffectOverlay.BAND_DANMAKU, me[1]);
+        }
+        if (opOk) {
+            overlay.rememberBandAnchor(SpecEffectOverlay.BAND_OPP_CHAT, op[1] + op[3]);
+        }
+        if (meOk && !myChatLines.isEmpty()
+                && overlay.getBandTop(SpecEffectOverlay.BAND_SELF_CHAT) != me[1] + me[3]) {
+            // 整列重挂：容器移到新锚点同时保留同一数据源的旧→新行序（旋转回灌同源）
+            relayoutSideChatRows(true, 0);
+        }
+        if (opOk && !opChatLines.isEmpty()
+                && overlay.getBandTop(SpecEffectOverlay.BAND_OPP_CHAT) != op[1] + op[3]) {
+            relayoutSideChatRows(false, 0);
+        }
+        repinDanmakuBand(overlay, me);
+    }
+
+    /** 重锚系统/观战弹幕带（带顶锚我方血条顶边，与 pumpDanmakuGroup 同一口径） */
+    private void repinDanmakuBand(SpecEffectOverlay overlay, int[] bar) {
+        if (danmakuViews.isEmpty() || bar == null || bar[2] <= 0 || bar[3] <= 0) return;
+        if (overlay.getBandTop(SpecEffectOverlay.BAND_DANMAKU) == bar[1]) return;
+        int bandHeight = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP,
+                DANMAKU_ROW_HEIGHT_DP * DANMAKU_MAX_ROWS,
+                ctl.activity.getResources().getDisplayMetrics());
+        // 只重设带的位置与尺寸（只改 topMargin）：在屏弹幕 TextView 的 translationX 与动画不受影响
+        overlay.obtainDanmakuLayer(bandHeight, bar[1]);
+    }
     protected static <T> void swapListContent(LinkedList<T> a, LinkedList<T> b) {
-        java.util.List<T> tmp = new ArrayList<>(a);
+        List<T> tmp = new ArrayList<>(a);
         a.clear();
         a.addAll(b);
         b.clear();

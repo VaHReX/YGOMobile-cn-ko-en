@@ -31,6 +31,7 @@ import cn.garymb.ygomobile.utils.CrashHandler;
 import cn.garymb.ygomobile.utils.DeckUtil;
 import cn.garymb.ygomobile.utils.LogUtil;
 import cn.garymb.ygomobile.utils.ProcessUtils;
+import cn.garymb.ygomobile.utils.TxEndpoint;
 import cn.garymb.ygomobile.utils.glide.GlideCompat;
 
 public class App extends GameApplication {
@@ -55,13 +56,17 @@ public class App extends GameApplication {
             QbSdk.initTbsSettings(map);
         }
         // 决斗引擎预热再提前到进程诞生时刻（已在 CrashHandler.init 之后，挂线程钩子
-        // 可用）：脚本解压∥卡包物化→cdb 加载全部在子线程后台进行，用 Logo/主页/
+        // 可用）：档案直读式 cdb 加载全部在子线程后台进行，用 Logo/主页/
         // 资源检查/导航/建房/猜拳/选先后攻的全部自然耗时覆盖首次引导开销，使
         // ServerDuel#startDuel 开局闸门即时通过、选完直接发牌。仅主进程预热
         //（:game/:dexopt 等子进程不跑内置局域网服务器，无需引擎数据）；
         // ensureEngineReady 同步幂等，与 YGOProActivity 启动预热/建主引导并发时
         // 串行合并互不重复
+        // TX 云固定源站（cdntx.moecube.com / cdn02.moecube.com:444）近期因风控不稳定：打开 app
+        // 时异步查一次可用节点接口，取返回列表的第一个主机用于替换这两类源站（仅主进程、
+        // 进程生命周期内一次，见 TxEndpoint）；查不到或结果未回来就沿用原固定源站，不阻塞任何流程
         if (!ProcessUtils.getCurrentProcessName(this).contains(":")) {
+            TxEndpoint.refreshAsync();
             NativeScriptBootstrap.warmUpAsync("AppEngineWarmUp", "App启动-引擎预热");
         }
     }
@@ -145,6 +150,11 @@ public class App extends GameApplication {
     @Override
     public boolean isLockSreenOrientation() {
         return AppsSettings.get().isLockSreenOrientation();
+    }
+
+    @Override
+    public boolean isLockPortraitOrientation() {
+        return AppsSettings.get().isLockPortraitOrientation();
     }
 
     @Override

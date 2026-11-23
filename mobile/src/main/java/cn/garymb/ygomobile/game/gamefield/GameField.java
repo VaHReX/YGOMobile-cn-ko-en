@@ -3,7 +3,10 @@ import cn.garymb.ygomobile.game.replay.ReplayPosSnap;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.utils.YGOUtil;
@@ -125,6 +128,11 @@ public class GameField {
         public int sequence;
         public boolean solved;
         public boolean needDistinguish;
+        /** 该次发动登记进发动账本时的登记序（MSG_CHAINING 里 record 后的
+         *  {@link EffectActivationLedger#eventCount()} 快照，0=未知）：效果处理阶段适用的
+         *  HINT_ZONE/MSG_FIELD_DISABLED 标注据此落戳，撤回剪除时比较的是「造成者那次发动」
+         *  而非标注消息到达时刻（连锁交错时后链先结算、无关发动后登记会误清保留中的标注） */
+        public int activationOrdinal;
         public List<ClientCard> targets = new ArrayList<>();
         /** 连锁图标（chain 旋转图 / number 序号）位置快照：MSG_CHAINED 时捕捉发动卡 xyz，卡因结算离开原位时图标不跟随，停在原地直到连锁消失。 */
         public boolean iconPosCaptured;
@@ -152,6 +160,14 @@ public class GameField {
     public boolean isTag;
     /** 回放快进重排期间的即时落位模式：移动/淡入淡出/LP/洗牌动画全部直接到位，不产生 aniFrame——动画闸门天然不阻塞，快进队列可单帧排空（GameEngine.drainReplayQueueNow）；投喂线程置位/复位、主线程派发链读取，volatile 防 JIT 提升旧值使落位门控失效 */
     public volatile boolean instantPlace = false;
+    /**
+     * 渲染循环心跳：{@code GameFieldView.onDrawFrame}（GL 线程）每帧调 {@code updateCardAnimation}
+     * 时写入当前时间。卡片 aniFrame 只由这一条链递减，本值为 0 或长时间不更新即说明渲染根本没在跑
+     *（决斗场 UI 被收走 / GL 曲面尚未创建），此时统一动画闸门只会一段一段等满兜底超时，回放表现为
+     * 「只剩决斗背景、场上没有卡片、录像卡住」；投喂侧据此判定是否需要强制瞬时落位（ReplayPacer）。
+     * GL 线程写、投喂/主线程读，volatile 保证跨线程立即可见。
+     */
+    public volatile long animBeatMs;
     /** 回放态遮蔽保护（用户规格：不引擎重跑也要对方手卡正面）：合并的客户端视角录像里，对方手卡的 UPDATE_DATA/UPDATE_CARD 块被服务器中继遮蔽（整块清零或 code=0），而同一张卡的真实卡码已由流内 MSG_DRAW/MSG_MOVE 未遮蔽中继写入卡对象；若再让零块覆盖会把对方手卡永远压成背面。置位时手卡区已有卡码的卡忽略零块（ClientCard 为独立类，故本开关也为 static；仅随回放会话置位/复位，实况遮蔽语义不受影响） */
     public static boolean preserveMaskedHandCode = false;
     public List<ChainInfo> chains = new ArrayList<>();
@@ -168,6 +184,30 @@ public class GameField {
     public long disabledField;
     /** HINT_ZONE 通讯（duelclient.cpp L1529-1572）展开出的被标注魔陷格集，位布局与 disabledField 同构（本地视角：seat0 MZ bits0-6 / SZ bits8-15，seat1 高 16 位）；仅接受无效类效果的 SZ 位来位——无限泡影类脚本效果处理成功时 Duel.Hint(HINT_ZONE, tp, 0x1<<(seq+8)) 宣告自身所在列的 SZONE 位，本端把它标到同列两张魔陷格——同侧 SZONE 格（同 seq）与对侧镜像 SZONE 格（4-seq，aux.GetColumn 同式）；仅主列 seq 0-4（额外怪兽列无魔陷对应格）。MZ 位（bit0-6/16-22）为封锁格子类卡片（封锁龙/黄金国亡灵 等，效果伴随 MSG_FIELD_DISABLED 白 X）的怪兽纵列宣告，桌面端只对掩码位瞬时高亮 40 帧、从不扩张魔陷格；本端若同样展开会出现「白 X 同纵列魔陷格错误显示泡影标注」的误报，故不产生持久标注。效果携 RESET_PHASE+PHASE_END，故下一个 MSG_NEW_TURN 清除。 */
     public int hintZoneMask;
+    /** HINT_OPPO_SELECT_PLACE(12) 位置回报的瞬时高亮（本地视角，位布局同 hintZoneMask）与到期时刻：
+     *  对手以 EFFECT_OPPO_SELECT_SPSUMMON_ZONE 代选特召位置后，引擎用独立 HINT 类型回报选中格
+     *  （ocgcore operations.cpp move_to_field step1，恰为单一位）。桌面端按 selectable_field 高亮
+     *  40 帧（duelclient.cpp），本端同样只做瞬时高亮——绝不并入 hintZoneMask：回报的 SZ 位与
+     *  无限泡影类的单 SZ 位标注同形，并入会整回合误标玫红。引擎/Ui 线程写、GL 线程读，volatile 可见性 */
+    public volatile int flashZoneMask;
+    public volatile long flashZoneUntilMs;
+    /** 两个标注掩码逐位的「写入时已登记的发动条数」（{@link EffectActivationLedger#eventCount()} 快照，
+     *  位序与各自掩码一致）：撤回把发动账本回退到 kept 条后，条数大于 kept 的标注位即由本次被抹掉的
+     *  发动适用，随之取消格子变色/无效徽记与白 X，直到该卡下次适用效果重新标注；0 = 无对应发动 */
+    final int[] hintZoneStamp = new int[32];
+    final int[] disabledStamp = new int[32];
+    /** 标注位布局为双方共 32 格（seat0 低 16 位 / seat1 高 16 位），条数戳与戳位同长 */
+    private static final int ZONE_BIT_COUNT = 32;
+    /** 正在结算的链的登记序（MSG_CHAIN_SOLVING(ct) 写 chains.get(ct-1).activationOrdinal，
+     *  CHAIN_END/reload 复位 0）：applyHintZone/applyDisabledField 优先取本作当前戳，链外
+     *  （持续/规则类适用，无结算链）退实时 eventCount()；仅引擎派发线程读写 */
+    public int resolvingChainOrdinal;
+    /** MSG_SELECT_EFFECTYN 询问中的卡（用户规格：诱发效果被询问是否发动时，该卡矩形角上
+     *  显示与可发动同款的绿色呼吸点）：由询问窗展示时置入、dismiss/新询问到达时清除。
+     *  不写 cmdFlag——COMMAND_ACTIVATE 置位会让点卡路由（GameFieldController）误弹命令菜单，
+     *  而询问期间点该卡应直接出卡详发光；渲染侧（CardOverlayRenderer）按本引用强制绘绿点。
+     *  GL 线程读、UI 线程写，volatile 保证可见性 */
+    public volatile ClientCard effectYnAsking;
     public boolean deckReversed;
     /** 本次灵摆召唤预演已闪动的两侧刻度卡：同批逐张放置询问（ocgcore special_summon
      *  每张怪兽各发一条 MSG_SELECT_PLACE）只在首次闪动，刻度对象未换期间不重复；
@@ -205,7 +245,20 @@ public class GameField {
     public volatile ClientCard selectAttacking;
 
     public List<ClientCard> selectableCards = new ArrayList<>();
+    /**
+     * 当前点击选中的卡（移动端语义对应 client_field.h 的 {@code hovered_card}）：点卡时由渲染层
+     * 经 {@code SetShowMark} 联动点亮其装备/对象/连锁对象图标，下次点别的卡前先据本引用清除。
+     * 存在场地上而非视图上，因视图实例会随横竖屏重建（rebindAfterRotation），
+     * 若引用随视图丢失则只会点亮不会清除，表现为旧关系卡与新关系卡同时带图标。
+     */
+    public ClientCard showMarkedCard;
     public List<ClientCard> selectedCards = new ArrayList<>();
+    /** client_field.h L82-83 select_counter_count / select_counter_type：MSG_SELECT_COUNTER 询问中
+     *  还需取除的指示物个数与指示物类型。候选卡按消息顺序存 {@link #selectableCards}，其当前/初始
+     *  指示物数分别存 {@code ClientCard.opParam} 的低/高 16 位（对齐 duelclient.cpp L2362），
+     *  场上点卡逐个递减低位，取满后按 {@code (opParam>>16)-(opParam&0xffff)} 组应答。 */
+    public int selectCounterCount;
+    public int selectCounterType;
     /** 正在「揭示」展示的手牌卡——由 applyMoveToHandReveal 加入，SelectionOutlineRenderer 对其绘行进蚂蚁线（不受 is_selectable 门控）；展示结束/洗切时清空，亦复用为灵摆召唤两张刻度卡。 */
     public final List<ClientCard> revealHighlightCards = new ArrayList<>();
     public List<ClientCard> selectsumCards = new ArrayList<>();
@@ -320,6 +373,9 @@ public class GameField {
         revealHighlightCards.clear();
         // 断线/结束/新开一局时选择态列表必须随场一并清空，旧实现漏清致残留 is_selectable 蚂蚁线（SelectionOutlineRenderer 仍绘线）
         selectableCards.clear();
+        // 联动图标引用随场复位（对齐 client_field.cpp Clear 的 hovered_card = 0）：
+        // 旧卡对象已不属本局场面，留着引用会使新一局首次点卡去清一个无关旧对象
+        showMarkedCard = null;
         selectedCards.clear();
         selectsumCards.clear();
         selectsumAll.clear();
@@ -327,6 +383,12 @@ public class GameField {
         contiAct = false;
         disabledField = 0;
         hintZoneMask = 0;
+        flashZoneMask = 0;
+        flashZoneUntilMs = 0;
+        resolvingChainOrdinal = 0;
+        Arrays.fill(hintZoneStamp, 0);
+        Arrays.fill(disabledStamp, 0);
+        effectYnAsking = null;
         deckReversed = false;
         pendulumPreludeL = null;
         pendulumPreludeR = null;
@@ -351,20 +413,135 @@ public class GameField {
         lpcstring = "";
     }
 
-    /** 接收 HINT_ZONE 掩码（本地视角）展开为魔陷格标注集存 hintZoneMask：仅 SZONE 位标注同纵列两格（同侧 seq 与对侧镜像 4-seq），MZ 位为封区类宣告不做持久标注，来位已被 disabledField 封锁时跳过，仅主列 seq 0-4 */
+    /** 标注当前戳（用户反馈连锁交错误清修正，评审 Major①）：优先取正在结算链的登记序
+     *  （造成该标注的那次发动），链外适用退实时登记条数 */
+    private int currentStamp() {
+        return resolvingChainOrdinal > 0 ? resolvingChainOrdinal : EffectActivationLedger.eventCount();
+    }
+
+    /** 接收 HINT_ZONE 掩码（本地视角）展开为魔陷格标注集存 hintZoneMask：仅 SZONE 位标注同纵列两格（同侧 seq 与对侧镜像 4-seq），MZ 位为封区类宣告不做持久标注，来位已被 disabledField 封锁时跳过，仅主列 seq 0-4。不含 HINT_OPPO_SELECT_PLACE(12)：位置回报只走 {@link #flashZones} 瞬时高亮（单 SZ 位与泡影标注同形，不可并入本标注集） */
     public void applyHintZone(int zones) {
-        for (int bit = 0; bit < 32; bit++) {
+        final int stamp = currentStamp();
+        for (int bit = 0; bit < ZONE_BIT_COUNT; bit++) {
             if ((zones & (1 << bit)) == 0) continue;
             if ((bit & 8) == 0) continue;                       // MZ 位：封区宣告，跳过
             if ((disabledField & (1L << bit)) != 0) continue;   // 该格已带白 X：不叠加标注
-            markSpellColumn(bit >= 16 ? 1 : 0, (bit & 7));
+            markSpellColumn(bit >= 16 ? 1 : 0, (bit & 7), stamp);
         }
     }
 
-    private void markSpellColumn(int seat, int seq) {
+    /** 记录一条位置回报的瞬时高亮（本地视角）：只影响渲染帧，不写 hintZoneMask/条数戳，
+     *  到期自然失效（SelectionOutlineRenderer 按 flashZoneUntilMs 门控），不跨回合残留 */
+    public void flashZones(int zones, long durationMs) {
+        flashZoneUntilMs = System.currentTimeMillis() + Math.max(0L, durationMs);
+        flashZoneMask = zones;
+    }
+
+    private void markSpellColumn(int seat, int seq, int stamp) {
         if (seq < 0 || seq > 4) return;
-        hintZoneMask |= 1 << (seat * 16 + 8 + seq);
-        hintZoneMask |= 1 << ((1 - seat) * 16 + 8 + (4 - seq));
+        markZoneBit(seat * 16 + 8 + seq, stamp);
+        markZoneBit((1 - seat) * 16 + 8 + (4 - seq), stamp);
+    }
+
+    /** 置位变色格/无效徽记标注并记入发动条数：已标注的格保留更早的条数（同格被多次标注时，
+     *  回退判据取最早那次发动，后续发动被撤回不得误清仍生效中的标注） */
+    private void markZoneBit(int bit, int stamp) {
+        if ((hintZoneMask & (1 << bit)) != 0) return;
+        hintZoneMask |= 1 << bit;
+        hintZoneStamp[bit] = stamp;
+    }
+
+    /** MSG_FIELD_DISABLED 下发的完整禁用掩码（本地视角）整值落位：新增格记当前发动条数，
+     *  仍禁的格沿用更早一次发动的条数（同一掩码被后续效果重发时不得把条数戳推到后来那次发动上），
+     *  解禁的格同时清位与戳 */
+    public void applyDisabledField(int mask) {
+        long prev = disabledField;
+        final int stamp = currentStamp();
+        disabledField = mask & 0xFFFFFFFFL;
+        for (int bit = 0; bit < ZONE_BIT_COUNT; bit++) {
+            if ((mask & (1 << bit)) != 0) {
+                if ((prev & (1L << bit)) == 0) disabledStamp[bit] = stamp;
+            } else {
+                disabledStamp[bit] = 0;
+            }
+        }
+    }
+
+    /** 回合结束（MSG_NEW_TURN）清除 HINT_ZONE 纵列标注：颜色与无效徽记连同条数戳一并归零 */
+    public void clearHintZoneMarks() {
+        hintZoneMask = 0;
+        Arrays.fill(hintZoneStamp, 0);
+    }
+
+    /** 当回合持续态场地标注的撤回前快照（变色格/无效徽记掩码与白 X 掩码及各自的发动条数戳） */
+    public static final class ZoneMarks {
+        public final int hintZoneMask;
+        public final long disabledField;
+        final int[] hintZoneStamps;
+        final int[] disabledStamps;
+
+        private ZoneMarks(int hintZoneMask, long disabledField, int[] hintZoneStamps, int[] disabledStamps) {
+            this.hintZoneMask = hintZoneMask;
+            this.disabledField = disabledField;
+            this.hintZoneStamps = hintZoneStamps;
+            this.disabledStamps = disabledStamps;
+        }
+    }
+
+    /** 取标注快照：撤回重同步的 field.clear() 会把它们抹掉，同回合回退时用 {@link #restoreZoneMarks} 恢复 */
+    public ZoneMarks captureZoneMarks() {
+        return new ZoneMarks(hintZoneMask, disabledField,
+                Arrays.copyOf(hintZoneStamp, ZONE_BIT_COUNT),
+                Arrays.copyOf(disabledStamp, ZONE_BIT_COUNT));
+    }
+
+    /** 恢复快照并按保留条数回退：本次撤回把「适用该标注的那次效果发动」抹掉时（戳 > keptEvents），
+     *  该位的变色/无效徽记与白 X 一并取消（用户规格：效果回退为未使用，格子恢复常规颜色）。
+     *  keptEvents < 0（旧服务端不报条数）时整份恢复、不做回退。 */
+    public void restoreZoneMarks(ZoneMarks marks, int keptEvents) {
+        hintZoneMask = marks.hintZoneMask;
+        disabledField = marks.disabledField;
+        System.arraycopy(marks.hintZoneStamps, 0, hintZoneStamp, 0, ZONE_BIT_COUNT);
+        System.arraycopy(marks.disabledStamps, 0, disabledStamp, 0, ZONE_BIT_COUNT);
+        trimZoneMarksByKeptEvents(keptEvents);
+    }
+
+    /** 跨回合撤回只回填决斗级封区标注（评审 Minor）：disabledField 是决斗级持续态，而撤回
+     *  重同步的 reload/各区 refresh 不重发 MSG_FIELD_DISABLED（query_field_info 亦不携禁用态），
+     *  若不回填则仍在生效的封区白 X 直到该效果下次适用才会重现——无条件恢复后同样按戳剪除；
+     *  hintZoneMask 是回合级（本就随 MSG_NEW_TURN 边界清除），跨回合不复活 */
+    public void restoreDisabledMarks(ZoneMarks marks, int keptEvents) {
+        disabledField = marks.disabledField;
+        System.arraycopy(marks.disabledStamps, 0, disabledStamp, 0, ZONE_BIT_COUNT);
+        if (keptEvents >= 0) trimZoneMarksByKeptEvents(keptEvents);
+    }
+
+    /** 按保留发动条数逐位剪除戳超新的标注：保留前缀内的标注（戳≤kept）连同更早戳原样留下，
+     *  被抹掉那次发动所标的位清值同清戳（下次适用重新落戳） */
+    private void trimZoneMarksByKeptEvents(int keptEvents) {
+        if (keptEvents < 0) return;
+        for (int bit = 0; bit < ZONE_BIT_COUNT; bit++) {
+            if (((hintZoneMask >>> bit) & 1) != 0 && hintZoneStamp[bit] > keptEvents) {
+                hintZoneMask &= ~(1 << bit);
+                hintZoneStamp[bit] = 0;
+            }
+            if (((disabledField >>> bit) & 1L) != 0 && disabledStamp[bit] > keptEvents) {
+                disabledField &= ~(1L << bit);
+                disabledStamp[bit] = 0;
+            }
+        }
+    }
+
+    /** 视角互换（swapField）：条数戳与高低 16 位掩码同步换位，保证剪除时戳与位仍同序 */
+    public void swapZoneMarkStamps() {
+        for (int i = 0; i < 16; i++) {
+            int t = hintZoneStamp[i];
+            hintZoneStamp[i] = hintZoneStamp[i + 16];
+            hintZoneStamp[i + 16] = t;
+            t = disabledStamp[i];
+            disabledStamp[i] = disabledStamp[i + 16];
+            disabledStamp[i + 16] = t;
+        }
     }
 
     /** 该本地座位的场上格子是否被 HINT_ZONE 纵列标注（location 为已去叠加位的 0x04/0x08） */
@@ -433,6 +610,9 @@ public class GameField {
         }
     }
 
+    /**
+     * 序号与列表下标对齐（getCard 三参/四参寻卡依赖），可选同时把堆叠高度归回 0.01 一层。
+     */
     public void resetSequence(List<ClientCard> list, boolean resetHeight) {
         int seq = 0;
         for (ClientCard pcard : list) {
@@ -521,6 +701,73 @@ public class GameField {
 
     public void applyCardHint(int localControler, int location, int sequence, int hintType, int value) {
         cards.applyCardHint(localControler, location, sequence, hintType, value);
+    }
+
+    /**
+     * 采集该侧场上卡当前「引擎权威上报为正在适用」的持续效果（用户新规格：黑点子效果按引擎信号取句）：
+     * 遍历本地该侧怪兽区/魔陷区在场卡（含灵摆区，与魔陷同区）的 {@code descHints}——这些提示由服务器
+     * 在带 {@code EFFECT_FLAG_CLIENT_HINT} 的持续效果注册/注销时经 {@code MSG_CARD_HINT} 的
+     * CHINT_DESC_ADD / CHINT_DESC_REMOVE 逐条加减（见 duelclient.cpp L4094-4109 与本类 applyCardHint），
+     * 提示值即 {@code peffect->description}＝该效果段落锚点的 {@code code*16+offset}，其存在本身就代表
+     * “该段落对应的效果此刻在场并适用”，无需回合/无效门控（离场或到期时服务器必发 REMOVE 摘除）。
+     * <p>只收卡码型提示（{@code value > MAX_STRING_ID}，即 &gt;0x7ff，系统字符串提示无段落序含义、丢弃）；
+     * 每项以 {@code {在场卡卡码, offset=value&0xf}} 返回，{@code side} 为本地索引（解算器据此归一 alias）。
+     * 与 {@link CardInfoBinder} 的已发动标记共用同一 descHints 通道，口径不分叉。
+     * <p>主线程解算时调用，而引擎派发线程会并发改写 descHints（TreeMap 非并发容器）：先把 keySet 快照
+     * 成数组再遍历，避免与 CHINT_DESC_ADD/REMOVE 的写入竞态致 ConcurrentModificationException。
+     */
+    public List<int[]> collectApplyingHints(int side) {
+        List<int[]> out = new ArrayList<>();
+        if (side < 0 || side > 1) return out;
+        PlayerField pf = players[side];
+        if (pf == null) return out;
+        collectZoneHints(pf.monsterZone, out);
+        collectZoneHints(pf.spellZone, out);
+        return out;
+    }
+
+    private static void collectZoneHints(List<ClientCard> zone, List<int[]> out) {
+        if (zone == null) return;
+        for (ClientCard c : zone) {
+            if (c == null || c.code <= 0 || c.descHints.isEmpty()) continue;
+            for (Integer key : new ArrayList<>(c.descHints.keySet())) {
+                long uid = key & 0xFFFFFFFFL;
+                //仅卡码型字符串 id（>MAX_STRING_ID）携段落序含义，系统字符串/0 一律丢弃
+                if (uid <= ocgcore.DataManager.MAX_STRING_ID) continue;
+                out.add(new int[]{c.code, (int) (uid & 0xf)});
+            }
+        }
+    }
+
+    /**
+     * 采集该侧场上此刻<b>效果被无效</b>的卡码（用户规律 6/7：『…召唤成功的回合，○○』『这个方法
+     * 特殊召唤（成功）过的回合，○○』『…召唤时适用』这族誓约是召唤成功后<b>在场上适用</b>的效果，
+     * 卡被无效即不适用，不该再列进「持续适用中效果」）。
+     * <p>判据与卡面无效角标完全同源（{@code CardOverlayRenderer.overlayCardStatus}：在场 + 表侧 +
+     * {@code STATUS_DISABLED|STATUS_FORBIDDEN}，即无限泡影类与技能抽取类），覆盖怪兽区与魔陷区
+     *（含灵摆区/场地区，同区）；异画卡连同其 alias 一并入集，使按物理卡码登记的召唤账本条目能对上。
+     * <p>主线程解算时调用（与 {@link #collectApplyingHints} 同一时机），无效态由引擎派发线程经
+     * {@code MSG_UPDATE_CARD/MSG_UPDATE_DATA} 写入，本方法只读一次当前快照。
+     */
+    public Set<Integer> collectNegatedCodes(int side) {
+        Set<Integer> out = new HashSet<>();
+        if (side < 0 || side > 1) return out;
+        PlayerField pf = players[side];
+        if (pf == null) return out;
+        collectZoneNegated(pf.monsterZone, out);
+        collectZoneNegated(pf.spellZone, out);
+        return out;
+    }
+
+    private static void collectZoneNegated(List<ClientCard> zone, Set<Integer> out) {
+        if (zone == null) return;
+        for (ClientCard c : zone) {
+            if (c == null || c.code <= 0) continue;
+            if ((c.status & (STATUS_DISABLED | STATUS_FORBIDDEN)) == 0) continue;
+            if (!c.isFaceUp()) continue;
+            out.add(c.code);
+            if (c.alias > 0 && c.alias != c.code) out.add(c.alias);
+        }
     }
 
     /**
@@ -620,16 +867,21 @@ public class GameField {
     }
 
     /** 回放「上一步」逆向倒放：重算前抓取当前各显示卡的渲染位置快照（步骤 N 显示态），供投喂线程记录后于落点交主线程 applyReverseAnimation 逆向补间；委托 motion */
-    public java.util.List<ReplayPosSnap> collectDisplayPositions() {
+    public List<ReplayPosSnap> collectDisplayPositions() {
         return motion.collectDisplayPositions();
     }
 
     /** 回放「上一步」逆向倒放：重算落定后把发生位移的卡从步骤 N 显示位逆向补间回 N-1 落定位（仅改渲染层 cur*，不动模型字段），须在主线程调用；委托 motion */
-    public void applyReverseAnimation(java.util.List<ReplayPosSnap> snapN) {
+    public void applyReverseAnimation(List<ReplayPosSnap> snapN) {
         motion.applyReverseAnimation(snapN);
     }
 
     void setCardPos(ClientCard pcard) {
+        motion.setCardPos(pcard);
+    }
+
+    /** 供跨包调用：把卡片瞬吸到其当前 c/l/s 对应的几何位（不产生动画），常用于兜底定位保证飞行起点正确 */
+    public void snapCardPos(ClientCard pcard) {
         motion.setCardPos(pcard);
     }
 
@@ -676,6 +928,12 @@ public class GameField {
     /** 洗手卡聚拢单动画（duelclient.cpp MSG_SHUFFLE_HAND L2662-2699） */
     public void startHandShuffle(ClientCard pcard) {
         motion.startHandShuffle(pcard);
+    }
+
+    /** 盖放卡洗牌的中场聚拢单动画（duelclient.cpp MSG_SHUFFLE_SET_CARD L2828-2831）：
+     *  10 帧移到场地中线并逐帧抬高 Z，停留后由调用方 moveCardAnimated 回到交换后的新格 */
+    public void startSetCardGather(ClientCard pcard) {
+        motion.startSetCardGather(pcard);
     }
 
     /** 卡片经效果入手的揭示：对方手卡从卡背翻到正面供对手确认，己方卡仅亮出不翻面 */

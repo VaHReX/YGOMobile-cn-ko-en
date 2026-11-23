@@ -1,4 +1,5 @@
 package cn.garymb.ygomobile.render.card;
+import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.render.field.FieldGeometry;
 import cn.garymb.ygomobile.render.field.FieldTextureManager;
 import cn.garymb.ygomobile.render.gamefieldview.GameFieldView;
@@ -39,7 +40,8 @@ public final class CardOverlayRenderer {
     private static final long EQUIP_TEX_KEY = -50L;
     private static final long TARGET_TEX_KEY = -51L;
     private static final long CHAIN_TARGET_TEX_KEY = -52L;
-    private static final long NEGATED_TEX_KEY = -53L;
+    // 无效徽记与场地标注格底（FieldBoardRenderer）为同一张 negated.png：共用纹理管理器发布的同一键（-5），-53 作废不得再给其他贴图取用
+    private static final long NEGATED_TEX_KEY = FieldTextureManager.NEGATED_TEX_KEY;
     private static final long CHAIN_TEX_KEY = -54L;
     private static final long CHAIN_NUM_TEX_KEY = -55L;
     private static final long ATTACK_TEX_KEY = -56L;
@@ -142,6 +144,15 @@ public final class CardOverlayRenderer {
     private ClientCard hideAttackCard;
     /** 已选定为当前攻击目标的对方怪兽：攻击弧展示期内不再在其卡上绘制 attack 浮动箭头 */
     private ClientCard hideAttackTarget;
+    /**
+     * 攻击弧正在展示的整段期间：场上所有卡上的 attack.png 浮动箭头一并隐藏（用户规格）。
+     * C++ 里这份抑制不是逐卡做的：宣言攻击的应答一发出，{@code DuelClient::SendResponse} 就对
+     * MSG_SELECT_BATTLECMD 调 {@code ClearCommandFlag()}（duelclient.cpp L4511-4515），所有卡的
+     * COMMAND_ATTACK 同时清零，故绿色拱形箭头播放期间没有任何卡还带着上下晃动的攻击贴图。
+     * 本端 cmdFlag 由后续询问才重设，这里在渲染层按同一观感整段抑制，避免弧线与其他仍可攻击怪兽
+     * 的浮动箭头同屏并存（用户反馈「视觉上和 C++ 不一致」的直接来源）。
+     */
+    private boolean hideAllAttackIcons;
 
     // 可发动绿点专用矩阵 scratch：buildCardModel 内部会占用 view.mModelTmp 作手卡 billboard 临时量，
     // 不能把 mModelTmp 同时作为其 out，故本处用独立数组避免 multiplyMM 结果/源同数组的未定义行为。
@@ -190,12 +201,15 @@ public final class CardOverlayRenderer {
         // 同理，已被选定为攻击目标的怪兽（arcTarget）卡上也不再显示攻击箭头
         hideAttackCard = null;
         hideAttackTarget = null;
+        hideAllAttackIcons = false;
         if (f.arcAttacker != null) {
             long el = view.animTimeMs - f.arcStartMs;
             // 与 drawAttackArc 同源：小负值视为窗口内（竞态首帧仍抑制 attack.png，避免闪一帧浮动箭头）
             if (el <= ATTACK_ARC_MS) {
                 hideAttackCard = f.arcAttacker;
                 hideAttackTarget = f.arcTarget;
+                // 弧线一开播就整段抑制所有卡的 attack.png（对齐 C++ 应答时 ClearCommandFlag 的效果）
+                hideAllAttackIcons = true;
             }
         } else if (f.arcAttacker == null && f.selectAttacking != null) {
             /** 战斗阶段点击「攻击宣言」选中的怪兽：cmdFlag 已清空但尚未进入 arcAttacker，
@@ -236,15 +250,19 @@ public final class CardOverlayRenderer {
         float dy = (float) Math.sin((double) view.animTimeMs * ACT_DOT_BREATH_RAD_PER_MS);
         float alpha = 0.55f + 0.45f * dy;
         boolean mr4 = f.dInfo.duelRule >= 4;
+        // EFFECT_YN 询问中的卡（用户规格：诱发效果被询问是否发动时角位也显示呼吸绿点）：
+        // 不依赖 cmdFlag（询问窗展示时置入、应答/dismiss 清除），同批同相位呼吸
+        ClientCard ynAsking = f.effectYnAsking;
         for (int p = 0; p < 2; p++) {
-            activatableDotList(f.players[p].hand, alpha, false, mr4, HAND_DOT_MASK);
-            activatableDotList(f.players[p].monsterZone, alpha, false, mr4, MONSTER_DOT_MASK);
-            activatableDotList(f.players[p].spellZone, alpha, true, mr4, COMMAND_ACTIVATE_OR_SPSUMMON);
+            activatableDotList(f.players[p].hand, alpha, false, mr4, HAND_DOT_MASK, ynAsking);
+            activatableDotList(f.players[p].monsterZone, alpha, false, mr4, MONSTER_DOT_MASK, ynAsking);
+            activatableDotList(f.players[p].spellZone, alpha, true, mr4, COMMAND_ACTIVATE_OR_SPSUMMON, ynAsking);
         }
     }
 
     private void activatableDotList(List<ClientCard> list, float alpha,
-                                    boolean spellZone, boolean mr4, int mask) {
+                                    boolean spellZone, boolean mr4, int mask,
+                                    ClientCard ynAsking) {
         if (list == null) return;
         try {
             for (int i = 0, n = list.size(); i < n; i++) {
@@ -255,8 +273,9 @@ public final class CardOverlayRenderer {
                     continue;
                 }
                 if (c == null || c.is_moving) continue;
-                if ((c.cmdFlag & mask) == 0) continue;
-                drawActivatableDot(c, alpha, spellZone, mr4);
+                boolean ynDot = ynAsking != null && c == ynAsking;
+                if (!ynDot && (c.cmdFlag & mask) == 0) continue;
+                drawActivatableDot(c, alpha, spellZone, mr4, ynDot);
             }
         } catch (Throwable ignored) {
         }
@@ -268,11 +287,11 @@ public final class CardOverlayRenderer {
      *  卡片局部空间非等比（CARD_W×CARD_H），按 1/CARD_W、1/CARD_H 反向缩放 x/y 使屏幕上呈正圆；
      *  抬升沿世界 +z（相机恒在上方）而非卡片局部 +z，保证盖放/竖立卡不被卡面遮挡。 */
     private void drawActivatableDot(ClientCard c, float alpha,
-                                    boolean spellZone, boolean mr4) {
+                                    boolean spellZone, boolean mr4, boolean forceActivate) {
         // 颜色按菜单内容细致区分（用户规格）：cmdFlag 含 COMMAND_ACTIVATE 时点击菜单必出
         // 「发动」（buildCardCommandMenu 以该位收集 activateList），绿点；不含发动而有
-        // 「召唤/特殊召唤」等其他按钮时蓝点
-        boolean hasActivate = (c.cmdFlag & GameEngine.COMMAND_ACTIVATE) != 0;
+        // 「召唤/特殊召唤」等其他按钮时蓝点；EFFECT_YN 询问卡不经 cmdFlag（forceActivate）恒绿
+        boolean hasActivate = forceActivate || (c.cmdFlag & GameEngine.COMMAND_ACTIVATE) != 0;
         int tex = obtainActivatableDotTexture(hasActivate);
         if (tex <= 0) return;
         final float[] m = dotModel;
@@ -360,14 +379,15 @@ public final class CardOverlayRenderer {
         // 烘焙刻度（compositePendulum），此处不重复叠加。
         drawPendulumScaleOverlay(c, mr4);
         // 可攻击宣言的怪兽：在其上方绘制上下浮动的 tAttack 箭头（对齐 drawing.cpp L685-693）；
-        // 攻击弧线显示期间的攻击者隐藏该贴图，改由滑动的绿色箭头动画表达；
-        // 已选定为攻击目标的对方怪兽（hideAttackTarget）同样不再显示——箭头只标记攻击手。
+        // 攻击弧线显示期间整段抑制本贴图（见 {@link #hideAllAttackIcons}），攻击语义只留滑动的绿色箭头动画；
+        // 弧线未启而仅为攻击者/目标抑制的两张卡仍按 hideAttackCard/hideAttackTarget 单独排除。
         // 我方：cmdFlag 含 COMMAND_ATTACK（由 battle cmd 精确置位）；
         // 对方：战斗宣言阶段的表侧攻击表示怪兽，近似判断（收不到对方 battle cmd）；
         // 必须叠加 TYPE_MONSTER 门槛，否则魔陷区盖卡揭开后 position 同为攻击表示会误显示箭头。
-        boolean showAttack = (c.cmdFlag & GameEngine.COMMAND_ATTACK) != 0
+        boolean showAttack = !hideAllAttackIcons
+                && ((c.cmdFlag & GameEngine.COMMAND_ATTACK) != 0
                 || (oppAttackHint && (c.type & TYPE_MONSTER) != 0
-                    && c.controler == 1 && c.isFaceUp() && c.isAttack());
+                    && c.controler == 1 && c.isFaceUp() && c.isAttack()));
         if (showAttack && c != hideAttackCard && c != hideAttackTarget) {
             drawAttackIcon(c);
         }
@@ -411,7 +431,7 @@ public final class CardOverlayRenderer {
         if (!c.isFaceUp() || c.equipTarget != null) return;    // 对齐 drawing.cpp 表侧 & !equipTarget
         boolean gate;
         try {
-            gate = cn.garymb.ygomobile.AppsSettings.get().isPendulumScale();
+            gate = AppsSettings.get().isPendulumScale();
         } catch (Throwable e) {
             gate = false;
         }
@@ -459,7 +479,7 @@ public final class CardOverlayRenderer {
         // 对齐 drawing.cpp L878：仅当连锁数 > 1，或勾选「只有连锁1也显示连锁动画」(draw_single_chain) 时才显示
         try {
             if (chains.size() <= 1
-                    && cn.garymb.ygomobile.AppsSettings.get().getIntSettings("draw_single_chain", 0) != 1)
+                    && AppsSettings.get().getIntSettings("draw_single_chain", 0) != 1)
                 return;
         } catch (Throwable ignored) {
         }

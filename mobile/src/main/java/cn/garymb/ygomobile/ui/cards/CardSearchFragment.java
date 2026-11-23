@@ -33,8 +33,10 @@ import com.ourygo.lib.duelassistant.util.DuelAssistantManagement;
 import java.util.List;
 import java.util.ArrayList;
 
+import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.base.BaseFragemnt;
+import cn.garymb.ygomobile.bean.events.CardFavoriteChangedEvent;
 import cn.garymb.ygomobile.core.IrrlichtBridge;
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.loader.CardLoader;
@@ -46,6 +48,7 @@ import cn.garymb.ygomobile.ui.home.HomeActivity;
 import cn.garymb.ygomobile.ui.plus.AOnGestureListener;
 import cn.garymb.ygomobile.ui.plus.DialogPlus;
 import cn.garymb.ygomobile.ui.plus.VUiKit;
+import cn.garymb.ygomobile.ui.widget.SectionDividerDecoration;
 import cn.garymb.ygomobile.utils.YGOUtil;
 import cn.garymb.ygomobile.utils.glide.GlideCompat;
 import ocgcore.CardManager;
@@ -53,6 +56,10 @@ import ocgcore.DataManager;
 import ocgcore.PackManager;
 import ocgcore.data.Card;
 import ocgcore.data.LimitList;
+
+import org.greenrobot.eventbus.EventBus;
+import org.greenrobot.eventbus.Subscribe;
+import org.greenrobot.eventbus.ThreadMode;
 
 public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallBack, CardSearcher.CallBack {
     private static final String TAG = "CardSearchFragment";
@@ -75,15 +82,33 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
     private CardDetail mCardDetail;
     private DialogPlus mDialog;
     private TextView mResult_count;
+    /**
+     * 顶部计数行的排序规则按钮：位序与比较器与决斗内卡组编辑器同源，
+     * 0=星数 / 1=攻击 / 2=守备 / 3=名称 / 4=时间（按卡包发售日期从早到晚）；
+     * resultSortReversed 为真时按该规则反向排（星数↑ …）
+     */
+    private int resultSortSel;
+    private boolean resultSortReversed;
+    /**
+     * 顶部计数行的展现模式切换按钮：默认列表，点一下换宫格；
+     * 图标始终表示当前模式，见 {@link #refreshResultViewModeIcon()}
+     */
+    private ImageButton mBtnViewMode;
 
     private View layoutView;
     private ImageButton btn_search;
+    /** 结果区顶部的发售日期时间轴接线（跨度取自卡包管理器，滑块一变动就过滤当前结果） */
+    private CardReleaseDateFilter mReleaseDateFilter;
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
         super.onCreateView(inflater, container, savedInstanceState);
         activity = (HomeActivity) getActivity();
         layoutView = inflater.inflate(R.layout.fragment_search, container, false);
         initView(layoutView);
+        // 收藏变化事件：收藏页显示中收到后按当前排序规则重排收藏列表
+        if (!EventBus.getDefault().isRegistered(this)) {
+            EventBus.getDefault().register(this);
+        }
         showNewbieGuide();
         return layoutView;
     }
@@ -94,20 +119,43 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
         mResult_count = layoutView.findViewById(R.id.search_result_count);
         mDrawerlayout = layoutView.findViewById(R.id.drawer_layout);
         mListView = layoutView.findViewById(R.id.list_cards);
+        // 展现模式按本页设置项初始化（用户规格：三页各存各的开关，未设置过走原列表）；
+        // 宫格态只留卡图与禁限/起源点角标，列数按列表宽度自适应；
+        // 本页不读卡组，所以行模式也不装配加卡按钮，但保留条目背景
         mCardListAdapter = new CardListAdapter(getContext(), activity.getImageLoader());
         mCardListAdapter.setShowAddButtons(false); // 隐藏添加按钮
         mCardListAdapter.setItemBg(true);
-
+        mCardListAdapter.setGridLayout(isResultGridPreferred());
         mListView.setLayoutManager(new FastScrollLinearLayoutManager(getContext()));
         mListView.setAdapter(mCardListAdapter);
+        // 结果列表/宫格的分段说明：列表按每张卡、宫格按整行分段（切换布局后不用重挂）
+        mListView.addItemDecoration(new SectionDividerDecoration(getContext(), mCardListAdapter));
+        // 顶部计数同一行的排序规则按钮与展现模式切换
+        setupResultSortButtons();
+        mBtnViewMode = layoutView.findViewById(R.id.btn_result_view_mode);
+        mBtnViewMode.setOnClickListener(v -> toggleResultViewMode());
+        refreshResultViewModeIcon();
+        // 初始化态可能是宫格（从设置读回），行 LM 必须当场换掉；
+        // 列数在宽度未量出时先给 1 列兜底，下一次填结果数据时再复核
+        mListView.post(() -> mCardListAdapter.applyListLayout(mListView));
         btn_search = layoutView.findViewById(R.id.btn_search);
         btn_search.setOnClickListener((v) -> showSearch(true));
         mPackManager = DataManager.get().getPackManager();
         mCardManager = DataManager.get().getCardManager();
+        // 搜索结果顶部的发售日期时间轴：跨度取自卡包管理器里全部卡片的发售日期，
+        // 两端滑块决定结果只保留日期落在中间的卡（接线见 CardReleaseDateFilter）
+        mReleaseDateFilter = new CardReleaseDateFilter(
+                layoutView.findViewById(R.id.release_date_bar),
+                mCardListAdapter, mResult_count,
+                () -> resultSortSel,
+                () -> mListView.post(() -> mCardListAdapter.applyListLayout(mListView)));
+        mReleaseDateFilter.refreshRange();
         mCardLoader = new CardLoader();
         mCardLoader.setCallBack(this);
         mCardSearcher = new CardSearcher(layoutView.findViewById(R.id.nav_view_list), mCardLoader);
         mCardSearcher.setCallBack(this);
+        // 收藏星标位于本页结果区顶行（计数/宫格切换/排序同排），筛选面板里已没有该按钮，得交进来
+        mCardSearcher.bindFavoriteButton(layoutView.findViewById(R.id.btn_my_fav));
         setListeners();
         isLoad = true;
         mCardLoader.loadData();
@@ -118,6 +166,76 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
 
     }
 
+    /**
+     * 顶部计数行的排序规则按钮：装项与样式由 {@link CardListAdapter#setupSortButtons}
+     * 统一装配（与卡组管理页同一份），比较器与决斗内卡组编辑器同源；
+     * 切换只对当前结果重排，不重新发起搜索
+     */
+    private void setupResultSortButtons() {
+        CardListAdapter.setupSortButtons(layoutView.findViewById(R.id.ll_result_sort),
+                resultSortSel, resultSortReversed, (sortSel, reversed) -> {
+                    resultSortSel = sortSel;
+                    resultSortReversed = reversed;
+                    resortSearchResults();
+                });
+    }
+
+    /**
+     * 结果填入与刷新：先记住搜索线程交来的原始顺序，再按本页当前档位填入，
+     * 最后复核一次展现布局。第 0 档（星数）就是改造前的原样顺序（含关键词完全命中置顶），
+     * 其余档位（攻守/名称/时间）才去套与决斗内卡组编辑器同源的规则
+     */
+    private void fillSearchResultList(List<Card> cards) {
+        mCardListAdapter.setRawCards(cards);
+        mCardListAdapter.setSortReversed(resultSortReversed);
+        mCardListAdapter.applySortRule(resultSortSel);
+        // 时间轴：卡包数据比页面晚读完是常态，每次填结果都复核一次跨度（已就绪则不动滑块）；
+        // 顶部计数按过滤后的条数刷新
+        if (mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+            mReleaseDateFilter.updateResultCount();
+        } else {
+            mResult_count.setText(String.valueOf(mCardListAdapter.getItems().size()));
+        }
+        // 布局管理器与列数变化会 requestLayout，填数据路径故 post 到本轮布局之外；
+        // 尚未量出宽度时适配器先给 1 列兜底，等下一次填结果数据时再算
+        mListView.post(() -> mCardListAdapter.applyListLayout(mListView));
+    }
+
+    /** 本页上一次的展现模式开关（与卡组管理页、决斗内卡组编辑器各存一份） */
+    private boolean isResultGridPreferred() {
+        return AppsSettings.get().getIntSettings(Constants.PREF_CARD_SEARCH_RESULT_GRID,
+                Constants.PREF_DEF_RESULT_GRID) == 1;
+    }
+
+    /**
+     * 切换搜索结果展现模式（列表/宫格）并同步按钮图标：模式由点击当场切换，
+     * 条目布局与布局管理器必须同一帧换完（toggleListLayout 里成对处理），
+     * 不能走填数据那条 post 路径，否则中间会有一帧宫格条目配在线性布局上、卡图被拉成满宽；
+     * 而点击回调本身不在布局过程中，可以直接换 LM；开关结果写回本页设置项供下次初始化
+     */
+    private void toggleResultViewMode() {
+        if (mCardListAdapter == null) return;
+        boolean grid = mCardListAdapter.toggleListLayout(mListView);
+        AppsSettings.get().saveIntSettings(Constants.PREF_CARD_SEARCH_RESULT_GRID, grid ? 1 : 0);
+        refreshResultViewModeIcon();
+    }
+
+    /** 展现模式按钮的图标即当前模式：宫格→宫格图标，列表→列表图标 */
+    private void refreshResultViewModeIcon() {
+        if (mBtnViewMode == null || mCardListAdapter == null) return;
+        mBtnViewMode.setImageResource(mCardListAdapter.isGridLayout()
+                ? R.drawable.ic_view_grid_24 : R.drawable.ic_view_list_24);
+    }
+
+    /** 排序规则变更后只重排当前结果，不重新搜索：以适配器里记下的原始顺序为底 */
+    private void resortSearchResults() {
+        if (mCardListAdapter == null) return;
+        mCardListAdapter.setSortReversed(resultSortReversed);
+        mCardListAdapter.applySortRule(resultSortSel);
+        mListView.post(() -> mCardListAdapter.applyListLayout(mListView));
+    }
+
     @Override
     public void onFirstUserVisible() {
 
@@ -125,7 +243,10 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
 
     @Override
     public void onUserVisible() {
-
+        // 切回本页时复核时间轴跨度：卡包数据可能在页面隐藏期间才读完
+        if (mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+        }
     }
 
     @Override
@@ -136,6 +257,21 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
     @Override
     public void onUserInvisible() {
 
+    }
+
+    @Override
+    public void onHiddenChanged(boolean hidden) {
+        super.onHiddenChanged(hidden);
+        // 底部页签切走：HomeActivity.switchFragment 以 hide 本页使根视图 GONE，而关键词记录的下拉
+        // 是独立窗体不会随之消失，会卡在切换后的页面上，故本页退场时主动收起自己那份下拉
+        if (hidden && mCardSearcher != null) {
+            mCardSearcher.dismissKeywordDropdown();
+        }
+        // 切回本页（页签用 hide/show 切换，不走 onUserVisible）：复核一次时间轴跨度，
+        // 卡包数据可能在本页隐藏期间才读完
+        if (!hidden && mReleaseDateFilter != null) {
+            mReleaseDateFilter.refreshRange();
+        }
     }
 
     private void intentSearch(String searchMessage) {
@@ -198,21 +334,43 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
 
     @Override
     public void onDestroy() {
+        if (EventBus.getDefault().isRegistered(this)) {
+            EventBus.getDefault().unregister(this);
+        }
         //mImageLoader.close();
         super.onDestroy();
     }
 
+    /**
+     * 收藏夹增删后（任何入口，含卡片详情、其他页面的收藏操作）：收藏列表显示中则
+     * 重新拉取收藏并按当前排序规则重排、重建分段，避免新加入的卡停留在列表末尾
+     * 而单独形成一个同类型的新分段
+     */
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onCardFavoriteChanged(CardFavoriteChangedEvent event) {
+        if (mCardSearcher != null && mCardSearcher.isShowFavorite()) {
+            mCardSearcher.showFavorites(false);
+        }
+    }
+
     @Override
     public void onSearchResult(List<Card> cardInfos, boolean isHide) {
+        // 关键词搜索与收藏列表直接交搜索结果线程的原样顺序，
+        // 由 fillSearchResultList 按本页档位决定要不要重排（第 0 档保持原样）
+        showSearchResultCards(cardInfos);
+    }
+
+    /**
+     * 结果填入 + 顶部计数。卡包展示需要保留卡包原来的顺序，不能拿它当关键词结果重排
+     */
+    private void showSearchResultCards(List<Card> cardInfos) {
+        // 关键词以搜索面板当前输入为准：重置后为空就要把上一次的关键词清掉，
+        // 否则重排时仍会按旧关键词把完全同名的卡置顶（用户报的残留问题）
         String keyword = mCardSearcher.getCurrentKeyword();
-        if (keyword != null && !keyword.isEmpty()) {
-            currentCardSearchMessage = keyword;
-        }
-        
+        currentCardSearchMessage = keyword == null ? "" : keyword;
+
         mCardListAdapter.setSearchKeyword(currentCardSearchMessage);
-        mCardListAdapter.set(cardInfos);
-        mResult_count.setText(String.valueOf(cardInfos.size()));
-        mCardListAdapter.notifyDataSetChanged();
+        fillSearchResultList(cardInfos);
         if (!cardInfos.isEmpty()) {
             mListView.smoothScrollToPosition(0);
         }
@@ -294,11 +452,7 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
         if (cardInfo != null) {
             if (mCardDetail == null) {
                 mCardDetail = new CardDetail((BaseActivity) getActivity(), activity.getImageLoader(), activity.getStringManager());
-                mCardDetail.setCallBack((card, favorite) -> {
-                    if (mCardSearcher.isShowFavorite()) {
-                        mCardSearcher.showFavorites(false);
-                    }
-                });
+                // 收藏变化统一由 CardFavoriteChangedEvent 通知收藏列表重排
                 mCardDetail.setOnCardClickListener(new CardDetail.OnCardSearcherCardClickListener() {
                     @Override
                     public void onOpenUrl(Card cardInfo) {
@@ -363,7 +517,10 @@ public class CardSearchFragment extends BaseFragemnt implements CardLoader.CallB
 
     private void showCardList(List<Card> cardList, boolean sort) {
         if (!cardList.isEmpty()) {
-            onSearchResult(sort ? mCardLoader.sort(cardList) : cardList, false);//根据情况不同，判断是否调用CardLoader的sort方法排序List<Card>
+            // 关联卡片与卡包展示都先走移动端固定序 mCardLoader.sort（怪兽→连接→魔法→陷阱、高星在前），
+            // 与第 0 档分割线的分段键一致；不能直接保留卡包的收集号原序，否则同段卡不相邻、分段会重复出现。
+            // 顶部规则下拉选攻/守/名称/时间时再由 applySortRule 在其上按当前档重排。
+            showSearchResultCards(mCardLoader.sort(cardList));
             //sort为true代表点击“关联卡片”按钮（卡包展示为false），以当前卡片名作为关键词计入搜索历史
             if (sort && mCardDetail != null && mCardDetail.getCardInfo() != null) {
                 mCardSearcher.recordHistoryKeyword(mCardDetail.getCardInfo().Name);

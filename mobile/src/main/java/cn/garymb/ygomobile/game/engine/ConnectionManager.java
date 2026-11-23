@@ -5,10 +5,17 @@ import android.content.Intent;
 import android.util.Log;
 
 
+import java.io.File;
+import java.util.Collections;
+import java.util.List;
+
+import cn.garymb.ygomobile.AppsSettings;
+import cn.garymb.ygomobile.Constants;
 import cn.garymb.ygomobile.GameApplication;
 import cn.garymb.ygomobile.network.LanDiscoveryManager;
 import cn.garymb.ygomobile.network.YGOProtocol;
 import cn.garymb.ygomobile.network.server.LanGameServer;
+import cn.garymb.ygomobile.utils.AiDeckUtil;
 import cn.garymb.ygomobile.utils.CrashHandler;
 
 /**
@@ -26,6 +33,9 @@ public class ConnectionManager {
      * volatile：launchWindBot 在独立线程轮询房间就绪状态，需跨线程可见性 */
     private volatile LanGameServer localServer;
 
+    /** 本次人机需要入座的 AI 席位数（1=单局/比赛，3=TAG），加入超时按此判定是否全部入座。 */
+    private volatile int expectedBotSeats = 1;
+
     public ConnectionManager(GameEngine engine) {
         this.engine = engine;
         this.botJoinTimeout = () -> {
@@ -33,7 +43,7 @@ public class ConnectionManager {
             if (server == null || !server.isRunning()) {
                 return;
             }
-            if (!server.isSecondPlayerJoined() && engine.listener != null) {
+            if (!server.isBotSeatsJoined(expectedBotSeats) && engine.listener != null) {
                 engine.listener.onNoticeMessage("AI 连接失败：WindBot 未在预期时间内加入");
             }
         };
@@ -52,6 +62,8 @@ public class ConnectionManager {
             server = new LanGameServer();
             localServer = server;
         }
+        // 聊天 “/ai 卡组名” 命令的拉起实现：仅本地建主才有 launcher，加入他人房间时命令由对方主机处理
+        server.setChatBotLauncher(this::launchWindBotFromChat);
         if (server.isRunning()) {
             return true;
         }
@@ -75,8 +87,11 @@ public class ConnectionManager {
         return started;
     }
 
-    /** AI 加入超时（毫秒）：启动 WindBot 后若在此时长内第二玩家仍未入座则提示失败。 */
+    /** AI 加入超时（毫秒）：启动 WindBot 后若在此时长内所需席位仍未全部入座则提示失败。 */
     private static final long BOT_JOIN_TIMEOUT_MS = 25000L;
+
+    /** 逐席拉起时等上一席入座的时限（毫秒）：保证复选顺序与 P2/P3/P4 席位顺序一致。 */
+    private static final long BOT_SEAT_ORDER_WAIT_MS = 10000L;
 
     /** AI 加入超时任务（在构造函数中初始化，以引用已赋值的 engine）。 */
     private final Runnable botJoinTimeout;
@@ -262,6 +277,11 @@ public class ConnectionManager {
                 String windbotArgs = "WindBotHost:" + host + " Port:" + port
                         + " Name:WindBot"                    + (botCommand != null && !botCommand.isEmpty() ? " " + botCommand : "");
                 Log.i(TAG, "Launching WindBot: " + windbotArgs);
+                // 人机席位不实现 MSG_RELOAD_FIELD：预先标记本房间，服务端对它的撤回重同步改用整局重放
+                server = localServer;
+                if (server != null) {
+                    server.markPeerNeedsReplayResync();
+                }
 
                 engine.mainHandler.post(() -> {
                     try {
@@ -286,16 +306,63 @@ public class ConnectionManager {
         });
     }
 
+    /** 主机端收到聊天 “/ai [卡组名]” 后在本机拉起 WindBot 入房；卡组名为空时从合规人机卡组中随机挑选（加入者无 localServer，命令由对方主机处理）。 */
+    private void launchWindBotFromChat(String deckName, int lflist) {
+        final LanGameServer server = localServer;
+        if (server == null || !server.isRunning()) return;
+        final File aiDeckDir = new File(AppsSettings.get().getAiDeckDir());
+        final String chosenDeck;
+        if (deckName == null || deckName.isEmpty()) {
+            // 纯 /ai：随机挑一个 bot.conf 有人机名且符合房间禁卡表的卡组
+            File botConf = new File(AppsSettings.get().getResourcePath(), Constants.CORE_BOT_CONF_PATH);
+            chosenDeck = AiDeckUtil.pickRandomDeckName(aiDeckDir, botConf, AiDeckUtil.resolveLimitList(lflist));
+            if (chosenDeck == null) {
+                Log.w(TAG, "/ai random: no compliant bot deck available");
+                return;
+            }
+        } else {
+            // 卡组名经聊天转发而来，只接受安全字符，避免借 “AI_<名>.ydk” 拼出目录穿越路径
+            if (!deckName.matches("[A-Za-z0-9_.\\-]+")) {
+                Log.w(TAG, "Rejected /ai deck name: " + deckName);
+                return;
+            }
+            chosenDeck = deckName;
+        }
+        final File deckFile = new File(aiDeckDir, "AI_" + chosenDeck + Constants.YDK_FILE_EX);
+        if (!deckFile.exists()) {
+            Log.w(TAG, "/ai deck not found: " + deckFile.getAbsolutePath());
+            return;
+        }
+        // 人机作为决斗位加入本房间：预先标记其靠整局重放接受撤回后的重同步（同 launchWindBot）
+        server.markPeerNeedsReplayResync();
+        // 参数格式同 buildWindBotArgs：Key=Value，含空格的路径用单引号包裹
+        String args = "Host=127.0.0.1 Port=" + server.getPort()
+                + " Name=WindBot DeckFile='" + deckFile.getAbsolutePath() + "'";
+        try {
+            Intent intent = new Intent();
+            intent.putExtra("args", args);
+            intent.setAction("RUN_WINDBOT");
+            GameApplication.get().sendBroadcast(intent);
+            Log.i(TAG, "Launching WindBot from /ai chat: " + args);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to launch WindBot from /ai", e);
+        }
+    }
+
     /**
      * 启动 WindBot 连接到指定主机并加入房间。
      * 用于人机对战：本地已通过 startLocalServerWithSettings 建立主机后，
-     * 让 AI 作为第二名玩家加入，主机端在 player waiting 页面即可看到其加入。
+     * 让 AI 作为决斗位加入，主机端在 player waiting 页面即可看到其加入。
      *
-     * @param deckFile 为 P2(WindBot) 指定的卡组文件绝对路径；非空时通过 DeckFile 参数
-     *                 覆盖 AI 自带卡组（对应 WindBot 内部 Deck.Load(DeckFile ?? Executor.Deck)）。
+     * @param botCommands 每个待拉起 AI 的 bot.conf 命令行（已含 Hand=1 等追加参数），下标即席位顺序
+     * @param deckFiles   与 botCommands 一一对应的 AI 卡组覆盖路径，空串表示用 AI 内置卡组
+     *                    （对应 WindBot 内部 Deck.Load(DeckFile ?? Executor.Deck)）。
      */
-    public void launchWindBot(String host, int port, String botCommand, String deckFile) {
+    public void launchWindBot(String host, int port, List<String> botCommands, List<String> deckFiles) {
         engine.isBotMode = true;
+        final List<String> commands = (botCommands == null || botCommands.isEmpty())
+                ? Collections.singletonList("") : botCommands;
+        expectedBotSeats = commands.size();
         spawn("WindBotLauncher", "网络-启动WindBot", () -> {
             // 等待本地主机房间就绪再广播启动 WindBot：startLocalServerWithSettings 的
             // 引擎引导（ensureLocalServer）+ createGame 在另一线程完成，房间未建好时 AI 连入无房可加。
@@ -312,34 +379,72 @@ public class ConnectionManager {
                 }
                 server = localServer;
             }
-            // WindBot.RunAndroid 以空格拆分参数(保留单引号片段)，再以 '=' 拆 key/value。
-            // 因此所有参数必须是 Key=Value 形式；含空格的值需用单引号包裹。
-            StringBuilder sb = new StringBuilder();
-            sb.append("Host=").append(host)
-              .append(" Port=").append(port)
-              .append(" Name=WindBot");
-            if (botCommand != null && !botCommand.isEmpty()) {
-                sb.append(' ').append(botCommand);
+            // WindBot.RunAndroid 以空格拆分参数(保留单引号片段)，再以 '=' 拆 key/value，故参数一律 Key=Value，
+            // 含空格的值用单引号包裹；逐席参数由 buildWindBotArgs 拼装
+            Log.i(TAG, "Launching " + commands.size() + " WindBot seats");
+            // 同上：人机作为决斗位加入本房间，标记它们靠整局重放接受撤回后的重同步
+            server = localServer;
+            if (server != null) {
+                server.markPeerNeedsReplayResync();
             }
-            if (deckFile != null && !deckFile.isEmpty()) {
-                // DeckFile 覆盖 AI 默认卡组，作为 P2 实际使用的卡组
-                sb.append(" DeckFile='").append(deckFile).append('\'');
-            }
-            String windbotArgs = sb.toString();
-            Log.i(TAG, "Launching WindBot: " + windbotArgs);
-            engine.mainHandler.post(() -> {
+            final int seats = commands.size();
+            LanGameServer readyServer = server;
+            // 逐席拉起：上一个 AI 入座后才启下一个，保证席位号 1..3 与列表复选顺序一一对应
+            //（同时广播时三个实例的 TCP 接入会排队，先连到哪席不可控）；
+            // 单席超时不再等，宁可序位错也不能不让 AI 进来
+            for (int i = 0; i < seats; i++) {
+                String deckFile = (deckFiles != null && i < deckFiles.size()) ? deckFiles.get(i) : "";
+                String args = buildWindBotArgs(host, port, commands.get(i), deckFile, i);
+                Log.i(TAG, "Launching WindBot seat " + (i + 1) + ": " + args);
                 try {
-                    Intent intent = new android.content.Intent();
-                    intent.putExtra("args", windbotArgs);
+                    final Intent intent = new Intent();
+                    intent.putExtra("args", args);
                     intent.setAction("RUN_WINDBOT");
                     GameApplication.get().sendBroadcast(intent);
-                    scheduleBotJoinTimeout();
                 } catch (Exception e) {
                     Log.e(TAG, "Failed to launch WindBot", e);
                     if (engine.listener != null) engine.listener.onNoticeMessage("启动AI失败: " + e.getMessage());
                 }
-            });
+                if (i < seats - 1) {
+                    waitBotSeatJoined(readyServer, i + 1);
+                }
+            }
+            engine.mainHandler.post(this::scheduleBotJoinTimeout);
         });
+    }
+
+    /** 等待本房间前 {@code botSeats} 个人机席位都已入座，最长 {@link #BOT_SEAT_ORDER_WAIT_MS}。 */
+    private void waitBotSeatJoined(LanGameServer server, int botSeats) {
+        if (server == null) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + BOT_SEAT_ORDER_WAIT_MS;
+        while (System.currentTimeMillis() < deadline && !server.isBotSeatsJoined(botSeats)) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+        if (!server.isBotSeatsJoined(botSeats)) {
+            Log.w(TAG, "AI 席位排队超时（等待 " + botSeats + " 席入座），继续拉起余下 AI");
+        }
+    }
+
+    /** 组装单个 WindBot 实例的启动参数：Host/Port/Name 由本端给定，再拼 bot.conf 命令行与卡组覆盖 */
+    private static String buildWindBotArgs(String host, int port, String botCommand, String deckFile, int index) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Host=").append(host)
+          .append(" Port=").append(port)
+          .append(" Name=WindBot").append(index == 0 ? "" : String.valueOf(index + 1));
+        if (botCommand != null && !botCommand.isEmpty()) {
+            sb.append(' ').append(botCommand);
+        }
+        if (deckFile != null && !deckFile.isEmpty()) {
+            // DeckFile 覆盖 AI 默认卡组，作为本席位实际使用的卡组
+            sb.append(" DeckFile='").append(deckFile).append('\'');
+        }
+        return sb.toString();
     }
 
     // ==== 录像回放控制 ====

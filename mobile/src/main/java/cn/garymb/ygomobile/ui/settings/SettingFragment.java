@@ -13,6 +13,7 @@ import static cn.garymb.ygomobile.Constants.PREF_FONT_ANTIALIAS;
 import static cn.garymb.ygomobile.Constants.PREF_GAME_FONT;
 import static cn.garymb.ygomobile.Constants.PREF_IMMERSIVE_MODE;
 import static cn.garymb.ygomobile.Constants.PREF_KEEP_SCALE;
+import static cn.garymb.ygomobile.Constants.PREF_LOCK_PORTRAIT;
 import static cn.garymb.ygomobile.Constants.PREF_LOCK_SCREEN;
 import static cn.garymb.ygomobile.Constants.PREF_NATIVE_GAME_MODE;
 import static cn.garymb.ygomobile.Constants.PREF_OPENGL_VERSION;
@@ -47,6 +48,7 @@ import android.widget.EditText;
 import android.widget.GridView;
 import android.widget.ImageView;
 import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -81,6 +83,7 @@ import cn.garymb.ygomobile.adapter.DialogImageAdapter;
 import cn.garymb.ygomobile.base.BaseFragemnt;
 import cn.garymb.ygomobile.bean.ImageItem;
 import cn.garymb.ygomobile.bean.events.ExCardEvent;
+import cn.garymb.ygomobile.engine.NativeScriptBootstrap;
 import cn.garymb.ygomobile.lite.BuildConfig;
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.ui.adapters.SimpleListAdapter;
@@ -324,7 +327,12 @@ public class SettingFragment extends SettingFragmentBase implements View.OnClick
         } else if (id == R.id.switch_immersive) {
             mSettings.setImmerSiveMode(checked);
         } else if (id == R.id.switch_lock_screen) {
+            // 游戏横屏锁定：与图片质量同行、随原生UI游戏模式隐藏；
+            // 与游戏内设置弹窗的竖屏锁定互斥，开启横屏锁定时关闭竖屏锁定
             putPrefBool(PREF_LOCK_SCREEN, checked);
+            if (checked) {
+                putPrefBool(PREF_LOCK_PORTRAIT, false);
+            }
         } else if (id == R.id.switch_font_antialias) {
             putPrefBool(PREF_FONT_ANTIALIAS, checked);
         } else if (id == R.id.switch_pendulum) {
@@ -437,30 +445,125 @@ public class SettingFragment extends SettingFragmentBase implements View.OnClick
 
         }
     };
+
+    /**
+     * 重置资源进度浮窗（与 ResCheckTask 初始化资源检查同款 view_res_check_banner）：
+     * 挂在 Activity 内容视图根上，非模态、不遮挡其他操作；挂载失败时退回模态对话框
+     */
+    private View resBanner;
+    private TextView resBannerText;
+    private ProgressBar resBannerBar;
+    /** banner 挂载失败时的模态兜底对话框 */
+    private DialogPlus resFallbackDialog;
+
+    /**
+     * 把重置资源进度浮窗挂到 Activity 内容视图根（android.R.id.content）：
+     * 与 ResCheckTask.attachBanner 同一套入场动画与挂载判定
+     */
+    private boolean attachResBanner() {
+        Activity activity = getActivity();
+        if (activity == null || activity.isFinishing()) {
+            return false;
+        }
+        View root = activity.findViewById(android.R.id.content);
+        // 只在已真正装载过界面的 Activity 上挂浮窗
+        if (!(root instanceof ViewGroup) || ((ViewGroup) root).getChildCount() == 0) {
+            return false;
+        }
+        resBanner = LayoutInflater.from(activity)
+                .inflate(R.layout.view_res_check_banner, (ViewGroup) root, false);
+        resBannerText = resBanner.findViewById(R.id.tv_res_check_step);
+        resBannerBar = resBanner.findViewById(R.id.pb_res_check);
+        ((ViewGroup) root).addView(resBanner);
+        // 从屏幕顶沿下滑入场
+        resBanner.setAlpha(0f);
+        resBanner.post(() -> {
+            if (resBanner == null) {
+                return;     // 重置在布局完成前就结束了，交给 hideResBanner 做移除
+            }
+            resBanner.setTranslationY(-resBanner.getHeight());
+            resBanner.animate().alpha(1f).translationY(0f).setDuration(200).start();
+        });
+        return true;
+    }
+
+    /** 更新重置资源进度（后台线程调用，内部切主线程）：文案格式与 ResCheckTask 一致 */
+    private void updateResProgress(String label, int pct) {
+        final String text = label + " " + pct + "%";
+        VUiKit.post(() -> {
+            if (resBannerBar != null) {
+                resBannerBar.setProgress(pct);
+            }
+            if (resBannerText != null) {
+                resBannerText.setText(text);
+            } else if (resFallbackDialog != null) {
+                resFallbackDialog.setMessage(text);
+            }
+        });
+    }
+
+    /** 收起重置资源进度提示：浮窗向上滑出并移出视图树，对话框直接 dismiss */
+    private void hideResBanner() {
+        final View banner = resBanner;
+        resBanner = null;
+        resBannerText = null;
+        resBannerBar = null;
+        if (banner != null) {
+            banner.animate().alpha(0f).translationY(-banner.getHeight()).setDuration(200)
+                    .withEndAction(() -> {
+                        if (banner.getParent() instanceof ViewGroup) {
+                            ((ViewGroup) banner.getParent()).removeView(banner);
+                        }
+                    }).start();
+        }
+        if (resFallbackDialog != null) {
+            try {
+                if (resFallbackDialog.isShowing()) {
+                    resFallbackDialog.dismiss();
+                }
+            } catch (Exception ignored) {
+                // dismiss 异常不影响重置结果提示
+            }
+            resFallbackDialog = null;
+        }
+    }
+
     public void updateImages() {
-        DialogPlus dialog = DialogPlus.show(getContext(), null, getString(R.string.message));
-        dialog.show();
+        // 与初始化 app 时的资源检查（ResCheckTask）同款顶部进度条浮窗：
+        // 非模态，重置期间仍可操作其他界面；挂载不上时退回原模态对话框
+        resFallbackDialog = null;
+        if (!attachResBanner()) {
+            resFallbackDialog = DialogPlus.show(getContext(), null, getString(R.string.check_res));
+            resFallbackDialog.show();
+        }
         VUiKit.defer().when(() -> {
             try {
+                updateResProgress(getString(R.string.check_things, getString(R.string.images)), 0);
                 //.nomedia
                 IOUtils.createNoMedia(mSettings.getResourcePath());
-                //删除script文件夹，因为已经直接从scripts.zip读取script
-                FileUtils.delFile(mSettings.getResourcePath() + "/" + Constants.CORE_SCRIPT_PATH);
+                //删掉旧版解压落地的 script/ 目录：主脚本已由 native 直读 scripts.zip，
+                //实体目录只剩兜底档，重建时不必再生成（顺带回收 31.5MB）
+                File scriptDir = new File(mSettings.getResourcePath(), Constants.CORE_SCRIPT_PATH);
+                FileUtils.delFile(scriptDir.getAbsolutePath());
                 //复制卡图包
                 if (IOUtils.hasAssets(getContext(), getDatapath(Constants.CORE_PICS_ZIP))) {
                     IOUtils.copyFilesFromAssets(getContext(), getDatapath(Constants.CORE_PICS_ZIP), mSettings.getResourcePath(), true);
                 }
-                //复制脚本包
-                if (IOUtils.hasAssets(getContext(), getDatapath(Constants.CORE_SCRIPTS_ZIP))) {
-                    IOUtils.copyFilesFromAssets(getContext(), getDatapath(Constants.CORE_SCRIPTS_ZIP), mSettings.getResourcePath(), true);
-                }
+                updateResProgress(getString(R.string.check_things, getString(R.string.scripts)), 30);
+                //主脚本：只把包内 scripts.zip 重拷一份（CRC 未变则不碰盘）；native 侧按
+                //size+mtime 自查并重建索引，Java 不再做解压也不需要等待
+                NativeScriptBootstrap.copyScriptsZipFromAssets(getContext(),
+                        getDatapath(Constants.CORE_SCRIPTS_ZIP), scriptDir.getParentFile(), true, null);
+                updateResProgress(getString(R.string.check_things, getString(R.string.game_skins)), 55);
                 //复制textures下的贴图文件
                 IOUtils.copyFilesFromAssets(getContext(), getDatapath(Constants.CORE_SKIN_PATH), mSettings.getCoreSkinPath(), false);
+                updateResProgress(getString(R.string.check_things, getString(R.string.font_files)), 70);
                 //先删除已存在的字体再复制字体
                 String fonts = mSettings.getResourcePath() + "/" + Constants.FONT_DIRECTORY;
                 if (new File(fonts).list() != null)
                     FileUtils.delFile(fonts);
                 IOUtils.copyFilesFromAssets(getContext(), getDatapath(Constants.FONT_DIRECTORY), mSettings.getFontDirPath(), true);
+                updateResProgress(getString(R.string.check_things, getString(R.string.cards_cdb)), 85);
                 //根据系统语言复制特定资料文件
                 if (mSettings.getDataLanguage() == -1) {//如果未在App中指定语言，则查询系统语言并进行设置
                     String language = getContext().getResources().getConfiguration().locale.getLanguage();
@@ -492,6 +595,7 @@ public class SettingFragment extends SettingFragmentBase implements View.OnClick
                         mSettings.copyPtData();
                 }
 
+                updateResProgress(getString(R.string.check_res), 95);
                 /*复制原目录文件
                 if (new File(ORI_DECK).list() != null)
                     FileUtils.copyDir(ORI_DECK, mSettings.getDeckDir(), false);*/
@@ -501,14 +605,20 @@ public class SettingFragment extends SettingFragmentBase implements View.OnClick
                     FileUtils.copyDir(ORI_PICS, mSettings.getCardImagePath(), false);
                 if (new File(ORI_EXPANSIONS).list() != null)
                     FileUtils.copyDir(ORI_EXPANSIONS, mSettings.getExpansionsPath().getAbsolutePath(), false);
+                updateResProgress(getString(R.string.check_res), 100);
             } catch (IOException e) {
                 e.printStackTrace();
                 Log.e("SettingFragment", "错误" + e);
             }
+        }).fail((e) -> {
+            // 异常提前退出时也要收起进度浮窗，不让提示停在半途
+            hideResBanner();
         }).done((rs) -> {
+            hideResBanner();
             YGOUtil.showTextToast(R.string.done);
-            dialog.dismiss();
-            refreshSkinPreviews();
+            if (isAdded()) {
+                refreshSkinPreviews();
+            }
         });
     }
 

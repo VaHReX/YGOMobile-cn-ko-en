@@ -1,6 +1,8 @@
 package cn.garymb.ygomobile.game.gamefield;
 import cn.garymb.ygomobile.game.engine.GameEngine;
 
+import android.util.Log;
+
 import java.nio.ByteBuffer;
 
 import cn.garymb.ygomobile.audio.SoundManager;
@@ -12,10 +14,39 @@ import ocgcore.enums.CardLocation;
  */
 public class MoveEventApplier {
 
+    private static final String TAG = "GameField";
+
+    /**
+     * ocgcore common.h L161-162：{@code REASON_DESTROY=0x1}（被破坏）、{@code REASON_RELEASE=0x2}（作为解放/解放代价）。
+     * <p>
+     * 旧实现把破坏音效误判在 0x2 上（当年注释也写错为“REASON_DESTROY=0x2”），于是只有「以解放/释放
+     * 为代价离开原区域」的移动会响销毁音；而脚本里真正的破坏一律带 0x1（常与 REASON_EFFECT 0x40、
+     * REASON_BATTLE 0x20 组合），包括手卡被破坏（如针虫的巢窟类）、卡组/额外被破坏送墓、魔陷区的
+     * 灵摆怪（刻度卡）被破坏等，均静默无声——即用户反馈的“一些破坏场景没有音效”。
+     */
+    private static final int REASON_DESTROY = 0x1;
+
     private final GameEngine engine;
 
     public MoveEventApplier(GameEngine engine) {
         this.engine = engine;
+    }
+
+    /**
+     * 「源卡查无此卡」时，本条 MSG_MOVE 是否允许新建一张卡片落位。
+     * <p>C++ 端只有 {@code pl == 0} 的新建分支会 {@code CreateCard}（duelclient.cpp L2962-2975），
+     * 普通移动分支拿到 {@code GetCard} 的结果就直接用，<b>从不为查无此卡凭空造卡</b>——它的模型里
+     * 源卡恒在（开局发牌与各次入手都已按 pl==0 / MSG_DRAW 建过）。本端唯一会缺源卡的情形是观战席位
+     * 中途接入：它没赶上开局发牌，之后对方「从手卡」的移动在本地无卡可搬；此时照旧造一张卡塞进
+     * 目的地，就留下一张卡码为 0、点不动、也再没有任何消息把它移走的空卡（用户反馈的「场上横向摆放
+     * 没卡图的空卡」与「对方除外区竖着的里侧影」）。
+     * <p>故只在下述两种情形仍建卡：①本条消息带真实卡码（公开信息，等同 pl==0 的新建语义，观战照常
+     * 看得到对手从手卡召唤/特召/盖放的怪）；②目的地是手卡（张数由 MSG_UPDATE_DATA 的块数经
+     * {@code reconcileHandCount} 对平、卡码由 MSG_CONFIRM_CARDS 补写，不会永久残留）。
+     * 其余（遮蔽移动落到场上/墓地/除外/卡组/额外）一律忽略这条移动，宁可不画也不留幽灵卡。
+     */
+    private static boolean canMaterializeMissingSource(int code, int newLoc) {
+        return code != 0 || (newLoc & 0x7f) == CardLocation.Hand.value();
     }
 
     public void applyMove(int code, int oldCtrl, int oldLoc, int oldSeq, int oldPos,
@@ -28,7 +59,13 @@ public class MoveEventApplier {
         if (newOverlay && !oldOverlay) {
             // 作为超量素材叠放到超量怪兽下方（duelclient.cpp L3055-3095）
             ClientCard card = engine.field.getCard(oldCtrl, oldLoc & 0x7f, oldSeq);
-            if (card == null) card = new ClientCard();
+            if (card == null) {
+                // 源卡不在本端模型里：只有带卡码（或目的地为手卡）的消息才允许建卡，其余按
+                // canMaterializeMissingSource 的判据忽略，避免凭空造出一张永远移不走的 0 码素材
+                if (!canMaterializeMissingSource(code, newLoc)) return;
+                card = new ClientCard();
+                card.owner = oldCtrl;
+            }
             if (code != 0) card.code = code;
             // 对齐 duelclient.cpp MSG_MOVE 素材入 overlay 分支（L3055-3095）：C++ 此分支绝不改写
             // pcard->position，素材保留其在场上的表侧表示，叠放后正面朝上。旧实现用协议 cp 覆盖 position
@@ -83,7 +120,7 @@ public class MoveEventApplier {
             }
         } else if (newLoc == 0) {
             // 离场消失（cl==0，duelclient.cpp MSG_MOVE L2973-2990）：先从区域移除，
-            // 清效果对象链接后淡出到 alpha 5（APPEAR_FRAME 帧），播完由 GameFieldMotion  purge；
+            // 清效果对象链接后淡出到 alpha 5（APPEAR_FRAME 帧），播完由 GameFieldMotion purge；
             // 旧实现直接丢弃卡片，场上/墓地卡片消失没有任何淡出过程
             ClientCard card = engine.field.removeCard(oldCtrl, oldLoc, oldSeq);
             if (card != null) {
@@ -91,6 +128,14 @@ public class MoveEventApplier {
                     card.code = code;
                 card.clearTarget();
                 card.is_hovered = false;
+                // removeCard 已把 location 置 0，而 getCardLocation 的 case 0 与手卡共用分支（同
+                // client_field.cpp L853-854），淡出期间渲染层必须按离场前的区域走：否则手卡/场上卡
+                // 会改走 3D 分支按手卡姿态斜立在手卡行列外，形成一张「没排齐的斜虚影」
+                card.fadeLocation = oldLoc & 0x7f;
+                // 对象/连锁对象/装备图标随卡离场关掉（同 C++ 移除前对 hovered 卡的 SetShowMark 语义）
+                card.is_showequip = false;
+                card.is_showtarget = false;
+                card.is_showchaintarget = false;
                 engine.field.fadeCard(card, 5, GameField.APPEAR_FRAME);
                 engine.field.fadingCards.add(card);
             }
@@ -108,12 +153,42 @@ public class MoveEventApplier {
             engine.field.fadeCard(card, 255, GameField.APPEAR_FRAME);
         } else {
             ClientCard card = engine.field.getCard(oldCtrl, oldLoc, oldSeq);
-            if (card == null) card = new ClientCard();
+            if (card == null) {
+                // C++ 的普通移动分支（duelclient.cpp L2994-3023）拿到 GetCard 结果直接用，绝不为
+                // 查无此卡造卡；本端一旦凭空造一张塞进目的地，就长出点不动也移不走的 0 码幽灵卡
+                //（场上横向空卡、对方除外区里侧竖影）。判据与被忽略原因见 canMaterializeMissingSource。
+                if (!canMaterializeMissingSource(code, newLoc)) {
+                    Log.i(TAG, "MSG_MOVE ignored: source card absent (mid-join spectator) src="
+                            + oldCtrl + "/0x" + Integer.toHexString(oldLoc) + "/" + oldSeq
+                            + " dst=" + newCtrl + "/0x" + Integer.toHexString(newLoc) + "/" + newSeq);
+                    return;
+                }
+                card = new ClientCard();
+                card.owner = oldCtrl;
+            }
             // 对齐 duelclient.cpp MSG_MOVE L2994：仅 code!=0 或回额外卡组(cl==0x40，服务端里侧回插
             // 时 code=0)才 SetCode；SetCode(0) 会把原卡码存入 chain_code（飞行中仍按原卡面绘制），
             // 旧实现无条件覆写 code 使其它隐藏信息移动误清卡码
             if (card.code != code && (code != 0 || newLoc == 0x40))
                 card.setCode(code);
+            // duelclient.cpp MSG_MOVE 普通移动分支 L2999-3014 的逐顶清理：
+            // 离开场上（旧位置为 MZONE/SZONE 且换区）时指示物随卡失效；换区时摘除效果对象
+            // 链接并断开装备关系；无论哪种移动一律关掉卡上的装备/对象/连锁对象图标与悬停态——
+            // 旧实现一个都不清，图标与对象链会跨移区残留（点已无关的旧对象链卡仍亮 target 图标）
+            boolean locChanged = newLoc != oldLoc;
+            if ((oldLoc & 0x0C) != 0 && locChanged) card.counters.clear();
+            if (locChanged) {
+                card.clearTarget();
+                if (card.equipTarget != null) {
+                    card.equipTarget.equipped.remove(card);
+                    card.equipTarget.is_showequip = false;
+                    card.equipTarget = null;
+                }
+            }
+            card.is_hovered = false;
+            card.is_showequip = false;
+            card.is_showtarget = false;
+            card.is_showchaintarget = false;
             // C++ L3018-3020 时序：RemoveCard → 改 position → AddCard。旧实现先覆写 position
             // 再移除，使额外卡组抽出时 removeCard(0x40) 的 isFaceUp 判定读到新值，
             // extraPCount 不递减而漂移；后续里侧回插点 (count-extraPCount) 落在错误层序，
@@ -121,6 +196,11 @@ public class MoveEventApplier {
             engine.field.removeCard(oldCtrl, oldLoc, oldSeq);
             card.position = position;
             engine.field.addCard(newCtrl, newLoc, newSeq, card);
+            // 发动方式地证一：手卡发动必走 move_to_field 发本消息（operations.cpp L4752-4760），
+            // 所以只认「手卡→场上区且表侧」；任何移动都重算两个标记（盖放发动不发移动，保留给 POS_CHANGE）
+            card.actFromHand = (oldLoc & 0x7f) == CardLocation.Hand.value()
+                    && (newLoc & 0x0C) != 0 && (position & GameField.POS_FACEUP) != 0;
+            if (newLoc != oldLoc) card.actFromSet = false;
             // 同区重排（duelclient.cpp MSG_MOVE L3022-3030：pl==cl && pc==cc && cl&0x71）：
             // 先 5 帧每帧横移 ±0.3（对方手卡向右、我方向左抖开），再 5 帧回到新位置，
             // 形成 gframe 标志性的抽卡/缩手抖动；animJitterX 驱动两阶段轨迹（合并 10 帧）。
@@ -208,14 +288,14 @@ public class MoveEventApplier {
                 }
             }
         }
-        // 音效严格对齐 duelclient.cpp MSG_MOVE L2952-2957：仅在真正发生移动（pl!=cl）时，
-        // 除外（目标含 LOCATION_REMOVED=0x20）播 BANISHED，否则因效果破坏（REASON_DESTROY=0x2）播 DESTROYED。
+        // 音效严格对齐 duelclient.cpp MSG_MOVE L2955-2960：仅在真正发生移动（pl!=cl）时，
+        // 目的地含除外位（LOCATION_REMOVED=0x20）播 BANISHED，否则 reason 带破坏位 REASON_DESTROY 播 DESTROYED。
         // C++ 此分支不要求目的地是墓地（破坏回手/回卡组等同样播 DESTROYED），也没有 SUMMON 分支——
         // 召唤/特殊召唤音效由 MSG_SUMMONING/MSG_SPSUMMONING（SummonAnimationManager）负责，此处重复播会错音。
         if (newLoc != oldLoc) {
             if ((newLoc & CardLocation.Removed.value()) != 0) {
                 engine.soundManager.playSoundEffect(SoundManager.SFX.BANISHED);
-            } else if ((reason & 0x2) != 0) {
+            } else if ((reason & REASON_DESTROY) != 0) {
                 engine.soundManager.playSoundEffect(SoundManager.SFX.DESTROYED);
             }
         }
@@ -238,6 +318,12 @@ public class MoveEventApplier {
             if (code != 0 && card.code != code)
                 card.setCode(code);
             card.position = newPos;
+            // 发动方式地证二：盖放的魔陷发动走 change_position（processor.cpp L4139），只发本消息（同格
+            // 里侧→表侧）而不发 MSG_MOVE；攻守互转、翻开被无效等同型翻转不会命中「里侧→表侧」的
+            // 魔陷区卡，而区域限定的误置位也只在文本含「盖放的这张卡发动的场合」时才参与判定
+            if ((oldPos & GameField.POS_FACEDOWN) != 0 && (newPos & GameField.POS_FACEUP) != 0
+                    && (loc & CardLocation.SpellZone.value()) != 0)
+                card.actFromSet = true;
             // 对齐 L3174 MoveCard(pcard, 10)：由 getCardLocation 依据新 position 求目标姿态
             //（里侧翻开 curRotY、攻击↔守备 curRotZ），normalizeAngleTarget 取最短路径，
             // 播放里侧翻开 / 攻守互转的卡片转动动画而非瞬时切换。C++ 此处不播音效，故不加声音。
@@ -293,7 +379,7 @@ public class MoveEventApplier {
         // 存 dField.disabled_field 供交叉线绘制；MSG_SWAP 时由 swapField 同步换位
         int disabled = disabledMask;
         if (!engine.isDuelFirst()) disabled = (disabled >>> 16) | (disabled << 16);
-        engine.field.disabledField = disabled & 0xFFFFFFFFL;
+        engine.field.applyDisabledField(disabled);
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onFieldChanged();
         });

@@ -51,6 +51,7 @@ import cn.garymb.ygomobile.render.card.CardDetailPanel;
 import cn.garymb.ygomobile.render.gamefieldview.GameFieldView;
 import cn.garymb.ygomobile.render.spec.SpecEffectOverlay;
 import cn.garymb.ygomobile.render.field.TextureLoader;
+import cn.garymb.ygomobile.ui.cards.CardDetailRandom;
 import cn.garymb.ygomobile.ui.dialogs.lobby.CreateHostDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.DuelLogDialog;
 import cn.garymb.ygomobile.ui.dialogs.lobby.EmotionDialog;
@@ -80,16 +81,17 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // 引擎引导放在 onCreate 第一时间拉起：脚本解压、卡包物化、cdb 加载全在
+        // 引擎引导放在 onCreate 第一时间拉起：旧残留清理、cdb 加载全在
         // 子线程与界面初始化并行进行，用主菜单/建房/猜拳/选先后攻的全部自然耗时
         // 覆盖首次引导开销，使 ServerDuel#startDuel 开局闸门即时通过、选完直接发牌
         warmUpDuelEngine();
-        // 启动方向按“游戏横屏锁定”设置决定（见 applyOrientationLock）：
-        // 锁定启用→始终横屏（SENSOR_LANDSCAPE 仍可左右横屏对调旋转，不自动转竖屏）；
-        // 未启用→SCREEN_ORIENTATION_FULL_SENSOR，无视系统自动旋转开关也随设备方向自动旋转
+        // 启动方向按“游戏横屏锁定/竖屏锁定”设置决定（见 applyOrientationLock）：
+        // 横屏锁定→SENSOR_LANDSCAPE（仍可左右 180° 对调旋转，不自动转竖屏）；
+        // 竖屏锁定→SENSOR_PORTRAIT；均未开启→SCREEN_ORIENTATION_FULL_SENSOR，
+        // 无视系统自动旋转开关也随设备方向自动旋转
         applyOrientationLock();
         // 息屏/亮屏旋转守卫（用户规格）：游戏显示中息屏后重新亮屏保持原布局，亮屏瞬间不切换
-        // 横竖屏；之后仅当未开启“游戏横屏锁定”设置时才随物理姿态变化旋转切换
+        // 横竖屏；之后仅当未开启“游戏横屏锁定/竖屏锁定”设置时才随物理姿态变化旋转切换
         wakeRotationWatcher = new OrientationEventListener(this) {
             @Override
             public void onOrientationChanged(int orientation) {
@@ -101,7 +103,8 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
                         : Configuration.ORIENTATION_LANDSCAPE;
                 if (physical != frozenOrientation) {
                     // 亮屏后用户实际改变了持机姿态：解除冻结并按设置恢复旋转——
-                    // 横屏锁定开启→SENSOR_LANDSCAPE（仍不转竖屏）；未开启→FULL_SENSOR（可横竖切换）
+                    // 横屏锁定→SENSOR_LANDSCAPE（仍不转竖屏）；竖屏锁定→SENSOR_PORTRAIT；
+                    // 两者均未开启→FULL_SENSOR（可横竖切换）
                     wakeRotationFrozen = false;
                     disable();
                     applyOrientationLock();
@@ -131,16 +134,20 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
     }
 
     /**
-     * 按“游戏横屏锁定”设置应用启动显示方向：
-     * 启用时锁定为横屏但保留左右横屏 180° 对调旋转（SENSOR_LANDSCAPE，不会自动转竖屏）；
-     * 未启用时取 SCREEN_ORIENTATION_FULL_SENSOR（用户规格）：即使系统自动旋转未开启，
+     * 按“游戏横屏锁定/竖屏锁定”设置应用显示方向：
+     * 横屏锁定→SENSOR_LANDSCAPE（锁定横屏，保留左右 180° 对调旋转，不会自动转竖屏）；
+     * 竖屏锁定→SENSOR_PORTRAIT（锁定竖屏，同理保留上下 180° 对调）；两者均未开启时
+     * 取 SCREEN_ORIENTATION_FULL_SENSOR（用户规格）：即使系统自动旋转未开启，
      * 也跟随设备物理方向在横/竖屏间自动旋转（FULL_SENSOR 无视系统自动旋转开关，
-     * 区别于 USER——后者仍受系统开关阻断）；锁定开启时的 SENSOR_LANDSCAPE 保持原有语义。
+     * 区别于 USER——后者仍受系统开关阻断）。
      * configChanges 已声明 orientation|screenSize，旋转不重建 Activity。
+     * 游戏内设置弹窗修改两个锁定开关后会直接调用本方法令设置立即生效。
      */
-    protected void applyOrientationLock() {
+    public void applyOrientationLock() {
         if (AppsSettings.get().isLockSreenOrientation()) {
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        } else if (AppsSettings.get().isLockPortraitOrientation()) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
         } else {
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
         }
@@ -194,8 +201,11 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
         // 布局与 layout_game_right 只在录像、决斗、卡组编辑场景回显；大厅聊天（玩家等待）
         // 虽借 layout_game_right 承载聊天区但不属决斗，不得回显卡详面板与决斗场
         GameEngine eng = engine;
-        boolean replaySessionActive = eng != null && eng.replayMode
-                && eng.replayPlayer != null && eng.replayPlayer.hasActiveSession();
+        // 回放语境按会话状态判（LOADING 也算，见 isReplaySessionActive）：外部打开 yrp 时
+        // enterReplayUI 已把决斗场 UI 切上屏，而 replayMode/isRunning 要等后台线程解完录像才置位，
+        // 旧写法在这段窗口里遇到旋转重建会走「非决斗分支」收起 layout_game_right，GL 曲面随之销毁，
+        // 卡片移动动画永不递减、闸门只能按超时一段一段放行——即只剩决斗背景、场上没有卡片、录像卡住
+        boolean replaySessionActive = isReplaySessionActive();
         // 决斗结束弹窗（待点确定返回主界面）期间 engine.disconnect 已令 isStarted/isSpectator 等
         // 全部为假，但「决斗结束」dialog 仍居中于 layout_game_right，旋转不得隐藏它（用户规格：
         // 保持显示到点确定按钮后才隐藏，隐藏由 returnToLanMain 走非决斗分支完成）
@@ -358,6 +368,11 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
             dialogUtil.repositionHandSelectDialog();
             dialogUtil.repositionTPSelectDialog();
         }
+        // 随机一卡的展示 Toast 是独立窗口、能盖在本 Activity 之上，但不随 setContentView 重定位：
+        // 按用户规格横屏贴左侧、竖屏贴顶部，且只在原定时长内重投（总显示时间不变）。
+        // 挂在本方法而非 onConfigurationChanged：息屏冻结期早退时不会误重定位，
+        // 稍后真正旋转时经同一入口自动补上
+        CardDetailRandom.onOrientationChanged(getResources().getConfiguration().orientation);
         // 主菜单阶段：MainMenuDialog 是独立窗口不受 setContentView 影响，无需回显
     }
     public void toggleEmotionDialog(View anchor) {
@@ -377,6 +392,10 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
      * 抬手时 onCardClick 会以新代际重新排期展示，不受本次收起影响（需求：点屏上任意
      * 不产出新气泡的位置即隐藏旧气泡）。
      * <p>
+     * 卡片选中态同步取消（用户规格）：同一次按下还登记「落在决斗场之外」候选，抬手时若
+     * 决斗场并未接住本次按下（即点的是其它按钮/聊天输入框/被弹窗层接管的位置），就取消金色
+     * 呼吸外框与手卡抬升并收起气泡；决斗场内的点击由自己的拾取结果决定，外部不插手。
+     * <p>
      * 聊天输入框失焦（用户规格）：按下点不在输入框上时取消其焦点并收起输入法，避免光标
      * 一直闪动、输入法已隐藏而焦点仍在输入框时再点输入框唤不起输入法；弹窗包装层转发
      * 进来的触摸不经本派发点，由 DragFrameLayout 的按下归属判定处调同一方法补齐。
@@ -384,6 +403,9 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
         boolean down = ev.getActionMasked() == MotionEvent.ACTION_DOWN;
+        // 取消候选必须在事件下发之前登记：决斗场视图的 OnTouchListener 在同一次派发中
+        // 会把本手势改判为「决斗场自己接住」，届时抬手结算不再取消
+        if (down) GameFieldController.onOutsideGestureDown();
         if (fieldCtl != null) {
             fieldCtl.onFieldTouchForChat(ev);
             if (down) fieldCtl.hideFieldStatusTip();
@@ -391,7 +413,9 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
         if (down) {
             ChatInputUI.clearFocusIfTouchedOutside(this, ev.getRawX(), ev.getRawY());
         }
-        return super.dispatchTouchEvent(ev);
+        boolean handled = super.dispatchTouchEvent(ev);
+        GameFieldController.onOutsideGestureUp(this, ev.getActionMasked());
+        return handled;
     }
     /**
      * 决斗/回放开场：局域网主界面与建主界面仅隐藏（hideForNavigation 保留 reshow 复用态，
@@ -540,9 +564,15 @@ abstract class YGOProActivityUi extends YGOProActivityBase {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                // 已禁用返回键响应：用户需要细化每个场景的返回键操作需求，当前保持返回键无效
-                // （避免在决斗进行中意外弹出退出询问对话框，或影响其他场景的交互）
-                // TODO: 后续根据用户规格细化返回键行为（主菜单/决斗中/回放中等不同场景）
+                // 卡组编辑批量勾选模式：返回键唯一语义是退出批量模式（清空勾选、恢复单卡拖拽），
+                // 此处消费后不再下传；除此之外仍保持返回键无效（避免决斗中误弹退出询问，
+                // TODO: 后续根据用户规格细化其他场景的返回键行为）
+                boolean deckEditorShowing = layoutDeckEditor != null
+                        && layoutDeckEditor.getVisibility() == View.VISIBLE;
+                if (deckEditorShowing && deckEditorManager != null
+                        && deckEditorManager.exitBatchSelectionMode()) {
+                    return;
+                }
             }
         });
     }

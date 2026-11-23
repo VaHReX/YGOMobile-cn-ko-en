@@ -36,7 +36,6 @@ public class ClientCard {
     public int reason;
     public ClientCard equipCard;
     public List<ClientCard> targetCards = new ArrayList<>();
-    public List<ClientCard> overlayCards = new ArrayList<>();
     public Map<Integer, Integer> counters = new HashMap<>();
     public int turnCounter;
 
@@ -56,6 +55,18 @@ public class ClientCard {
     public List<ClientCard> overlayed = new ArrayList<>();
     public ClientCard overlayTarget;
     public int status;
+    /**
+     * 本端版的 ocgcore {@code STATUS_ACT_FROM_HAND}（common.h L222）——核心发给客户端的 status 只放行
+     * DISABLED|FORBIDDEN|PROC_COMPLETE 三位（card.cpp L335），该位从不进包，协议里也没有「从哪发动」
+     * 字段（MSG_CHAINING 的 triggering_location 对两种发动都是 SZONE，因核心先 move_to_field 再发链），
+     * 所以靠场地痕迹重建：手卡发动必走 move_to_field 发 {@code MSG_MOVE}（手卡→魔陷区表侧，
+     * operations.cpp L4752-4760）。由 {@code MoveEventApplier.applyMove} 每次移动重算，连锁结束再清。
+     */
+    public boolean actFromHand;
+    /** 与 {@link #actFromHand} 互斥的反向痕迹：盖放发动走 {@code change_position}（processor.cpp L4139）
+     *  只发同格里侧→表侧的 {@code MSG_POS_CHANGE} 而不发移动，据此正向认定盖放发动，
+     *  避免「两个痕迹都没看到」（如重同步重建卡对象）时只能退到协议区域默认值 */
+    public boolean actFromSet;
 
     /** duelclient.cpp MSG_CARD_HINT 的 desc_hints：效果文字 id→引用计数；TreeMap 对齐 C++ std::map 升序遍历，ClearData 不清（与 C++ 一致）。 */
     public final Map<Integer, Integer> descHints = new TreeMap<>();
@@ -67,6 +78,14 @@ public class ClientCard {
     public boolean is_showequip;
     public boolean is_showtarget;
     public boolean is_showchaintarget;
+    /**
+     * 淡出卡的「原区域」（仅 {@code location==0} 时有意义）：MSG_MOVE cl==0 的离场淡出在本端
+     * 是先把卡从区域列表 structural 移除再淡出（卡片暂存 {@code GameField.fadingCards} 继续绘制），
+     * 而 {@code location} 已被置 0；手卡在绘制分支上靠 {@code location==0x02} 走相机 billboard，
+     * 一旦落到场上卡的 3D 分支就会按手卡姿态（rotX=±0.798/rotY=π）画出一张斜立在手卡行列外的
+     * 幽灵卡。渲染层据此回退到卡离场前的区域，保持与淡出前完全一致的姿态与卡背归属。
+     */
+    public int fadeLocation;
 
     public String atkString = "";
     public String defString = "";
@@ -236,17 +255,28 @@ public class ClientCard {
         descHints.clear();
     }
 
+    /**
+     * client_card.cpp ClientCard::ClearTarget L191-202 逐行等价：双向摘除效果对象关系，
+     * 并关掉对面卡上的对象图标——本卡的 {@code targetCards}（本卡以其为对象的卡）逐个
+     * 清 is_showtarget 并从其 {@code ownerTarget} 中摘掉自己；本卡的 {@code ownerTarget}（以其为
+     * 对象的来源卡）同样清图标并从其 {@code targetCards} 中摘掉自己，最后两个集合均清空。
+     * <p>
+     * 旧实现只扫 {@code targetCards} 并误去动早已不存在的 overlayCards，从不遍历/清空
+     * {@code ownerTarget}：反查关系链因此永久残留（来源卡早已离场/不再以本卡为对象，本卡的
+     * ownerTarget 仍挂着他），点本卡就把过期的来源卡也标上对象图标，表现为「选对象的卡与
+     * 被选对象的卡同时亮 target 图标」。
+     */
     public void clearTarget() {
         for (ClientCard pcard : targetCards) {
             pcard.is_showtarget = false;
-            pcard.overlayCards.remove(this);
+            pcard.ownerTarget.remove(this);
         }
-        for (ClientCard pcard : overlayCards) {
+        for (ClientCard pcard : ownerTarget) {
             pcard.is_showtarget = false;
             pcard.targetCards.remove(this);
         }
         targetCards.clear();
-        overlayCards.clear();
+        ownerTarget.clear();
     }
 
     public void updateQuery(ByteBuffer buf) {

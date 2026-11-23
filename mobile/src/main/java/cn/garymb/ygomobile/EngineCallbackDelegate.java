@@ -3,13 +3,16 @@ package cn.garymb.ygomobile;
 import android.util.Log;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.List;
 
+import cn.garymb.ygomobile.game.deck.DeckEditorManager;
 import cn.garymb.ygomobile.game.engine.GameEngine;
 import cn.garymb.ygomobile.game.gamefield.GameField;
 import cn.garymb.ygomobile.game.replay.ReplayMsgMerger;
 import cn.garymb.ygomobile.game.select.ShowDialogUtil;
 import cn.garymb.ygomobile.render.spec.SpecEffectOverlay;
+import cn.garymb.ygomobile.ui.dialogs.duel.CardDisplayDialog;
 import cn.garymb.ygomobile.ui.dialogs.duel.YesOrNoDialog;
 import ocgcore.enums.DuelPhase;
 
@@ -66,6 +69,10 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
                     break;
                 }
                 activity.enterDuelingUI();
+                // 新一局开场：上一局残留的居中特效（胜负/投降文字、召唤/发动大图等）与待播队列
+                // 一并清掉，不得在新一局里补播上一局的演出（用户反馈：上一局动画未完就投降时，
+                // 下一局会先把旧演出播完才开始）
+                clearSpecEffectsForNewDuel();
                 int selfSeat = activity.engine.getClient().selfType;
                 if (selfSeat >= 7) {
                     // 观战者（NETPLAYER_TYPE_OBSERVER）：不显示底部行动区与时点按钮，左侧面板常驻专用观战控制集（跳到当前/切换视角/退出，需求5）（对齐 event_handler.cpp BUTTON_REPLAY_SWAP / BUTTON_LEAVE_GAME 观战分支）
@@ -86,6 +93,10 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
                 duelEnd.duelEndHandling = false;
                 break;
             case SIDING:
+                // match 局间进入换 side：上一局仍在显示的局内弹窗（询问/选卡/展示/宣言/选项/知会）是独立窗口，
+                // 不随换备卡的卡组编辑器显隐销毁，会浮在编辑器上遮挡操作，故进换 side 界面先全部收口
+                if (activity.dialogUtil != null) activity.dialogUtil.dismissOpenGameDialogs();
+                YesOrNoDialog.dismissShowingDialogs();
                 applySidingScreen();
                 break;
             case DUEL_END:
@@ -94,6 +105,9 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
                 activity.cardDetailPanel.closeGameButtons();
                 duelEnd.duelEndHandling = true;
                 if (activity.dialogUtil != null) activity.dialogUtil.dismissOpenGameDialogs();
+                // 收尾需要等 MSG 尾段动画播完再弹录像/结算窗：释放可能残留的确认卡片持闸，
+                // 否则消息队列永远排不空，等待只能靠 20s 兜底
+                if (activity.engine != null) activity.engine.releaseMsgGateForDialog();
                 if (duelEnd.resultDialog != null) {
                     duelEnd.resultDialog.dismiss();
                     duelEnd.resultDialog = null;
@@ -101,7 +115,8 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
                 // 断开前捕获观战身份（需求4：观战结算前需等所有 msg 对应动画排空）
                 duelEnd.duelEndedAsSpectator = activity.engine != null && activity.engine.isSpectator();
                 if (activity.engine != null) activity.engine.disconnect();
-                // 观战结算前先置动画排空等待截止（processPendingReplays 轮询至消息队列空闲且无动画在播再弹保存录像 dialog，超时兜底防卡死；对战玩家无此等待）
+                // 结算前先置动画排空等待截止（processPendingReplays 轮询至消息队列空闲且无动画在播再弹保存录像 dialog，
+                // 超时兜底防卡死；观战积压可刷新截止，对战方按 20s 截止。对齐 gframe：保存流程只在消息队列耗尽后执行）
                 duelEnd.animSettleDeadlineMs = System.currentTimeMillis() + DuelEndReplayHandler.ANIM_SETTLE_TIMEOUT_MS;
                 // 顺序：先处理通讯发来的录像（保存/取消），全部完成后再弹「决斗结束」对话框
                 duelEnd.scheduleReplayProcessing();
@@ -119,22 +134,47 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         }
     }
 
-    /** 进入/重入换 side 界面：打开卡组编辑器，solo 下按席位顺序 soloSideSession 载入对应席位卡组再进副卡组替换模式；调用点含首次 SIDING（服务端 CHANGE_SIDE）与 solo 后续席位（DeckEditorViewHost.onSideDeckFinished 本地逐席位投递） */
+    /** 进入/重入换 side 界面：打开卡组编辑器，按席位载入“当前对局卡组”再进副卡组替换模式；调用点含首次 SIDING（服务端 CHANGE_SIDE）与 solo 后续席位（DeckEditorViewHost.onSideDeckFinished 本地逐席位投递） */
     void applySidingScreen() {
-        activity.showDeckEditorView();              // 打开卡组编辑器
-        if (activity.deckEditorManager == null) return;
-        boolean solo = activity.engine != null && activity.engine.soloMode;
+        GameEngine eng = activity.engine;
+        boolean solo = eng != null && eng.soloMode;
+        int seat = solo ? eng.soloSideSession : 0;
+        // 同一席位的换侧界面已打开且尚未提交（重复的 SIDING 派发）：不重复推进席位，
+        // 否则会跳过当前席位、载入下一席位卡组（表现为“卡组不是当前使用的卡组”）
+        DeckEditorManager cur = activity.deckEditorManager;
+        if (cur != null && cur.isSidingMode() && !cur.isSideSubmitting()) return;
         if (solo) {
-            // Solo match 换 side：客户端本地逐席位驱动，按席位顺序 soloSideSession 载入对应席位卡组，再进入 side 编辑。
-            int seat = activity.engine.soloSideSession;
-            String[] paths = activity.engine.soloSeatDeckPaths;
-            if (seat >= 0 && seat < paths.length && paths[seat] != null && !paths[seat].isEmpty()) {
-                activity.deckEditorManager.loadDeckForSideSwap(paths[seat]);
-            }
+            int required = eng.gameMode == 2 ? 4 : 2;
+            // 会话计数越界（重复驱动的错位）时不再打开编辑器：否则会在已提交换完的席位上
+            // 再次换 side，服务端无空槽位可归位而回 ERRMSG_SIDEERROR
+            if (seat < 0 || seat >= required) return;
         }
-        activity.deckEditorManager.enterSideMode();  // 记录替换前张数并允许编辑
+        activity.showDeckEditorViewForSiding();        // 打开卡组编辑器（换侧入口：不重载上次卡组）
+        DeckEditorManager mgr = activity.deckEditorManager;
+        if (mgr == null || eng == null) return;
+        String path = "";
+        if (solo && seat < eng.soloSeatDeckPaths.length && eng.soloSeatDeckPaths[seat] != null) {
+            path = eng.soloSeatDeckPaths[seat];
+        } else if (!solo) {
+            // 非 solo：本局提交的卡组即大厅当前选卡（换卡组会同步写回该设置），仅用于标题/重置元信息
+            String lobbyPath = AppsSettings.get().getLastDeckPath();
+            if (lobbyPath != null) path = lobbyPath;
+        }
+        // 以“本场对局卡组快照”为编辑起点：磁盘 ydk 在第 2/3 局之间已不是当前使用的卡组
+        //（换侧结果只提交给本局、不落盘），从磁盘重读会让玩家在错误的卡组上换备卡
+        boolean loaded = false;
+        if (seat >= 0 && seat < eng.matchDecks.length && !eng.matchDecks[seat].isEmpty()) {
+            loaded = mgr.loadDeckForSideSwap(eng.matchDecks[seat].main,
+                    eng.matchDecks[seat].extra, eng.matchDecks[seat].side, path);
+        }
+        if (!loaded && solo && !path.isEmpty()) {
+            // 兜底：快照缺失或本地卡库解析不全时退回按席位路径读盘（第 1 局开局前两者等价）
+            mgr.loadDeckForSideSwap(path);
+        }
+        mgr.ensureSidingDeckLoaded();                  // 前两者都不可用时退回上次卡组，避免空网格
+        mgr.enterSideMode();                           // 记录替换前张数并允许编辑
         if (solo) {
-            activity.engine.soloSideSession++;
+            eng.soloSideSession++;
         }
     }
 
@@ -153,8 +193,10 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         activity.fieldCtl.invalidate();
         activity.runOnUiThread(() -> {
             activity.topInfoManager.updateCardCountDisplay(activity.engine.getField());
+            // 回合数随场面变更直接重取，不再只靠 NEW_TURN/NEW_PHASE 两条回调（观战防漏刷）
+            activity.topInfoManager.syncTurnCounter(activity.engine.getField());
             // 堆叠区查看列表弹窗（观战/录像）即时刷新：任何 field 变化后重拉 supplier，将宿主区域最新状态同步到已开着的弹窗（如果有）
-            cn.garymb.ygomobile.ui.dialogs.duel.CardDisplayDialog.refreshLiveDialogs();
+            CardDisplayDialog.refreshLiveDialogs();
         });
     }
 
@@ -204,7 +246,25 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
     @Override
     public void onChatReceived(int playerType, String message) {
         // 决斗中的聊天/观战发言以 0xF1 伪帧录入当前 MSG 段（回放模式与决斗外场景自动丢弃，见 GameEngine::recordChatFrame），保存录像时随 V2 尾段并入 yrp，无引擎回放按时间线重现；libygo 不读尾段，兼容性不受影响
-        if (activity.engine != null) activity.engine.recordChatFrame(playerType, message);
+        GameEngine eng = activity.engine;
+        if (eng != null) eng.recordChatFrame(playerType, message);
+        // 串行化判据不能只看 inDuel：它要到 MSG_START 真正「派发」时才置真（STOC_DUEL_START 反而先把它写假），
+        // 而观战端整条消息链常被动画闸门一段段持住、开局与局间的队列里常存积压——这段窗口内到达的聊天
+        //（含服务端下发的召唤/特召系统弹幕）会绕过串行链在主线程即时上屏，抢在尚未派发的召唤动画
+        // 前面出现，看上去就是「还没上场的怪兽的召唤词提前弹了」（用户反馈）。
+        // 补的条件只取「队列里还有存量」这一条：队列空时即时与排队等价，而积压中的窗口靠 hasPendingMsgs
+        // 兜住（开局那一串消息里 duelStarted 已为真、inDuel 未真的那一拍队列也必然非空）。刻意不把
+        // duelStarted/siding 也纳进来：局间队列已排空时本就该即时显示，而新一局的 STOC_DUEL_START 会经
+        // prepareNewDuel 把 pendingMsgs 整段丢掉——把一条局间聊天压进那条会被硬清的队列，
+        // 会让它从此永不显示（聊天没有重放机会，不同于可重建的场面消息）。
+        if (eng != null && !eng.replayMode && (eng.inDuel || eng.hasPendingMsgs())) {
+            // 对齐 C++：StocChat 与引擎消息在同一条“被动画阻塞”的串行链上（duelclient.cpp ClientAnalyze
+            // 在 WaitFrameSignal 期间阻塞整条消息线程，STOC_CHAT 自然排在当前动画之后上屏）。
+            // 原先在主线程即时 append，没有积压时（如人机先攻首回合）台词会抢在对应操作动画前面
+            // 出现；改走消息队列后，队列里的动作消息播完动画才轮到聊天，观感与 C++ 一致。
+            eng.postOnMsgQueue(() -> activity.fieldCtl.appendChat(playerType, message));
+            return;
+        }
         activity.runOnUiThread(() -> activity.fieldCtl.appendChat(playerType, message));
     }
 
@@ -253,27 +313,7 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
     public void onUndoResync() {
         // 撤回被接受：点击撤回时即时隐藏的询问弹窗快照作废——被撤销的询问已不存在，服务端重同步后会重新挂回回退点的询问并弹窗，旧窗不得再恢复
         activity.clearUndoHiddenDialogs();
-        activity.runOnUiThread(() -> {
-            if (activity.dialogUtil != null) activity.dialogUtil.dismissOpenGameDialogs();
-            if (activity.cardDetailPanel != null) activity.cardDetailPanel.dismissOpenDialogs();
-            // 连锁必发标志：旧强制连锁询问遗留它会使「取消操作」被吞掉（handleChainCancel 直接 return）
-            YesOrNoDialog.setChainForcedMode(false);
-            // 连锁询问窗静态引用作废：被撤销的那次询问的窗体已被 dismiss，但静态引用还在，handleChainCancel 会把它当成“还挂着”而去 show 一个已死弹窗，或直接放弃处理使取消无效
-            YesOrNoDialog.setChainQueryDialog(null);
-            if (activity.cardDetailPanel != null) {
-                // 面板的选择上下文必须一并作废：「取消操作 / 完成选择」按钮按 currentSelectType 直接编码应答（case 16 连锁→ -1、case 15/20/23/26 → confirm/‑1），撤回后新询问已到达、应答屏障已放行，此时误触这个旧按钮就是把一份旧询问的答复打到新局面上，连锁项与引擎期望对不上 → retry 风暴或直接走偏，决斗再也推不下去
-                activity.cardDetailPanel.setSelectType(-1);
-                activity.cardDetailPanel.hideCancelOrFinishButton();
-                activity.cardDetailPanel.setCurrentDialog(null);
-                activity.cardDetailPanel.setCardSelectDialog(null);
-                activity.cardDetailPanel.setCardDisplayDialog(null);
-            }
-            if (activity.fieldCtl != null) {
-                activity.fieldCtl.abortPendingSelectSessions();
-                activity.fieldCtl.clearSelectionVisuals();
-                activity.fieldCtl.invalidate();
-            }
-        });
+        activity.runOnUiThread(activity::closeDuelUiForUndo);
     }
 
     /** 撤回被服务端拒绝（STOC_UNDO_ACK = DENIED）：待答询问仍是回退前那一条；屏障期间丢弃过应答时询问已按新询问重新派发显示（restorePendingQuestionUi），旧快照必须作废，未丢弃时恢复点击撤回瞬间隐藏的询问弹窗，否则询问永久不可见无法应答 */
@@ -282,16 +322,63 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         activity.runOnUiThread(() -> {
             if (questionRedelivered) {
                 activity.clearUndoHiddenDialogs();
-            } else {
-                activity.restoreUndoHiddenDialogs();
+                return;
             }
+            // 点击撤回瞬间已把询问窗之外的选卡/确认/选项/宣言/表示形式窗按同一口径收口
+            //（用户规格：这些窗的按钮已被应答屏障吞掉，留着只会遮挡回退后的新局面）；这类窗
+            // 没有可原地恢复的实例快照，被拒时只能按留存的最近询问快照重派发，由同一组静态
+            // 工厂重建那张待答窗；重派发成功即作废询问窗旧快照（否则同一条询问叠出两个窗），
+            // 无快照可重派发时退回恢复询问窗旧实例，避免待答询问永久不可见。
+            // isQuestionPending 为双重闸门：收口过应答窗却已无待答询问（罕见的交错时序）时
+            // 不重派发，以免把已答完的旧询问弹回界面造成误答
+            if (activity.consumeUndoClosedQuestionDialog()
+                    && activity.engine != null && activity.engine.isQuestionPending()
+                    && activity.engine.restorePendingQuestionUi()) {
+                activity.clearUndoHiddenDialogs();
+                return;
+            }
+            activity.restoreUndoHiddenDialogs();
         });
+    }
+
+    /** 撤回入口显示态的延时补算（评审 Critical 配套）：显示态已与 1s 发出闸门解耦，若补算
+     *  重算仍为假（其余判定未落定）且最小发出间隔仍在计时，按剩余时间到点后再算一次，
+     *  保证 ic_undo 不会因窗口内评估为假而熄灭后无人点亮（INVISIBLE 图标不吃触摸）。
+     *  用方法引用而非 lambda 作字段初始化：activity 是构造器才赋值的 blank final，
+     *  初始化器里 lambda 体内直接读取会触发「might not have been initialized」确定赋值告警，
+     *  方法引用只绑定 this，字段读取推迟到运行期 */
+    private final Runnable undoPromptRecheck = this::recheckUndoPrompt;
+
+    /** {@link #undoPromptRecheck} 的实体：到点重算 ic_undo 显示态（引擎已销毁/非可撤场景静默跳过） */
+    private void recheckUndoPrompt() {
+        if (activity.engine == null || !activity.engine.canUndo()
+                || activity.topInfoManager == null) return;
+        activity.topInfoManager.setUndoPrompt(activity.engine.isUndoPromptActive());
     }
 
     @Override
     public void onSelectRequired(int selectType, ByteBuffer data) {
         // 询问代次推进（撤回应答屏障的唯一放行点）：必须在投给 UI 之前同步执行；撤回布防记下的是「被撤销的那次询问」的代次，唯有本次新询问把代次推过屏障下界，界面上的选择/命令应答才会重新发往服务端；屏障只压住新询问到达之前那一段
         if (activity.engine != null) activity.engine.onQuestionDispatched();
+        // 本行就是撤回应答屏障的放行点，而服务端把 STOC_UNDO_STATE 发在重挂询问之前——那一波
+        // 评估时重同步尚未落地，准入必为假；此处补一次重算，撤回成功后的「再撤一次」入口
+        // 才会亮出来（连续撤回的可见入口）
+        if (activity.engine != null && activity.engine.canUndo()) {
+            activity.runOnUiThread(() -> {
+                if (activity.topInfoManager != null) {
+                    boolean undoActive = activity.engine.isUndoPromptActive();
+                    activity.topInfoManager.setUndoPrompt(undoActive);
+                    // 评审 Critical：若仍为假且 1s 最小间隔仍在计时，按剩余时间调度一次补算
+                    activity.engine.mainHandler.removeCallbacks(undoPromptRecheck);
+                    if (!undoActive) {
+                        long wait = activity.engine.undoSendIntervalRemainingMs();
+                        if (wait > 0L) {
+                            activity.engine.mainHandler.postDelayed(undoPromptRecheck, wait + 50L);
+                        }
+                    }
+                }
+            });
+        }
         activity.runOnUiThread(() -> {
             // 结束阶段按钮仅在通讯允许进入 EP 时有效：空闲指令(11)/战斗指令(10) 路径内会按指令可用性重新启用；其余请求一律隐藏
             activity.fieldCtl.setEpButtonAllowed(selectType == 10 || selectType == 11);
@@ -358,6 +445,12 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
                 case 27:
                     showDialogUtil.showConfirmCardsDialog(data);
                     break;
+                case 132:
+                    // MSG_ROCK_PAPER_SCISSORS：决斗中脚本猜拳（duelclient.cpp L3973-3980 弹 wHand），
+                    // 应答为 CTOS_RESPONSE int32；与 switch 开头的两个握手层入口（0=STOC_SELECT_HAND、
+                    // 1=STOC_SELECT_TP）走的是不同弹窗与不同协议，不可归并
+                    showDialogUtil.showInDuelRpsDialog();
+                    break;
                 case 140:
                     showDialogUtil.showAnnounceRaceDialog(data);
                     break;
@@ -398,7 +491,15 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         // 观战「跳到当前」瞬间排空期间：丢弃各局胜负文字覆盖与胜负 BGM 覆盖（对齐其他动画回调的 replaySkip 抑制），多局制下不逐局回显 you win/you lose，直接落位到当前最终局面
         if (activity.engine != null && activity.engine.replaySkip) return;
         activity.runOnUiThread(() -> {
-            boolean selfWon = winner != 2 && activity.engine.isSelfSide(winner);
+            // 纯单人（solo）下胜负归属按“当前视角的我方”算，不能走 isSelfSide 的 solo 恒真短路：
+            // 该短路是为“两侧都是同一人、卡片恒可点”设计的，用在胜负文字上会把任何一局都说成
+            // YOU WIN，且把败者名字写成非行动侧（displayName(1)）——而投降判定的败方正是当回合方
+            //（服务端 ServerDuelBase.surrender 按 liveTurnPlayer 取席位）。solo 每回合都把当回合方
+            // 翻到视角下方（localPlayer==0，见 DuelEventHandlerBase.onNewTurn 的 solo 分支），
+            // 故按胜者席位换算视角即可：行动侧胜=YOU WIN、行动侧负=YOU LOSE，败者名取视角下方那侧
+            boolean selfWon = winner != 2 && (activity.engine.soloMode
+                    ? activity.engine.localPlayer(winner & 1) == 0
+                    : activity.engine.isSelfSide(winner));
             int code = winner == 2 ? SpecEffectOverlay.TEXT_DRAW_GAME
                     : (selfWon ? SpecEffectOverlay.TEXT_YOU_WIN
                        : SpecEffectOverlay.TEXT_YOU_LOSE);
@@ -461,13 +562,23 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         activity.runOnUiThread(() -> activity.fieldCtl.hideDuelHint());
     }
 
+    /**
+     * 知会消息（对齐 C++ Game::addMessageBox 与 HINT_MESSAGE 弹的 wMessage：正文 + 「确定」键，
+     * 弹出时响 INFO 音效）：MSG_SHOW_HINT、自定义消息与连接/卡组错误等经引擎 listener 送达；
+     * 旧实现在本层无接手方（GameEngine.EngineListener 的默认空实现），知会整条丢失。
+     */
+    @Override
+    public void onNoticeMessage(String msg) {
+        activity.runOnUiThread(() -> YesOrNoDialog.showMessageDialog(activity, msg));
+    }
+
     @Override
     public void onReplayData(byte[] data) {
         Log.i(TAG, "Replay data received, size=" + data.length);
         // 双兼容合并（读包线程顺序保证：本局全部 MSG 帧先于 STOC_REPLAY 入队）：取最早已完结的逐局录制段 FIFO 配对，把引擎 MSG 尾段并入原录像字节，产物 libygo（ocgcore+script 重跑）与 MsgStreamReplaySource（无引擎）均可播放；无本地段/已是 V2/合并失败时原样返回（见 ReplayMsgMerger）；客机/观战身份下逐局段是服务端遮蔽视角（对方暗区零码），置 GUEST_VIEW 位使回放侧优先引擎重跑恢复全量信息（公开双方手卡），无引擎时退回按流播放
         final byte[] merged = ReplayMsgMerger.appendMsgFrames(data,
                 activity.engine != null ? activity.engine.takeRecordedMsgSegment()
-                        : java.util.Collections.emptyList(),
+                        : Collections.emptyList(),
                 activity.engine != null && !activity.engine.isHost);
         activity.runOnUiThread(() -> {
             duelEnd.pendingReplays.add(merged);
@@ -520,6 +631,16 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
     @Override
     public void onHandResult(int myHand, int oppHand) {
         activity.runOnUiThread(() -> activity.getDialogUtil().onHandResult(myHand, oppHand));
+    }
+
+    @Override
+    public void onDuelRpsResult(int myHand, int oppHand) {
+        // MSG_HAND_RES(133)：走居中特效层的 drawspec case 100 渲染器（与 C++ drawing.cpp L1422-1433
+        // 同一入口，渲染器早已存在只是仍没人接得上）。不另起一套 RPSDialog 动画：汇入串行特效队列后
+        // isBusy() 置真，统一动画闸门据此暂缓后续消息，天然复现 duelclient.cpp L3996 的
+        // WaitFrameSignal(60)；且回放渲染冻结期的 setSuppressed(true) 会直接拒新入队，与 C++ 的
+        // isReplaySkiping 早退同一效果。手势取本方视角的 1/2/3（与 RPSDialog.HAND_* 同值）。
+        activity.runOnUiThread(() -> specEffect().showRpsResult(myHand, oppHand));
     }
 
     // === 玩家等待界面转发（引擎回调 → playerWaitingDialog.handleXxx） ===
@@ -577,13 +698,27 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
         });
     }
 
-    /** 回放结束：用阶段文字（case 101）显示胜负 + 胜利原因（供门面 public showReplayResult 转发）；回放为观战视角，约定 player 0 胜=YOU WIN、player 1 胜=YOU LOSE、player 2=平局，winner<0 表示回放自然播放完毕（无 MSG_WIN 判定）不显示胜负文字 */
-    void showReplayResult(int winner, int reason, String winnerName) {
-        if (winner < 0) return;
+    /**
+     * 回放结束：用阶段文字（case 101）显示胜负 + 胜利原因（供门面 public showReplayResult 转发）。
+     * <p>胜负归属按「当前视角的我方」判定，与 duelclient.cpp MSG_WIN 的 {@code LocalPlayer(player) == 0}
+     * 同构，也与正常决斗/观战的 {@link #onDuelResult} 同口径：录像默认以录制者为视角 0
+     *（ReplayPlayer.startSession 恒置 duelIsFirst=true），但界面「切换视角」按钮会翻转视角侧
+     *（ReplayPlayer.performSwapField 翻 duelIsFirst 并对调名字/LP），此时胜者席位与视角侧不再相等。
+     * 旧写法按 {@code winner == 0} 恒判 YOU WIN，于是切换视角后「视角下方那侧输了」也被说成
+     * YOU WIN（用户反馈：录像里 YOU LOSE 经常不显示，总是只显示 YOU WIN）。
+     * winner==2 为平局（ocgcore PLAYER_NONE），winner&lt;0 表示回放自然播毕（无 MSG_WIN 判定）不显示胜负文字。
+     * <p>胜利说明的「[X] 原因」前缀取【败方】昵称（对齐 duelclient.cpp L1593-1600：我方胜时取
+     * clientname=对方=败者，我方负时取 hostname=我方=败者），不再由调用方传入胜者名。
+     */
+    void showReplayResult(int winner, int reason) {
+        // 引擎已释放（Activity 销毁中）时无视角可换算，也不再弹胜负文字
+        if (winner < 0 || activity.engine == null) return;
+        boolean selfWon = winner != 2 && activity.engine.localPlayer(winner & 1) == 0;
         int code = winner == 2 ? SpecEffectOverlay.TEXT_DRAW_GAME
-                : (winner == 0 ? SpecEffectOverlay.TEXT_YOU_WIN
+                : (selfWon ? SpecEffectOverlay.TEXT_YOU_WIN
                    : SpecEffectOverlay.TEXT_YOU_LOSE);
-        specEffect().showWinText(code, reason, winnerName);
+        String vicName = winner == 2 ? null : playerDisplayName(selfWon ? 1 : 0);
+        specEffect().showWinText(code, reason, vicName);
     }
 
     // === 门面生命周期 / 返回流程对录像状态的复位 ===
@@ -609,6 +744,18 @@ class EngineCallbackDelegate implements GameEngine.EngineListener {
             });
         }
         return specEffectOverlay;
+    }
+
+    /** 新一局开场：丢弃上一局残留的居中特效与待播队列（不新建实例），并告知引擎特效已空闲以重开消息闸门 */
+    private void clearSpecEffectsForNewDuel() {
+        if (specEffectOverlay == null) {
+            return;
+        }
+        specEffectOverlay.hide();
+        // 队列被中断不会自然排空 idle 回调：显式通知引擎解除特效侧动画屏障
+        if (activity.engine != null) {
+            activity.engine.notifySpecEffectIdle();
+        }
     }
 
     /** drawspec 覆盖层按需创建（供 YGOProActivity 弹幕入口转发；与特效回调共用同一实例与 idle 闸门接线） */

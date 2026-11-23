@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="StringFormatInvalid">
     <string name="action_settings">設定</string>
     <string name="action_game">AI対戦</string>
@@ -39,17 +39,16 @@
     <string name="string_help_text">権限が足りません。\n 設定-権限 をクリックして全部を通してください。</string>
     <string name="fetch_ex_card">ネットからカードをダウンロード</string>
     <string name="ex_card_list_title">超非公式☆専用☆</string>
-    <string name="ex_card_log_title">更新リスト</string>
-    <string name="ex_card_report_title">フィードバック</string>
     <string name="ex_card_check_toast_message">非公式パックをダウンロードしないとサーバー対戦ではUNKOWNカードをとして扱う、非公式パックを先にダウンロードしてください</string>
     <string name="ex_card_check_toast_message_ii">非公式パックをダウンロードしないとサーバー対戦ではUNKOWNカードをとして扱う、非公式パックを先にダウンロードしてください</string>
-    <string name="ex_card_check_toast_message_iii">非公式データを認識できません、２３３サイトからダウンロードします</string>
+    <string name="ex_card_check_toast_message_iii">非公式データを認識できません、時間をおいて再度お試しください</string>
 
     <!-- settings -->
     <string name="settings_about">ソフトについて</string>
     <string name="settings_about_sub_about">ソフトについて</string>
     <string name="settings_game_enable_sound_effect">ゲーム起動用サウンド</string>
     <string name="settings_game_screen_orientation">横画面ロック</string>
+    <string name="settings_game_portrait_orientation">縦画面ロック</string>
     <string name="settings_game_font_antialias">アンチエリアシング</string>
     <string name="settings_game_lab_pendulum_scale">ペンデュラムスケール画像</string>
     <string name="settings_game_font_antialias_summary">アンチエリアシングを禁止してFPSを上げる</string>
@@ -154,8 +153,8 @@
     <string name="save_deck">保存</string>
     <string name="save_as_deck">名前を付けて保存 </string>
     <string name="deck_list">デッキリスト</string>
-    <string name="loading">ロード..."</string>
-    <string name="loading_failed">ロード失敗"</string>
+    <string name="loading">ロード...</string>
+    <string name="loading_failed">ロード失敗</string>
     <string name="tip">ヒント</string>
     <string name="question">問う</string>
     <string name="question_delete_deck">デッキを削除?</string>
@@ -169,6 +168,13 @@
     <string name="file_exist">ファイルはすでに存在します</string>
     <string name="share_deck">デッキ共有</string>
     <string name="code_share">デッキコード共有</string>
+    <string name="ask_idle_cmd_label">召喚・セット・ペンデュラム発動前に確認</string>
+    <string name="ask_cmd_summon_confirm" formatted="false">[%s]を召喚しますか？</string>
+    <string name="ask_cmd_set_confirm" formatted="false">[%s]を伏せてセットしますか？</string>
+    <string name="ask_cmd_pendulum_confirm" formatted="false">[%s]をペンデュラムゾーンで発動しますか？</string>
+    <string name="settings_pendulum_activate_btn">ペンデュラムスケール発動ボタンを分離</string>
+    <string name="cmd_pendulum_activate">ペンデュラムゾーンで発動</string>
+    <string name="cmd_activate_monster_effect">モンスター効果の発動</string>
     <string name="screenshoot">スクリーンショット共有</string>
     <string name="ydk_share">ydk共有</string>
     <string name="no_share_app">共アプリは見つかりません</string>
@@ -183,7 +189,12 @@
     <string name="refresh">リフレッシュ</string>
     <string name="select_deck">デッキを選択</string>
     <string name="solo_mode">ソロモード</string>
+    <string name="bot_p2_deck_label">P2デッキ：</string>
+    <string name="bot_tag_max_select">TAGモードではAIを最大3体まで選択できます。差し替えるには選択済みの項目をタップして解除してください。</string>
+    <string name="bot_favorite_added">%1$s をお気に入りに追加しました。リストの先頭に移動しました</string>
+    <string name="bot_favorite_removed">%1$s をお気に入りから解除しました。元の位置に戻りました</string>
     <string name="quit_deck_tip">変更を破棄しますか？</string>
+    <string name="deck_discard_switch_tip">現在のデッキの変更を破棄します。続行しますか？</string>
     <string name="deck_delete_text">デッキ削除</string>
     <string name="question_keep_cur_deck">現在のカードを残す？</string>
     <string name="check_choose_file" formatted="false"> %s を選択しますか？</string>
@@ -252,9 +263,6 @@
     <string name="Join_QQ">QQを参加</string>
     <string name="about_Join_QQ">ソフトフィットバックはQQでお願いします</string>
     <string name="donatefor">寄付はサーバーの維持や情報収集に使用します</string>
-    <string name="coverSelect">カードプロテクターを選択してください</string>
-    <string name="bgSelect">壁紙を選択してください</string>
-    <string name="avatarSelect">アバタを選択してください</string>
     <string name="ClickLinkArrows">クリック矢印を発光する</string>
     <string name="tip_no_permission" formatted="false"> %s 権限はあなたに禁止されています</string>
     <string name="Already_Lastest">新バージョンなし。作者の最新情報を確認？</string>
@@ -270,6 +278,23 @@
     <string name="Download_Precard_Failed">非公式データダウンロー失敗</string>
     <string name="Pre_Server_Name">MYCARD超非公式サーバー</string>
     <string name="Ask_to_Change_Other_Way">メインソースダウンロード失敗，他のダウンロード先を選択してください...</string>
+    <string name="superpre_inc_checking">確認中...</string>
+    <string name="superpre_inc_comparing">比較中...</string>
+    <string name="superpre_inc_requesting">取得中...</string>
+    <string name="superpre_inc_downloading">%1$d%%</string>
+    <string name="superpre_inc_retry_network">再接続中</string>
+    <string name="superpre_inc_retry_server">混雑中</string>
+    <string name="superpre_inc_merging">結合中...</string>
+    <string name="superpre_inc_start">差分更新：%1$dファイル（%2$s）をダウンロード</string>
+    <string name="superpre_inc_fallback">差分更新が利用できません（サーバーまたはデータの問題）。フルパッケージをダウンロードしますか？</string>
+    <string name="superpre_inc_network_failed">ネットワーク接続に失敗しました。ダウンロード済みの%1$sは保持されます。回復後にもう一度ダウンロードを押してください</string>
+    <string name="superpre_inc_network_failed_nothing_kept">ネットワーク接続に失敗しました。回復後にもう一度ダウンロードを押してください</string>
+    <string name="superpre_inc_try_later">新しいバージョンを公開中です。数分後にもう一度お試しください</string>
+    <string name="superpre_inc_long_press_tip">ダウンロードボタンを長押しすると、フルダウンロードを選べます。</string>
+    <string name="superpre_inc_choose_title">ダウンロード方法を選択</string>
+    <string name="superpre_inc_choose_message">差分更新：変更されたファイルをダウンロードします。\nフルダウンロード：パッケージ全体を再ダウンロードします（従来の方法）。</string>
+    <string name="superpre_inc_choose_incremental">差分更新</string>
+    <string name="superpre_inc_choose_full">フルダウンロード</string>
     <string name="DuelAssistant">デュエルアシスタント起動中</string>
     <string name="masterrule">マスタールールを勉強します</string>
     <string name="tutorial">ソフトチュートリアルをチェック</string>
@@ -288,6 +313,7 @@
     <string name="searchresult">検索結果</string>
     <string name="Pre_share">共有中，お待ちを……</string>
     <string name="category_pack">パックリスト</string>
+    <string name="label_release_date">発売日</string>
     <string name="category_windbot_deck">AIデッキ</string>
     <string name="category_Uncategorized">未分類デッキ</string>
     <string name="please_input_category_name">新しい分類名を入力してください</string>
@@ -335,7 +361,7 @@
     <string name="guide_search_result_count">カード数の検査結果を示す</string>
     <string name="guide_button_search_result">検査結果を示す\nブックマークカードを常に表示する</string>
     <string name="guide_view_deck_manager">デッキを変更する\nデッキ分類も管理できます</string>
-    <string name="guide_view_move_card">カードを長押しながら移動できます\nカードを長押しで削除できます</string>
+    <string name="guide_view_move_card">カードを長押ししながら移動できます\n長押しで一括選択モード：一括移動／削除</string>
     <string name="guide_view_banner">MYCARDニュース，クリックして確認する</string>
     <string name="title_delete_ex">非公式データを削除</string>
     <string name="ask_delete_ex">クリアを確認してください</string>
@@ -393,6 +419,9 @@
     <string name="tip_drag_side_full" formatted="false">サイドデッキが上限（%d枚）に達しました</string>
     <string name="tip_drag_extra_in_main">エクストラデッキのカードはメインデッキに置けません</string>
     <string name="tip_drag_normal_in_extra">通常モンスター・魔法・罠カードはエクストラデッキに置けません</string>
+    <string name="batch_delete_done" formatted="false">%d枚のカードを削除しました</string>
+    <string name="batch_delete_none">カードが選択されていません</string>
+    <string name="batch_mode_exit">一括</string>
     <string name="point_cost">ポイント消費</string>
     <string name="credit_limit">ポイント上限</string>
     <string name="switch_genesys_mode">起源点数モード</string>
@@ -499,6 +528,7 @@
     <string name="resource_lflist">· リミットレギュレーション</string>
     <string name="resource_strings">· 文字列などの設定</string>
     <string name="resource_pics">· カード画像アーカイブ</string>
+    <string name="resource_scripts">· スクリプトアーカイブ</string>
 
     <!-- 画像と画面の設定 -->
     <string name="follow_bilibili">Bilibili のフィードをフォロー</string>
@@ -511,11 +541,35 @@
     <string name="quality_high">高</string>
     <string name="settings_opengl_version">OpenGL バージョン</string>
     <string name="settings_screen_padding_summary">画面の余白</string>
-    <string name="settings_native_game_mode">ネイティブUIゲームモード</string>
+    <string name="settings_native_game_mode">実験室：新ゲームUI</string>
     <string name="settings_native_game_mode_summary">原版より多くの新機能</string>
 
     <!-- System Strings for UI Localization (index 1740+) -->
     <string name="spectator_skip_to_current">現在へ移動</string>
     <string name="refresh_lan_button">LANを更新</string>
     <string name="mode_single_duel_solo">ソロモード</string>
+
+    <!-- 適用中効果のヒント（アバター隅の金色の感嘆符バッジとそのドロップダウンリスト） -->
+    <string name="applying_effects_title">適用中の効果</string>
+    <string name="applying_effects_self">自分の適用中の効果</string>
+    <string name="applying_effects_opponent">相手の適用中の効果</string>
+    <string name="applying_effect_scope_turn">このターン</string>
+    <string name="applying_effect_scope_duel">決闘中</string>
+    <!-- /ai 人机召唤 UI -->
+    <string name="btn_ai_summon">/ai（Bot呼び出し）</string>
+    <string name="ai_deck_select_title">%1$s に適合するAIデッキ一覧</string>
+    <string name="ai_deck_random">ランダム-指定なし</string>
+    <string name="ai_deck_empty">現在のリミットレギュレーションに適合するAIデッキがありません</string>
+    <string name="cancel">キャンセル</string>
+    <string name="sort_rule_time">時間↓</string>
+    <!-- 検索結果の見出し -->
+    <string name="section_title_star">%1$d星</string>
+    <string name="section_title_link">LINK-%1$d</string>
+    <string name="section_title_spell">魔法</string>
+    <string name="section_title_trap">罠</string>
+    <string name="section_title_other">その他</string>
+    <string name="section_title_digits">数字</string>
+    <string name="section_title_year">%1$d年</string>
+    <string name="section_title_unknown">不明</string>
+    <string name="section_title_with_count">%1$s · %2$d枚</string>
 </resources>

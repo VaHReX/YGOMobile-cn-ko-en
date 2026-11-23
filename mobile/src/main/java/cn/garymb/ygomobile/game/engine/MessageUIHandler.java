@@ -5,7 +5,6 @@ import android.util.Log;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
-import cn.garymb.ygomobile.audio.SoundManager;
 import cn.garymb.ygomobile.game.gamefield.ClientCard;
 import cn.garymb.ygomobile.game.gamefield.GameField;
 import cn.garymb.ygomobile.ui.dialogs.duel.DuelLogDialog;
@@ -74,11 +73,11 @@ public class MessageUIHandler {
             case 9: {
                 String acText = DuelLogDialog.sysFormat(1512, "已选择数字：%d", data);
                 DuelLogDialog.addLog(acText);
-                engine.soundManager.playSoundEffect(SoundManager.SFX.NEGATE);
+                // C++ 本分支不播任何音效（旧实现额外响一声 NEGATE，会把「宣告数字」听成「效果被无效」）
                 showActionMessage(acText);
                 return;
             }
-            // HINT_ZONE（duelclient.cpp L1529-1572）：Duel.Hint(HINT_ZONE,tp,mask) 宣告区域，掩码按 LocalPlayer 交换两半后仅展开 SZONE 位为同纵列魔陷格玫红呼吸标注至下个 NEW_TURN，MZ 位封锁类在 applyHintZone 内跳过（白X同纵列魔陷格不得误显泡影提示）；case 0 为旧版 constant.lua 无 HINT_ZONE 时 lua_tointeger 降级 type=0 的兼容分支
+            // HINT_ZONE（duelclient.cpp L1529-1572）：Duel.Hint(HINT_ZONE,tp,mask) 宣告区域，掩码按 LocalPlayer 交换两半后仅展开 SZONE 位为同纵列魔陷格玫红呼吸标注至下个 NEW_TURN，MZ 位封锁类在 applyHintZone 内跳过（白X同纵列魔陷格不得误显泡影提示）；case 0 为旧版 constant.lua 无 HINT_ZONE 时 lua_tointeger 降级 type=0 的兼容分支（引擎的位置回报已分流到新 HINT 12，不再经过本分支）
             case 0:
             case 11: {
                 int zones = data;
@@ -87,6 +86,21 @@ public class MessageUIHandler {
                 if (engine.localPlayer(player) == 1)
                     zones = (zones >>> 16) | (zones << 16);
                 engine.field.applyHintZone(zones);
+                engine.mainHandler.post(() -> {
+                    if (engine.listener != null) engine.listener.onFieldChanged();
+                });
+                return;
+            }
+            // HINT_OPPO_SELECT_PLACE（ocgcore common.h 12，operations.cpp move_to_field step1）：
+            // 对手以 EFFECT_OPPO_SELECT_SPSUMMON_ZONE 代选特召位置后的选中格回报，恰为单一位。
+            // 桌面端按「区域宣告」高亮 40 帧（duelclient.cpp 与 HINT_ZONE 同块）且不持久；
+            // 本端只走瞬时高亮——不可落 applyHintZone：回报的 SZ 位与无限泡影类标注同形，
+            // 并入会把单格位置误展开为整回合的玫红呼吸标注
+            case 12: {
+                int zones = data;
+                if (engine.localPlayer(player) == 1)
+                    zones = (zones >>> 16) | (zones << 16);
+                engine.field.flashZones(zones, 40L * 17L); // 40 帧，与 duelclient.cpp WaitFrameSignal(40) 同长
                 engine.mainHandler.post(() -> {
                     if (engine.listener != null) engine.listener.onFieldChanged();
                 });
@@ -104,7 +118,7 @@ public class MessageUIHandler {
     }
 
     /** MSG_HINT 居中消息文本动画（duelclient.cpp L1463-1521：SetStaticText+PopupElement+WaitFrameSignal(40)）：网络线程调用，经 UI 层 SpecEffectOverlay 于右侧中央以 12sp 小字展示，并设约 40 帧动画屏障使 isAnyAnimationBusy 在持有期内恒真以串行插入后续消息。 */
-    private void showActionMessage(String text) {
+    void showActionMessage(String text) {
         if (text == null || text.isEmpty()) return;
         if (engine.replaySkip) return; // 回放快进：丢弃居中消息文本，不占用动画屏障
         final String acText = text;
@@ -130,6 +144,15 @@ public class MessageUIHandler {
         // 回放视角恒以录制者为参照（ReplayPlayer.startSession 置恒等映射/切换翻转），不得由 MSG_START 先攻方重新推断，否则 undo/重放重投本消息会把用户已切视角静默翻回
         if (!engine.replayMode) {
             engine.duelIsFirst = (playerType & 1) == 0;
+            // 视角在这里被重新推断，昵称必须同步重绑：观战手动「切换视角」只翻 duelIsFirst 与
+            // playerInfos 的左右名字（performSpectatorSwap），而 match 局间的本帧会把视角还原到
+            // 默认边——整场第一局的 STOC_DUEL_START 确实会发给观战（在那里绑一次），但 side 局进
+            // 下一局时它不重发（那份包只随换备卡发给提交方，观战只收 WAITING_SIDE），于是旧实现里
+            // 只有场面跟着还原、名字仍停在上一局的交换态，表现为「名字与卡组/场面反了」，
+            // 投降与胜负结算读到的也是错位名字（用户反馈）。
+            // bindViewNames 按座位重算是幂等的：对战席位收到过 STOC_DUEL_START 再算一次同值；
+            // 残局/回放在方法内自行短路，不干扰各自 runner 按视角直写的名字。
+            engine.bindViewNames();
         }
         // tag_player 初始化（duelclient.cpp L1644-1649：isTag 非先动队首回合由队友先打），后续由 MSG_NEW_TURN 逐回合翻转
         if (engine.field.isTag) {
@@ -152,7 +175,10 @@ public class MessageUIHandler {
         engine.field.dInfo.startLp = Math.max(lp0, lp1);
         engine.field.dInfo.lp[p0] = lp0;
         engine.field.dInfo.lp[p1] = lp1;
-        // ClientField::Initial：为双方卡组/额外创建全部 ClientCard（背面朝下、带堆叠高度）
+        // ClientField::Initial（duelclient.cpp L1644-1652）：帧内 deckc/extrac 直接用，为双方卡组/
+        // 额外创建全部 ClientCard（背面朝下、带堆叠高度）。与 C++ 一致，本端不留任何张数缓存、
+        // 不做回退：服务端把帧内张数留 0 时就同样不建堆叠。观战席位也不补建手卡——开局发牌属隐私，
+        // 引擎不给观战下发手卡的 MSG_MOVE，桌面 gframe 同样不显示双方手卡。
         engine.field.initial(p0, deck0, extra0, 0);
         engine.field.initial(p1, deck1, extra1, 0);
         // 回放（含带消息流录像 MSG_START）不切 DUELING 状态：该状态会经 EngineCallbackDelegate 弹底部行动区，回放左侧面板只应显示录像控制条
@@ -343,12 +369,51 @@ public class MessageUIHandler {
 
     public void onSelectCounter(ByteBuffer data) {
         if (engine.replayMode) return;
+        // 对齐 duelclient.cpp MSG_SELECT_COUNTER L2345-2371：本消息不走弹窗，而是把候选卡标成
+        // 场上可选（黄色行进虚线由 SelectionOutlineRenderer 统一承担），由玩家在场上直接点卡取除指示物
+        applyCounterCandidates(data);
         // 对齐 duelclient.cpp L2362-2365：stHintMsg 显示 GetSysString(204)（移除 N 个指示物）
         String hint = engine.hintManager.counterHint(data);
         if (hint != null) engine.hintManager.postDuelHint(hint);
         engine.mainHandler.post(() -> {
             if (engine.listener != null) engine.listener.onSelectRequired(22, data);
         });
+    }
+
+    /**
+     * MSG_SELECT_COUNTER 候选登记（对齐 duelclient.cpp L2345-2364）：读 player(1) counter_type(u16)
+     * counter_count(u16) count(1) + count×[code(4) ctrl(1) loc(1) seq(1) counter(u16)]，按消息顺序把
+     * 候选卡入 {@code field.selectableCards}（应答数组的编码顺序即此顺序），并把该卡当前指示物数同时写入
+     * {@code opParam} 高 16 位（初始值，取满后据此算差值）与低 16 位（点击逐次递减）。
+     * 用 duplicate 解析不推进原缓冲（提示文案与 UI 侧仍需同一份数据）。
+     */
+    private void applyCounterCandidates(ByteBuffer data) {
+        GameField field = engine.field;
+        field.selectableCards.clear();
+        field.selectCounterCount = 0;
+        field.selectCounterType = 0;
+        if (data == null || data.remaining() < 6) return;
+        try {
+            ByteBuffer dup = data.duplicate();
+            dup.order(ByteOrder.LITTLE_ENDIAN);
+            dup.get(); // selecting_player（对齐 C++ 读入即弃）
+            field.selectCounterType = dup.getShort() & 0xFFFF;
+            field.selectCounterCount = dup.getShort() & 0xFFFF;
+            int count = dup.get() & 0xFF;
+            for (int i = 0; i < count && dup.remaining() >= 9; i++) {
+                dup.getInt(); // code（C++ 读入即弃，卡码由场地既有数据提供）
+                int c = engine.localPlayer(dup.get() & 1);
+                int l = dup.get() & 0xFF;
+                int s = dup.get() & 0xFF;
+                int counter = dup.getShort() & 0xFFFF;
+                ClientCard pcard = field.getCard(c, l, s);
+                if (pcard == null) continue;
+                field.selectableCards.add(pcard);
+                pcard.opParam = (counter << 16) | counter;
+                pcard.is_selectable = true;
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     public void onSelectSum(ByteBuffer data) {
@@ -410,7 +475,7 @@ public class MessageUIHandler {
         try {
             ByteBuffer dup = data.duplicate();
             dup.order(ByteOrder.LITTLE_ENDIAN);
-            int selectingPlayer = engine.localPlayer(dup.get() & 0xFF); // player
+            int selectingPlayer = engine.localPlayer(dup.get() & 1); // player
             dup.get(); // finishable
             dup.get(); // cancelable
             dup.get(); // min
@@ -419,7 +484,7 @@ public class MessageUIHandler {
             boolean hasHand = false;
             for (int i = 0; i < count1 && dup.remaining() >= 8; i++) {
                 dup.getInt(); // code
-                int ctrl = engine.localPlayer(dup.get() & 0xFF);
+                int ctrl = engine.localPlayer(dup.get() & 1);
                 int loc = dup.get() & 0xFF;
                 dup.get(); // seq
                 dup.get(); // subseq

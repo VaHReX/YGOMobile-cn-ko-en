@@ -3,9 +3,14 @@ package cn.garymb.ygomobile.render.card;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
+import android.graphics.Paint;
+import android.graphics.Shader;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Layout;
 import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
 import android.text.TextPaint;
@@ -13,6 +18,7 @@ import android.text.method.LinkMovementMethod;
 import android.text.style.ClickableSpan;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.ImageSpan;
+import android.text.style.LineBackgroundSpan;
 import android.util.SparseArray;
 import android.view.View;
 import android.widget.ImageView;
@@ -34,6 +40,7 @@ import cn.garymb.ygomobile.AppsSettings;
 import cn.garymb.ygomobile.game.deck.CardSearcherManager;
 import cn.garymb.ygomobile.game.gamefield.GameField;
 import cn.garymb.ygomobile.game.gamefield.ClientCard;
+import cn.garymb.ygomobile.game.gamefield.EffectActivatableHints;
 import cn.garymb.ygomobile.game.gamefield.EffectActivationLedger;
 import cn.garymb.ygomobile.lite.R;
 import cn.garymb.ygomobile.loader.ImageLoader;
@@ -62,6 +69,8 @@ class CardInfoBinder {
 
     private int currentCardCode = -1;
     private Bitmap coverBitmap;
+    /** 对方卡背（cover2.jpg）缓存：点对方未公开信息的卡时贴，对齐 tCover[1] */
+    private Bitmap coverBitmapOpp;
     private StringManager mStringManager = DataManager.get().getStringManager();
 
     // 关键词卡片列表弹窗支撑（详情描述「」/""高亮点击后在 layout_game_right 最左侧停靠显示命中列表）：
@@ -166,6 +175,7 @@ class CardInfoBinder {
 
     /** 面板隐藏时由 CardDetailPanel.hide() 调用：收起关键词卡片列表弹窗并清理当前卡引用 */
     void dismissKeywordListDialog() {
+        stopGlowBreath();
         dismissKeywordDialog();
         currentDisplayCard = null;
         lastShownClientCard = null;
@@ -181,6 +191,18 @@ class CardInfoBinder {
     }
 
     void showDefault() {
+        showDefault(false);
+    }
+
+    /**
+     * 无卡码/未知卡时的详情重置（对齐 game.cpp ClientField 悬停无码分支的
+     * {@code Game::ClearCardInfo(mcard->controler)}：图框贴 tCover[控制方]，卡名/字段/攻守/描述均清空）。
+     *
+     * @param opponentCover 是否按对方半场取卡背（传入该卡的本地 controler!=0）：旧实现无论哪方
+     *                      都贴 cover.jpg（我方卡背），导致点对方未公开的里侧卡时卡详显示成我方卡背
+     */
+    void showDefault(boolean opponentCover) {
+        stopGlowBreath();
         currentCardCode = -1;
         currentDisplayCard = null;
         lastShownClientCard = null;
@@ -193,7 +215,7 @@ class CardInfoBinder {
         }
         if (panelRoot != null) panelRoot.setVisibility(View.VISIBLE);
         if (ivCardImage != null) {
-            Bitmap cover = getCoverBitmap();
+            Bitmap cover = getCoverBitmap(opponentCover);
             if (cover != null) {
                 ivCardImage.setImageBitmap(cover);
             } else {
@@ -230,7 +252,16 @@ class CardInfoBinder {
         }
         int code = clientCard.displayCode();
         if (code <= 0) {
-            showDefault();
+            // 未公开信息的卡（对方手卡/暗盖卡）：卡背按该卡所在半场取，对齐 ClearCardInfo(mcard->controler)
+            showDefault(clientCard.controler != 0);
+            return;
+        }
+        // 用户规格：详情正在展示该卡时重复点击不重新绑定（保持滚动位置与现状），
+        // 同卡码+同半场即命中；换卡/换码才重走绑定。标记即时刷新走 refreshShownMarks
+        // 不经此门，登记簿/账本变化仍能即时落到展示中的卡详
+        if (layout != null && layout.getVisibility() == View.VISIBLE
+                && currentDisplayCard != null && code == currentCardCode
+                && displayedSide == (clientCard.controler == 1 ? 1 : 0)) {
             return;
         }
 
@@ -261,7 +292,17 @@ class CardInfoBinder {
         lastShownClientCard = clientCard;
         displayedSide = clientCard.controler == 1 ? 1 : 0;
         sActiveBinder = this;
-        bindCardDesc(cardData, collectEffectRefs(code, cardData, displayedSide, clientCard));
+        List<Integer> ourGlow = Collections.emptyList();
+        List<Integer> oppGlow = Collections.emptyList();
+        if (clientCard != null) {
+            // 主阶/战斗指令为全桌广播，对方轮的 SELECT 也收得到：登记簿已含对方半场条目，
+            // 双半场各取一份，命中段铺同款背景呼吸（新规格：不再按半场分色，
+            // 分半场仅作查询隔离）
+            ourGlow = EffectActivatableHints.offsetsFor(code, cardData.Alias, 0);
+            oppGlow = EffectActivatableHints.offsetsFor(code, cardData.Alias, 1);
+        }
+        bindCardDesc(cardData, collectEffectRefs(code, cardData, displayedSide, clientCard),
+                ourGlow, oppGlow);
 
         if (svCardDesc != null) {
             svCardDesc.fullScroll(ScrollView.FOCUS_UP);
@@ -296,8 +337,16 @@ class CardInfoBinder {
                 ? lastShownClientCard : null;
         displayedSide = shown != null ? (shown.controler == 1 ? 1 : 0) : -1;
         sActiveBinder = this;
+        // 可发动效果背景呼吸仅走 ClientCard 展示态路径（场卡/列表临时卡）：卡组编辑态与
+        // 纯卡表展示（shown==null）不呼吸，防过期询问脏染与无归属误呼吸；双半场各取一份
+        List<Integer> ourGlow = Collections.emptyList();
+        List<Integer> oppGlow = Collections.emptyList();
+        if (shown != null && deckCardListHandler == null) {
+            ourGlow = EffectActivatableHints.offsetsFor(card.Code, card.Alias, 0);
+            oppGlow = EffectActivatableHints.offsetsFor(card.Code, card.Alias, 1);
+        }
         bindCardDesc(card, deckCardListHandler != null ? Collections.<EffectRef>emptyList()
-                : collectEffectRefs(card.Code, card, displayedSide, shown));
+                : collectEffectRefs(card.Code, card, displayedSide, shown), ourGlow, oppGlow);
 
         if (svCardDesc != null) {
             svCardDesc.fullScroll(ScrollView.FOCUS_UP);
@@ -330,10 +379,12 @@ class CardInfoBinder {
 
     /** 释放资源 */
     void onDestroy() {
+        stopGlowBreath();
         executorService.shutdown();
     }
 
     void showUnknownCard() {
+        stopGlowBreath();
         currentCardCode = -1;
         currentDisplayCard = null;
         lastShownClientCard = null;
@@ -468,7 +519,16 @@ class CardInfoBinder {
         tvCardLevel.setVisibility(View.VISIBLE);
     }
 
-    private void bindCardDesc(Card cardData, List<EffectRef> effectRefs) {
+    private void bindCardDesc(Card cardData, List<EffectRef> effectRefs,
+                              List<Integer> ourGlowOffsets, List<Integer> oppGlowOffsets) {
+        bindCardDesc(cardData, effectRefs, ourGlowOffsets, oppGlowOffsets, true);
+    }
+
+    /** plainFirst：首屏立即铺纯文本可读；标记刷新路径（用户规格3）传 false，
+     *  旧标记文本保留到新结果就绪再一次性替换，避免命令到达/登记簿变化时闪白 */
+    private void bindCardDesc(Card cardData, List<EffectRef> effectRefs,
+                              List<Integer> ourGlowOffsets, List<Integer> oppGlowOffsets,
+                              boolean plainFirst) {
         if (tvCardDesc == null) return;
         // 记录当前展示的卡，供关键词 queryable 判定（唯一命中即当前卡自身则视为不可查）
         currentDisplayCard = cardData;
@@ -481,8 +541,14 @@ class CardInfoBinder {
         // 后台遍历快照避免与写入交叉；纯卡表展示传空列表则整段标记逻辑短路
         final List<EffectRef> usedIds = effectRefs == null || effectRefs.isEmpty()
                 ? Collections.<EffectRef>emptyList() : new ArrayList<>(effectRefs);
-        // 纯文本立即显示（描述先可读，不等待任何扫描）
-        tvCardDesc.setText(desc);
+        // 可发动效果段落文档序快照（同不受后台任务期间命令清空影响，空集即不呼吸）；
+        // 我方/对方两份分开传递，同款背景呼吸、仅查询与分块归属区分半场
+        final List<Integer> ourGlow = ourGlowOffsets == null || ourGlowOffsets.isEmpty()
+                ? Collections.<Integer>emptyList() : new ArrayList<>(ourGlowOffsets);
+        final List<Integer> oppGlow = oppGlowOffsets == null || oppGlowOffsets.isEmpty()
+                ? Collections.<Integer>emptyList() : new ArrayList<>(oppGlowOffsets);
+        // 纯文本立即显示（描述先可读，不等待任何扫描）；刷新态保留旧标记文本不铺纯文本
+        if (plainFirst) tvCardDesc.setText(desc);
         // 关键词解析 + 高亮 spannable 构建 + queryable 判定（缓存未命中为全卡表扫描）+
         // 关联卡片计算一律在后台线程执行：此前在主线程逐关键词做全表扫描，连续点卡时
         // 主线程被反复阻塞（表现为点卡无响应“卡死”），且与后台线程并发读写普通 HashMap
@@ -492,12 +558,18 @@ class CardInfoBinder {
             if (gen != bindGen) return;
             List<String> keywords = new ArrayList<>();
             // 关键词高亮构建后再叠加已发动效果标记（命中行灰+绿勾，用户规格）
-            final CharSequence marked = markUsedEffects(buildStyledDesc(desc, card, keywords), desc, usedIds);
+            final CharSequence marked = markUsedEffects(buildStyledDesc(desc, card, keywords), desc,
+                    usedIds, ourGlow, oppGlow);
             List<Card> related = relatedCards(card, keywords);
             mainHandler.post(() -> {
                 if (gen != bindGen || tvCardDesc == null) return;
                 tvCardDesc.setText(marked);
                 tvCardDesc.setMovementMethod(LinkMovementMethod.getInstance());
+                // 背景呼吸驱动环（新规格1/2）：EffectBgBreathSpan 的相位按 uptimeMillis 现算，
+                // 而 TextView 缓存 Layout、单纯 invalidate 不重跑 updateDrawState，须按帧
+                // 重 setText 重建；本文无呼吸段则停环防无谓重绘（showDefault 等入口已各自停）
+                if (ourGlow.isEmpty() && oppGlow.isEmpty()) stopGlowBreath();
+                else startGlowBreath();
                 spanStringList.clear();
                 spanStringList.addAll(keywords);
                 lastRelatedCards = related;
@@ -506,158 +578,90 @@ class CardInfoBinder {
         });
     }
 
-    /** 已发动效果行的显示色（用户规格：用过的效果行改灰色，未用行保持原色） */
-    private static final int COLOR_USED_EFFECT = YGOUtil.c(R.color.chat_color_gray);
+    /** 已发动效果行的显示色（用户规格：用过的效果行改灰色，未用行保持原色）；
+     *  grayDark(#A7A7A7) 比正文白字略暗、比旧 chat_color_gray 亮，置灰后文本仍易读 */
+    private static final int COLOR_USED_EFFECT = YGOUtil.c(R.color.grayDark);
     /** 行首插入的打勾前缀：首字符（不换行空格）由 ImageSpan 占位绘制绿圆对勾图标，次字符留间隙 */
     private static final String USED_MARK_PREFIX = "\u00A0 ";
 
     /**
-     * 在关键词高亮结果上叠加「已发动效果」标记（用户规格：不改 cards.cdb，让描述里每个
-     * 效果段落都能对应到引擎）。refs 为发动引用集（descHints 合成记录 + 账本 Activation，
-     * 每条携 完整字符串 id × 半场 × 发动回合），每个 id 两级定位：
+     * 在关键词高亮结果上叠加「已发动效果」标记。refs 为发动引用集（descHints 合成记录 + 账本
+     * Activation）：账本条目的 offset 已由 {@code EffectActivationLedger.resolveOffset} 按 desc
+     * 文本反查为段落文档序；descHints 路径仍按 desc 低 4 位（CLIENT_HINT 的短标签另行兜底）。
+     * 卡码型 id 命中 offset==段落文档序即标整段：
      * <ol>
-     * <li>文本相等匹配：id 经 DataManager.getDesc 取 str1~16/系统字符串文本，归一化后与
-     * 归一化段落行全等才命中。实测本仓库 cdb 的 str 多为「特殊召唤」类短碎片，故严禁
-     * contains 包含匹配（碎片会蹭中错误段落），相等匹配仅作 str 规范库的加成路径。</li>
-     * <li>锚点映射：卡码型 id 低 4 位 offset 即脚本 aux.Stringid(code, n) 的编号。
-     * 统一原则（用户定稿，不做逐卡特例/兼容分支）：带序号段落共 n 个、灵摆框段落 p 个，
-     * 编号按文档序跨框全局连续——灵摆框段占 offset 0..p-1、怪兽框段从 offset p 起；
-     * 灵摆卡恒按「段落文档序==offset」映射，非灵摆卡按「段首圆圈序号==offset」（此类卡
-     * 圆圈序号即文档序），越界不标；卡面圆圈号保持官方逐框重启样式不影响映射。
-     * 上游现状脚本两套约定混用，直接按上述默认映射处理（无校准表/逐卡特例）。异画卡 Stringid 用
-     * 原卡号，uid>>>4 天然共享条目。
-     * 系统字符串 id（≤MAX_STRING_ID）无段序含义，仅走文本匹配。</li>
+     * <li>序号文本数组原则（用户规格2）：卡面带序号段落共 n 个、灵摆框段 p 个，文档序
+     * 跨框全局连续——下标 0..p-1 为灵摆框段、p..n-1 为怪兽框段，offset 直指对应段。</li>
+     * <li>分框分割原则（用户规格3，灵摆怪兽卡）：灵摆框段从第 1 条含「【」或「[」行的
+     * 下一行开始，到第 2 条含「【」或「[」行的上一行结束（第 2 条标题行上方出现分隔线时
+     * 以分隔线为界再往上一行）；第 2 条标题行及其下方不再属灵摆框，其下一行起为怪兽效果段。
+     * 标题行与分隔线自身不归入任何段（邻段置灰不连带），段也不得越过第 2 条标题行上方
+     * 的分隔线延续——怪兽框内仅序号行开头的文本参与段落划分，含①②③序号但非序号
+     * 开头的行不会因灵摆段渗染被误标。</li>
      * </ol>
      * 段落 = 段首效果标记行（换行符后的第一个 ①②③ 圆圈序号行；全文无圆圈序号的传统卡才认 ● 项目符行）
-     * 起、到下一标记行前止，其间的续行/●行等所有行归该段整段置灰；两类框标题行（含半角 `[` 或
-     * 全角 `【` 且含灵摆/怪兽关键词的短行）与两框之间的分隔线不归入任何段（邻段置灰不连带）。打勾图标只插段首。
+     * 起、到下一标记行前止，其间的续行/●行等所有行归该段整段置灰。打勾图标只插段首。
      * 段落自末向首逆序处理：插入前缀只影响其后偏移，未处理段的原始
      * 行下标仍有效。在后台线程执行，不触碰视图。
      */
-    private CharSequence markUsedEffects(CharSequence styled, String desc, List<EffectRef> refs) {
-        if (refs == null || refs.isEmpty() || desc.isEmpty()) return styled;
-        // 拆行：[start, end) 不含换行符
-        List<int[]> lines = new ArrayList<>();
-        int lineStart = 0;
-        for (int i = 0; i < desc.length(); i++) {
-            if (desc.charAt(i) == '\n') {
-                lines.add(new int[]{lineStart, i});
-                lineStart = i + 1;
-            }
-        }
-        lines.add(new int[]{lineStart, desc.length()});
-        int lineCount = lines.size();
-        // 分段规则（用户规格）：段 = 段首圆圈序号行（换行符后第一个序号）起、到下一序号行
-        // 前一行止，其间的续行/●行/【】框标题行等所有行均归该段；全文无圆圈序号行的传统卡
-        // 才按段首 ●/项目符行分段。先扫一遍判定有无圆圈序号行，有则项目符不再切段
-        boolean hasCircled = false;
-        for (int k = 0; k < lineCount && !hasCircled; k++) {
-            hasCircled = leadingCircledIndex(desc.substring(lines.get(k)[0], lines.get(k)[1]).trim()) >= 0;
-        }
-        // 段落归属扫描：框标题行/分隔线切换灵摆框/怪兽框状态但自身不归任何段（paraOf=-1）；
-        // 圆圈/项目符行开启新段落（docIdx 全文连续），并记录 {docIdx, anchor, box}：anchor=段首圆圈序号
-        // 或全文项目符序位（非灵摆卡即 offset）；
-        // 首段之前的背景文本行（含“这个卡名的①②效果…”行）与框标题行/分隔线 paraOf=-1 不参与映射
-        int[] paraOf = new int[lineCount];
-        String[] normLines = new String[lineCount];
-        List<int[]> meta = new ArrayList<>();
-        int docIdx = -1, para = -1, bulletSeq = 0;
-        boolean inPend = false, inMon = false, pendulumSeen = false;
-        for (int i = 0; i < lineCount; i++) {
-            String raw = desc.substring(lines.get(i)[0], lines.get(i)[1]);
-            normLines[i] = normalizeEffectLine(raw);
-            String trimmed = raw.trim();
-            // 用户规格：两类框标题行与分隔线都不属于任何效果段（邻段被标记也不连带置灰）
-            if (isDividerLine(trimmed)) {
-                paraOf[i] = -1;
-                continue;
-            }
-            boolean boxMarker = false;
-            if (isPendulumBoxMarkerLine(trimmed)) {
-                inPend = true; inMon = false; pendulumSeen = true; boxMarker = true;
-            } else if (isMonsterBoxMarkerLine(trimmed)) {
-                inPend = false; inMon = true; boxMarker = true;
-            }
-            if (boxMarker) {
-                paraOf[i] = -1;
-                continue;
-            }
-            int circled = leadingCircledIndex(trimmed);
-            int anchor;
-            if (circled >= 0) {
-                anchor = circled;
-                bulletSeq = circled + 1;   // 其后若混排 ● 续编号，避开已占用的圆圈序号
-            } else if (!hasCircled && !trimmed.isEmpty() && isBulletChar(trimmed.charAt(0))) {
-                anchor = bulletSeq++;
-            } else {
-                anchor = -1;
-            }
-            if (anchor >= 0) {
-                docIdx++;
-                para = docIdx;
-                meta.add(new int[]{docIdx, anchor, inPend ? 1 : (inMon ? 2 : 0)});
-            }
-            paraOf[i] = para;
-        }
-        // 段落→段首圆圈序号：per-duel 条款判定时需要知道限制句中序号与本段的对应关系
-        int[] paraAnchor = new int[docIdx + 1];
-        for (int[] m : meta) paraAnchor[m[0]] = m[1];
-        int monCount = 0, pendCount = 0;
-        for (int[] m : meta) {
-            if (m[2] == 1) pendCount++;
-            else if (m[2] == 2) monCount++;
-        }
-        // 灵摆分框仅在两框都有段落时启用；否则退回全文锚点映射（含只有单框标记的异常文本）
-        boolean pendulum = pendulumSeen && pendCount > 0 && monCount > 0;
+    private CharSequence markUsedEffects(CharSequence styled, String desc, List<EffectRef> refs,
+                                         List<Integer> ourGlowOffsets, List<Integer> oppGlowOffsets) {
+        boolean hasGlow = (ourGlowOffsets != null && !ourGlowOffsets.isEmpty())
+                || (oppGlowOffsets != null && !oppGlowOffsets.isEmpty());
+        if ((refs == null || refs.isEmpty()) && !hasGlow || desc.isEmpty()) return styled;
+        // 拆行/分段/分框/文档序映射与「决斗中只能使用1次」条款判定统一由 EffectParagraphs 承载
+        //（与持续适用效果提示同源，规则详见该类注释），本处只取其只读结果做标记与铺色
+        EffectParagraphs model = EffectParagraphs.build(desc);
+        List<int[]> lines = model.lines;
+        int[] paraOf = model.paraOf;
+        int lineCount = paraOf.length;
         // 标记位域：0=未标 1=对方发动(红勾) 2=我方发动(绿勾)，同段落双方命中时绿优先
         int[] mark = new int[lineCount];
         final int nowTurn = EffectActivationLedger.getCurrentTurn();
         for (EffectRef ref : refs) {
             long uid = ref.id & 0xFFFFFFFFL;
-            // ① 文本全等匹配（str 规范的库最权威，不依赖编号约定假设）；str 行首带不带
-            //    圆圈序号+冒号均可命中 desc 段首行（规范 B：str 填段落全文）
-            List<int[]> hits = new ArrayList<>();
-            String norm = normalizeEffectLine(DataManager.get().getDesc(ref.id, ""));
-            if (!norm.isEmpty()) {
-                String normCore = stripCircledPrefix(norm);
-                for (int i = 0; i < lineCount; i++) {
-                    if (norm.equals(normLines[i])
-                            || (!normCore.isEmpty()
-                            && normCore.equals(stripCircledPrefix(normLines[i])))) {
-                        hits.add(new int[]{paraOf[i], i});
-                    }
-                }
-            }
-            // ② 锚点映射兑底：按统一原则默认映射；offset 落在辅助/适用效果等无对应段落的高序号时自然无命中
-            if (hits.isEmpty() && uid > DataManager.MAX_STRING_ID) {
-                int offset = (int) (uid & 0xf);
-                int hitDoc = -1;
-                for (int[] m : meta) {
-                    if (pendulum ? (m[0] == offset) : (m[1] == offset)) { hitDoc = m[0]; break; }
-                }
-                if (hitDoc >= 0) {
-                    for (int i = 0; i < lineCount; i++) {
-                        if (paraOf[i] == hitDoc) {
-                            hits.add(new int[]{hitDoc, i});
-                            break;
-                        }
-                    }
-                }
-            }
-            if (hits.isEmpty()) continue;
+            // offset 直指段落文档序：系统字符串 id（≤MAX_STRING_ID）无段序含义不标；
+            // 卡码型 id 的低 4 位即段落下标（账本已在登记时按文本反查归轴），
+            // 命中 meta.docIdx 即标整段，越界（辅助/适用效果预留的 ≥n 让位槽）自然无命中。
+            // 异画卡 Stringid 用原卡号，uid>>>4 天然共享条目
+            if (uid <= DataManager.MAX_STRING_ID) continue;
+            int offset = (int) (uid & 0xf);
+            int head = model.firstLineOf(offset);
+            if (head < 0) continue;
             // 回合门控（用户规格3）：1回合1次类标记随回合轮转过期（MSG_WIN/MSG_START 整账
             // 清空后只剩当回合）；引擎不下发限制类别（MSG_CHAINING 仅 code/loc/desc），
             // 故非当回合记录需命中段落块的「决斗中只能使用1次」类条款才持续显示
-            if (ref.turn != nowTurn && !hitsArePerDuel(hits, paraOf, paraAnchor, lines, desc)) continue;
-            int val = ref.side == 0 ? 2 : 1;
-            for (int[] h : hits) markParagraph(mark, paraOf, h[1], val);
+            if (ref.turn != nowTurn && !model.isPerDuel(offset)) continue;
+            markParagraph(mark, paraOf, head, ref.side == 0 ? 2 : 1);
         }
+        // 通讯可发动效果段落（绿/黄呼吸点与 conti_act 动画同源数据：MSG_SELECT_* 选项 desc
+        // 已在登记时按文本反查归轴）：双半场各自记录归属（1=对方 2=我方），与已发动置灰互不影响
+        int[] glowSide = new int[lineCount];
+        markGlowParagraphs(glowSide, paraOf, lineCount, ourGlowOffsets, 2);
+        markGlowParagraphs(glowSide, paraOf, lineCount, oppGlowOffsets, 1);
         SpannableStringBuilder sb = new SpannableStringBuilder(styled);
         boolean iconAvailable = context != null;
         // 标记行按段聚成连续块自下而上处理：同段才合并成块（背景文本两相邻标记行不并），
         // 块首插打勾前缀、整块铺灰
         int i = lineCount - 1;
         while (i >= 0) {
+            // 可发动背景呼吸块先于 mark==0 短路判定（呼吸段不再写 mark，若放在短路之后将成为
+            // 永不执行的死代码——此前「任何模式都不发光」的根因）：整段铺 EffectBgBreathSpan
+            // （holo_blue_bright 背景 50%↔20% 透明度呼吸，用户新规格：文字外发光不够明显），
+            // 不插前缀不置灰，与已发动块同款自下而上处理互不干扰；glowSide 仅用于同段归属
+            // 分块合并（双方同段都可发动时合为一块），不再按半场分色
+            int gi = paraOf[i];
+            if (gi >= 0 && glowSide[i] != 0) {
+                int g = i;
+                while (g - 1 >= 0 && glowSide[g - 1] == glowSide[i] && paraOf[g - 1] == gi) g--;
+                int gs = lines.get(g)[0], ge = lines.get(i)[1];
+                if (gs < ge) {
+                    sb.setSpan(new EffectBgBreathSpan(COLOR_ACTIVATABLE_BG), gs, ge,
+                            SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+                }
+                i = g - 1;
+                continue;
+            }
             if (mark[i] == 0) { i--; continue; }
             int paraId = paraOf[i];
             int j = i;
@@ -705,6 +709,142 @@ class CardInfoBinder {
                 SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
     }
 
+    /** 可发动效果段落背景呼吸基色（用户新规格：柔和向外渐变透明的荧光绿晕染，不再按
+     *  半场分色；询问卡是否发动/是否连锁带呼吸点的卡与命令绿点同源登记，
+     *  点击同样命中本色呼吸段） */
+    private static final int COLOR_ACTIVATABLE_BG = YGOUtil.c(R.color.holo_green_bright);
+
+    /** 把某半场可发动的效果段落文档序整段记入呼吸归属数组（1=对方 2=我方，同段双发取
+     *  较大值）；归属值不再决定颜色（双方同款背景呼吸），仅用于呼吸块合并判定；
+     *  只认序号段落（paraOf>=0），背景/限制行不参与 */
+    private static void markGlowParagraphs(int[] glowSide, int[] paraOf, int lineCount,
+                                           List<Integer> offsets, int val) {
+        if (offsets == null || offsets.isEmpty()) return;
+        for (int off : offsets) {
+            for (int li = 0; li < lineCount; li++) {
+                if (paraOf[li] == off) glowSide[li] = Math.max(glowSide[li], val);
+            }
+        }
+    }
+
+    /** 背景呼吸角速度：比卡角呼吸绿点
+     *  （CardOverlayRenderer.ACT_DOT_BREATH_RAD_PER_MS=0.006）慢 2 倍的正弦，周期≈2.1s */
+    private static final double GLOW_BREATH_RAD_PER_MS = 0.003;
+    /** 呼吸驱动帧间隔：周期≈2.1s 下 50ms/帧足够平滑，非呼吸期不跑帧 */
+    private static final long GLOW_BREATH_FRAME_MS = 50L;
+
+    /** 可发动效果段落背景呼吸 span（用户新规格2：取代硬边 bgColor 矩形——直角背景不好看，
+     *  改画柔和向外渐变透明的 holo_green_bright 晕染，透明度 10%(0x1A)↔30%(0x4D) 交替）：
+     *  实现 {@link LineBackgroundSpan}，按 span 在行内的子段坐标画两端渐隐的胶囊圆角矩形
+     *  （水平 LinearGradient 外缘渐透，圆角半径取行高一半，无直角）。
+     *  <p>平台签名差异（看不见的根因）：API 35 起接口只有带 baseline 的 11 参方法且 StaticLayout
+     *  传入的 text 为原始文本 CharSequence（不再是旧版的 Layout 自身）；旧运行时（API<35）接口
+     *  则只有 10 参抽象方法——只实现其中一个会分别在新版不绘制（instanceof Layout 早退）/旧版
+     *  AbstractMethodError，故两个重载都写并共享同一段自适应绘制逻辑（10 参版在 compileSdk 35
+     *  下不存在不可标 @Override，靠运行时签名分派）。旧版 Layout 路径用 getPrimaryHorizontal 取
+     *  字级 x；新版原文本路径拿不到 Layout，退回整行 left..right 胶囊（呼吸段按整段铺设，实际
+     *  贴合）；相位取 uptimeMillis 现算，由 {@link #glowBreathTick} 周期性重 setText 驱动刷新
+     *  （TextView 缓存 Layout，单纯 invalidate 不会重跑绘背景）；与高亮词前景 span/下划线/点击
+     *  span 叠加共存 */
+    private static final class EffectBgBreathSpan implements LineBackgroundSpan {
+        private final int rgb;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        EffectBgBreathSpan(int argb) { this.rgb = argb & 0x00FFFFFF; }
+
+        /** API 35+ 新签名（compileSdk 35 接口中唯一的抽象方法） */
+        @Override
+        public void drawBackground(Canvas c, Paint p, int left, int right, int top, int bottom,
+                                   int baseline, CharSequence text, int start, int end, int lnum) {
+            drawBreath(c, p, left, right, top, bottom, text, start, end);
+        }
+
+        /** API<35 旧签名：该运行时接口只有这个 10 参抽象方法；在 compileSdk 35 上非接口方法，
+         *  故不加 @Override，按方法签名参与虚分派，旧机 StaticLayout 调用时命中本方法 */
+        public void drawBackground(Canvas c, Paint p, int left, int right, int top, int bottom,
+                                   CharSequence text, int start, int end, int lnum) {
+            drawBreath(c, p, left, right, top, bottom, text, start, end);
+        }
+
+        private void drawBreath(Canvas c, Paint p, int left, int right, int top, int bottom,
+                                CharSequence text, int start, int end) {
+            // 旧版传入的是 Layout 自身（可取字级水平坐标）；API 35+ 传入原始文本
+            Layout layout = (text instanceof Layout) ? (Layout) text : null;
+            CharSequence buf = layout != null ? layout.getText() : text;
+            if (!(buf instanceof android.text.Spanned)) return;
+            android.text.Spanned sp = (android.text.Spanned) buf;
+            int ss = sp.getSpanStart(this), se = sp.getSpanEnd(this);
+            int s, e;
+            if (ss >= 0 && se > ss) {
+                s = Math.max(start, ss);
+                e = Math.min(end, se);
+            } else {
+                // 查不到自身区间（平台副本异常等边角）：drawBackground 被调到本行本身即说明
+                // span 与该行相交，按整行区间铺设，不让定位失败导致整体不可见
+                s = start;
+                e = end;
+            }
+            if (s >= e) return;
+            float sx, ex;
+            if (layout != null) {
+                sx = left;
+                ex = right;
+                try {
+                    float xs = layout.getPrimaryHorizontal(s);
+                    float xe = layout.getPrimaryHorizontal(Math.max(s, e - 1));
+                    if (xe > xs + 0.5f) {
+                        // 末字符右缘：再加一个字宽估计，不超出本行右界
+                        xe = Math.min(xe + p.measureText(buf.subSequence(Math.max(s, e - 1), e).toString()), right);
+                    }
+                    if (xe > xs) { sx = xs; ex = xe; }
+                } catch (RuntimeException bad) {
+                    sx = left;
+                    ex = right;
+                }
+            } else {
+                sx = left;
+                ex = right;
+            }
+            if (ex <= sx) return;
+            float p0 = 0.5f + 0.5f * (float) Math.sin(
+                    (double) android.os.SystemClock.uptimeMillis() * GLOW_BREATH_RAD_PER_MS);
+            int a = (int) (0x1A + 0x33 * p0); // alpha ≈10%..30% 随相位循环
+            float pad = (bottom - top) * 0.10f;
+            float y0 = top - pad, y1 = bottom + pad;
+            float rad = Math.min((y1 - y0) * 0.5f, (ex - sx) * 0.5f);
+            paint.setShader(new LinearGradient(sx, 0f, ex, 0f,
+                    new int[]{rgb, (a << 24) | rgb, (a << 24) | rgb, rgb},
+                    new float[]{0f, 0.10f, 0.90f, 1f}, Shader.TileMode.CLAMP));
+            c.drawRoundRect(sx, y0, ex, y1, rad, rad, paint);
+            paint.setShader(null);
+        }
+    }
+
+    /** 呼吸驱动环：呼吸段存在时每 50ms 重建一次文本（span 集合原样携带，Layout 重建重跑
+     *  绘背景刷新相位）；呼吸段过期（命令清空/换卡/切卡详）时自动停环，
+     *  不留持续重绘开销 */
+    private final Runnable glowBreathTick = new Runnable() {
+        @Override
+        public void run() {
+            if (tvCardDesc == null) return;
+            CharSequence t = tvCardDesc.getText();
+            if (!(t instanceof android.text.Spanned)
+                    || ((android.text.Spanned) t).getSpans(0, t.length(), EffectBgBreathSpan.class).length == 0) {
+                return;
+            }
+            tvCardDesc.setText(new SpannableStringBuilder(t));
+            mainHandler.postDelayed(this, GLOW_BREATH_FRAME_MS);
+        }
+    };
+
+    private void startGlowBreath() {
+        mainHandler.removeCallbacks(glowBreathTick);
+        mainHandler.post(glowBreathTick);
+    }
+
+    private void stopGlowBreath() {
+        mainHandler.removeCallbacks(glowBreathTick);
+    }
+
     /** 命中的是效果段内任意行（含续行）则整段标记；背景文本（para -1）仅标记该行。
      *  值语义 1=对方(红勾) 2=我方(绿勾)，双方命中同段时取 max 即绿优先、不降级 */
     private static void markParagraph(int[] mark, int[] paraOf, int lineIdx, int val) {
@@ -717,78 +857,8 @@ class CardInfoBinder {
         }
     }
 
-    /** 「决斗中只能使用1次」类限制条款关键词（实测 assets 6 套 cdb）：中文「决斗中只能…」、
-     * 繁中「決鬥中/決闘中」、日「デュエル中に１度しか…」、韩「듀얼( 중에) 1번밖에/1장밖에」、
-     * 西「por Duel(o)」、英/葡「per Duel」；拉丁部分小写比较 */
-    private static final String[] PER_DUEL_MARKS = {
-            "决斗中", "決鬥中", "決闘中", "デュエル中", "듀얼", "per duel", "por duelo"
-    };
-    /** 与决斗词同现的「一度/しか」类限定词，排除仅卡名含决斗字样的行 */
-    private static final String[] PER_DUEL_ONCE_WORDS = {"只能", "しか", "밖에", "만", "once", "vez"};
-
-    /** 命中行所在段落块内是否存在 per-duel 条款（任一命中成立即跨回合持续保留）：
-     *  段落块 = 该段全部行 + 段首上方紧邻的连续背景行（发动限制语句惯写在段首之前，
-     *  如「这个卡名的②的效果在决斗中只能使用1次。」）；para=-1 背景命中时取该行上下紧邻背景行 */
-    private static boolean hitsArePerDuel(List<int[]> hits, int[] paraOf, int[] paraAnchor, List<int[]> lines, String desc) {
-        for (int[] h : hits) {
-            int para = h[0];
-            int lo, hi;
-            if (para >= 0) {
-                lo = Integer.MAX_VALUE;
-                hi = -1;
-                for (int k = 0; k < paraOf.length; k++) {
-                    if (paraOf[k] == para) { if (k < lo) lo = k; if (k > hi) hi = k; }
-                }
-                if (hi < 0) continue;
-                while (lo - 1 >= 0 && paraOf[lo - 1] < 0) lo--;
-            } else {
-                lo = h[1];
-                hi = h[1];
-                while (lo - 1 >= 0 && paraOf[lo - 1] < 0) lo--;
-                while (hi + 1 < paraOf.length && paraOf[hi + 1] < 0) hi++;
-            }
-            char anchorCh = para >= 0 && para < paraAnchor.length
-                    ? (char) (0x2460 + paraAnchor[para]) : 0;
-            for (int k = lo; k <= hi; k++) {
-                if (lineMarksPerDuel(desc.substring(lines.get(k)[0], lines.get(k)[1]), anchorCh)) return true;
-            }
-        }
-        return false;
-    }
-
-    /** 单行是否携归属本段的 per-duel 条款：含决斗词+一度限定词的行按读句分隔符拆小句，
-     *  含决斗词的小句无圆圈序号（全局限制句，如「这个卡名的效果在决斗中只能使用1次」）
-     *  即命中；有小句带序号时须含本段序号（如「①的效果1回合只能使用1次，②的效果在决斗
-     *  中只能使用1次」只对②持续） */
-    private static boolean lineMarksPerDuel(String line, char anchorCh) {
-        String low = line.toLowerCase(java.util.Locale.ROOT);
-        boolean anyMark = false;
-        for (String m : PER_DUEL_MARKS) {
-            if (low.contains(m)) { anyMark = true; break; }
-        }
-        if (!anyMark) return false;
-        boolean anyOnce = false;
-        for (String w : PER_DUEL_ONCE_WORDS) {
-            if (low.contains(w)) { anyOnce = true; break; }
-        }
-        if (!anyOnce) return false;
-        for (String c : line.split("[，,、。．；;]")) {
-            String cl = c.toLowerCase(java.util.Locale.ROOT);
-            boolean hasMark = false;
-            for (String m : PER_DUEL_MARKS) {
-                if (cl.contains(m)) { hasMark = true; break; }
-            }
-            if (!hasMark) continue;
-            boolean hasCircled = false;
-            for (int k = 0; k < c.length(); k++) {
-                char ch = c.charAt(k);
-                if (ch >= 0x2460 && ch <= 0x2473) { hasCircled = true; break; }
-            }
-            if (!hasCircled) return true;
-            if (anchorCh != 0 && c.indexOf(anchorCh) >= 0) return true;
-        }
-        return false;
-    }
+    // 「决斗中只能使用1次」条款关键词与判定已随分段规则一并迁入 EffectParagraphs
+    //（isPerDuel），此处不再重复维护两套关键词表。
 
     /** 汇总标记所需的「已发动」段落引用候选：descHints（CHINT 持续提示，属当前展示卡半场，
      *  回合取当前恒可见）与账本按半场过滤的发动记录（side=-1 取双方）合并；每条记录以展示
@@ -825,26 +895,28 @@ class CardInfoBinder {
         }
     }
 
-    /** 引擎派发线程在发动登记/回合轮转/开局胜负清零后回调（经 CardDetailPanel.refreshCardDetailMarks
-     *  进入）：主线程重绑正在展示卡的描述标记（用户规格1：本回合发动无需重新点卡即时刷新） */
+    /** 引擎派发线程在发动登记/回合轮转/开局胜负清零、可发动登记簿登记/清空后回调
+     *  （经 CardDetailPanel.refreshCardDetailMarks 进入）：主线程重绑正在展示卡的描述
+     *  标记（用户规格1：本回合发动无需重新点卡即时刷新；新规格3：可发动段落出现/过期
+     *  同样即时刷新） */
     static void notifyLedgerChanged() {
         final CardInfoBinder b = sActiveBinder;
         if (b == null) return;
-        b.mainHandler.post(b::refreshShownMarks);
+        b.mainHandler.post(b::scheduleMarksRefresh);
     }
 
-    /** 效果发动专用的门控刷新（用户规格2：不同卡码的卡发动不打扰面板）：仅当发动卡与
+    /** 效果发动/登记专用的门控刷新（用户规格2：不同卡码的卡发动不打扰面板）：仅当相关卡码与
      *  正在展示卡同码、或互为异画/同名 alias（两码共用效果段落与账本镜像）时才重绑 */
     static void notifyLedgerChanged(int activatedCode) {
         final CardInfoBinder b = sActiveBinder;
         if (b == null) return;
         b.mainHandler.post(() -> {
-            if (b.affectsShownCard(activatedCode)) b.refreshShownMarks();
+            if (b.affectsShownCard(activatedCode)) b.scheduleMarksRefresh();
         });
     }
 
-    /** 视角切换回调（观战/单人自动翻转/回放交换，用户规格3）：账本 side 语义已随视角
-     *  整体对调（EffectActivationLedger.swapSides）、场卡 controler 已由 swapField 重算，
+    /** 视角切换回调（观战/单人自动翻转/回放交换，用户规格3）：账本与登记簿的 side 语义已随视角
+     *  整体对调（swapSides）、场卡 controler 已由 swapField 重算，
      *  展示卡半场取绑定态快照翻转后无条件重绑，绿/红勾随双方互换 */
     static void notifyViewpointSwapped() {
         final CardInfoBinder b = sActiveBinder;
@@ -853,6 +925,16 @@ class CardInfoBinder {
             if (b.displayedSide >= 0) b.displayedSide = 1 - b.displayedSide;
             b.refreshShownMarks();
         });
+    }
+
+    /** 标记刷新防抖：同一引擎消息段内「先清后登」（clearCommandFlags → 命令解析逐段登记）会
+     *  多次触发刷新，40ms 内合并为一次——既不以「已清空未登记」的中间态重绑闪断呼吸，
+     *  又避免每条命令双份后台重建开销 */
+    private final Runnable marksRefreshTick = this::refreshShownMarks;
+
+    private void scheduleMarksRefresh() {
+        mainHandler.removeCallbacks(marksRefreshTick);
+        mainHandler.postDelayed(marksRefreshTick, 40L);
     }
 
     /** 发动卡码是否与正在展示卡相关：同码直接相关；异画卡与本卡共用效果段落编号和
@@ -875,116 +957,20 @@ class CardInfoBinder {
         if (deckCardListHandler != null || currentDisplayCard == null || currentCardCode <= 0) return;
         ClientCard cc = lastShownClientCard != null && lastShownClientCard.displayCode() == currentCardCode
                 ? lastShownClientCard : null;
-        bindCardDesc(currentDisplayCard, collectEffectRefs(currentCardCode, currentDisplayCard, displayedSide, cc));
+        // plainFirst=false（新规格3）：刷新期间保留旧标记文本，新结果就绪后一次性替换，
+        // 命令到达/登记簿清空都不闪白；可发动呼吸仍只走 ClientCard 展示态路径（与
+        // showCard 首显同款 cc 门控）：纯卡表展示无归属，不过期询问脏染
+        bindCardDesc(currentDisplayCard,
+                collectEffectRefs(currentCardCode, currentDisplayCard, displayedSide, cc),
+                cc != null ? EffectActivatableHints.offsetsFor(currentCardCode, currentDisplayCard.Alias, 0)
+                        : Collections.<Integer>emptyList(),
+                cc != null ? EffectActivatableHints.offsetsFor(currentCardCode, currentDisplayCard.Alias, 1)
+                        : Collections.<Integer>emptyList(),
+                false);
     }
 
-    /**
-     * 灵摆框标题行（多语言，实测 assets 6 套 cards.cdb）：中「←6 【灵摆】 6→/【灵摆】」、
-     * 英「[ Pendulum Effect ]」、西「【Efecto de Péndulo】」、葡「[ Pendulum Effect ]/
-     * 【Efeito Pêndulo】」、韩「【펜듈럼 효과】」、日「【Ｐスケール：青６／赤６】(兼作灵摆框首行，
-     * 日文无独立 Ｐ効果 标题)」。判据（用户归纳）：行含 [ 或 【 且含灵摆关键词的短行。
-     * 圆圈序号开头的效果行（如“①：此卡①的灵摆效果…”）不算。
-     */
-    private static boolean isPendulumBoxMarkerLine(String trimmed) {
-        return isBoxMarkerLine(trimmed, PENDULUM_TITLE_KEYWORDS);
-    }
-
-    /**
-     * 怪兽框标题行（多语言）：中「【怪兽效果】/【怪兽描述】」、英/葡「[ Monster Effect ]」、
-     * 西「【Efecto de Monstruo】」、葡「【Efeito de Monstro】」、韩「【몬스터 효과】」、
-     * 日「【モンスター効果】」。判据同灵摆框标题行。
-     */
-    private static boolean isMonsterBoxMarkerLine(String trimmed) {
-        return isBoxMarkerLine(trimmed, MONSTER_TITLE_KEYWORDS);
-    }
-
-    /** 框标题行关键词（拉丁部分一律小写，匹配前对行做 toLowerCase；CJK/假名/谚文不受大小写影响） */
-    private static final String[] PENDULUM_TITLE_KEYWORDS = {
-            "灵摆", "靈擺", "pendulum", "펜듈럼",
-            "péndulo", "pêndulo",                       // 西 / 葡（含尖音符变体）
-            "ｐスケール", "pスケール", "ｐ効果", "p効果" // 日文框首行/Ｐ効果标题
-    };
-    private static final String[] MONSTER_TITLE_KEYWORDS = {
-            "怪兽", "怪獸",                                   // 简/繁（覆盖【怪兽效果】与【怪兽描述】变体）
-            "monster",                                        // 英/葡 [ Monster Effect ]
-            "몬스터", "モンスター",                        // 韩 / 日
-            "monstruo", "monstro"                             // 西 / 葡
-    };
-
-    private static boolean isBoxMarkerLine(String trimmed, String... keywords) {
-        // 段首圆圈行优先当效果段处理，不当框标记
-        if (trimmed.isEmpty() || leadingCircledIndex(trimmed) >= 0) return false;
-        // 用户判据：框标题行必含 [ 或 【 两种方括号之一，且为短行（效果段长句不算）
-        if (trimmed.length() > 24) return false;
-        if (trimmed.indexOf('[') < 0 && trimmed.indexOf('【') < 0) return false;
-        String low = trimmed.toLowerCase(java.util.Locale.ROOT);
-        for (String k : keywords) {
-            if (low.contains(k)) return true;
-        }
-        return false;
-    }
-
-    /** 分隔线（用户规格：同框标题行一样不归入任何段落）：整行由横线/短横类字符组成，
-     * 如英/葡「----------------------------------------」、西「━━━━━━━━━━…」 */
-    private static boolean isDividerLine(String trimmed) {
-        if (trimmed.isEmpty()) return false;
-        for (int i = 0; i < trimmed.length(); i++) {
-            char c = trimmed.charAt(i);
-            if (c == '-' || c == '—' || c == '–' || c == '─' || c == '━' || c == '═'
-                    || c == '=' || c == '_' || c == '~' || c == '〜' || c == '·' || c == '*') {
-                continue;
-            }
-            return false;
-        }
-        return true;
-    }
-
-    /** 效果行归一化：去行首项目符号（cdb 描述行常见 ●/◆/- 等前缀，脚本 str 文本不含）与全部空白 */
-    private static String normalizeEffectLine(String s) {
-        String t = s.trim();
-        while (!t.isEmpty() && isBulletChar(t.charAt(0))) {
-            t = t.substring(1).trim();
-        }
-        StringBuilder sb = new StringBuilder(t.length());
-        for (int i = 0; i < t.length(); i++) {
-            char c = t.charAt(i);
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n'
-                    || c == '　' || c == '\u00A0') continue;
-            sb.append(c);
-        }
-        return sb.toString();
-    }
-
-    /** 段落匹配增强：反复剥去行首圆圈序号及其后紧跟的冒号/句点/分号。cdb 惯例 str 不含段首
-     *  ①：前缀而 desc 段首行含，不归一则全等匹配落空退回编号启发；剥后两侧均无序号时仍相等，
-     *  不会把不同序号段误判为同一段（序号差异只剩这一处前缀的卡才会两侧同时命中） */
-    private static String stripCircledPrefix(String s) {
-        String t = s;
-        while (!t.isEmpty() && t.charAt(0) >= '\u2460' && t.charAt(0) <= '\u2473') {
-            t = t.substring(1);
-            if (!t.isEmpty() && (t.charAt(0) == ':' || t.charAt(0) == '：'
-                    || t.charAt(0) == '.' || t.charAt(0) == ';' || t.charAt(0) == '；')) {
-                t = t.substring(1);
-            }
-        }
-        return t;
-    }
-
-    private static boolean isBulletChar(char c) {
-        return c == '●' || c == '○' || c == '◦' || c == '・' || c == '-' || c == '–' || c == '—'
-                || c == '*' || c == '▪' || c == '‣' || c == '•' || c == '◆' || c == '◇' || c == '■';
-    }
-
-    /**
-     * 行首圆圈序号：①~⑳（U+2460~U+2473）映射为效果序位 0~19，非圆圈开头返回 -1。
-     * 现代卡描述以段首圆圈序号标注各效果，该序位即脚本 aux.Stringid(code, n) 的 n，
-     * 亦是 CHINT_DESC_ADD hint 值（code*16+n）的低 4 位，据此定位已发动效果段落。
-     */
-    private static int leadingCircledIndex(String trimmedLine) {
-        if (trimmedLine.isEmpty()) return -1;
-        char c = trimmedLine.charAt(0);
-        return (c >= '\u2460' && c <= '\u2473') ? c - '\u2460' : -1;
-    }
+    // 分段行分类辅助（分隔线 / 项目符 / 行首圆圈序号）已迁入 EffectParagraphs，
+    // 供卡详标记与持续适用效果提示同源复用。
 
     /**
      * 将描述中「」与 "" 之间的文本渲染为高亮可点击文字（对齐 CardDetail.setHighlightTextWithClickableSpans）：
@@ -1084,6 +1070,27 @@ class CardInfoBinder {
         // 条目点击刷新左侧详情面板（this::showCard），弹窗保持打开以便继续链式点关键词
         keywordDialog = new KeywordCardListDialog(context, imageLoader, anchor, cards, keyword, this::showCard);
         keywordDialog.show();
+    }
+
+    /**
+     * 停用聊天后决斗内检索的展示入口（聊天输入框转作关键词检索框，输入法点发送触达）：
+     * 切词与命中规则与卡组编辑同源（空格分词、{@code @+}字段、{@code -} 排除、卡名/描述/卡码
+     * 包含），结果用既有关键词卡片列表弹窗显示，标题为整串查询词，条目点击仍刷新左侧卡详。
+     */
+    void showKeywordSearchResult(String keywords) {
+        final String query = keywords == null ? "" : keywords.trim();
+        if (query.isEmpty() || context == null) return;
+        // 全卡表扫描放后台线程（与卡组编辑检索一致），回主线程时按当时的 anchor 建弹窗，
+        // 避免旋转重建后拿着旧视图的 window token 弹窗
+        executorService.execute(() -> {
+            List<Card> cards = CardSearcherManager.searchCardsByKeywords(query);
+            mainHandler.post(() -> {
+                if (context == null || anchor == null) return;
+                if (keywordDialog != null) keywordDialog.dismiss();
+                keywordDialog = new KeywordCardListDialog(context, imageLoader, anchor, cards, query, this::showCard);
+                keywordDialog.show();
+            });
+        });
     }
 
     /** 关闭关键词卡片列表弹窗（切换/隐藏卡详时调用，避免残留遮挡） */
@@ -1204,9 +1211,22 @@ class CardInfoBinder {
     // 引用文本解析状态（对齐 CardDetail.QuoteType）
     private enum QuoteType {NONE, DOUBLE_QUOTE, ANGLE_QUOTE}
 
-    private Bitmap getCoverBitmap() {
+    private Bitmap getCoverBitmap(boolean opponent) {
+        // 对齐 TextureLoader.getCardCover(opponent)：tCover[0]=cover.jpg、tCover[1]=cover2.jpg，
+        // 对方皮肤缺失时回退我方卡背（与桌面版 ImageManager 加载失败时的同构兼容）
+        String skin = AppsSettings.get().getCoreSkinPath();
+        if (opponent) {
+            if (coverBitmapOpp == null || coverBitmapOpp.isRecycled()) {
+                File oppFile = new File(skin, "cover2.jpg");
+                if (!oppFile.exists()) oppFile = new File(skin, "cover.jpg");
+                if (oppFile.exists()) {
+                    coverBitmapOpp = BitmapFactory.decodeFile(oppFile.getAbsolutePath());
+                }
+            }
+            return coverBitmapOpp;
+        }
         if (coverBitmap == null || coverBitmap.isRecycled()) {
-            File coverFile = new File(AppsSettings.get().getCoreSkinPath(), "cover.jpg");
+            File coverFile = new File(skin, "cover.jpg");
             if (coverFile.exists()) {
                 coverBitmap = BitmapFactory.decodeFile(coverFile.getAbsolutePath());
             }

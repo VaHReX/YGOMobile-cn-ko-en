@@ -46,19 +46,18 @@
         please click Settings - permissions - open the required permissions.</string>
     <string name="fetch_ex_card">Fetching pre-cards via web</string>
     <string name="ex_card_list_title">Card List</string>
-    <string name="ex_card_log_title">update log</string>
-    <string name="ex_card_report_title">Reoprt</string>
     <string name="ex_card_check_toast_message">before join in this server, please "used Expansions" in settings first</string>
     <string name="ex_card_check_toast_message_ii">before join in this server, please download expansions first</string>
-    <string name="ex_card_check_toast_message_iii">obtain expansion cards failed, opening 233 website to download now.</string>
+    <string name="ex_card_check_toast_message_iii">obtain expansion cards failed, please try again later.</string>
     <!-- settings -->
     <string name="settings_about">About</string>
     <string name="settings_about_sub_about">About</string>
     <string name="settings_game_enable_sound_effect">Enable sound effect</string>
     <string name="settings_game_screen_orientation">Lock screen in duel</string>
+    <string name="settings_game_portrait_orientation">Lock screen in portrait</string>
     <string name="settings_game_font_antialias">Font antialias</string>
     <string name="settings_game_lab_pendulum_scale">Pendulum Scale Images</string>
-    <string name="settings_native_game_mode">Native UI Game Mode</string>
+    <string name="settings_native_game_mode">Lab: New Game UI</string>
     <string name="settings_native_game_mode_summary">More features than the original version</string>
     <string name="settings_game_font_antialias_summary">Disable this option can increase the frame rate</string>
     <string name="settings_about_author_pref">Author</string>
@@ -165,8 +164,13 @@
     <string name="card_result">Cards List</string>
     <string name="unsort">Unsort</string>
     <string name="sort">Sort</string>
-    <string name="loading">loading..."</string>
-    <string name="loading_failed">loading failed"</string>
+    <string name="loading">loading...</string>
+    <string name="loading_failed">loading failed</string>
+    <string name="script_loading_progress">Loading card scripts (%1$s) %2$d%%</string>
+    <string name="script_loading_stage_script">script archive</string>
+    <string name="script_loading_stage_cdb">card database</string>
+    <string name="script_loading_stage_engine">card data &amp; scripts</string>
+    <string name="script_loading_failed">Card scripts failed to load. Exit and retry.</string>
     <string name="question">Question</string>
     <string name="question_delete_deck">delete this deck?</string>
     <string name="noname">noname</string>
@@ -182,6 +186,9 @@
     <string name="tip_drag_side_full" formatted="false">Side deck is full (max %d)</string>
     <string name="tip_drag_extra_in_main">Extra deck cards can not be placed in the main deck</string>
     <string name="tip_drag_normal_in_extra">Normal cards can not be placed in the extra deck</string>
+    <string name="batch_delete_done" formatted="false">%d cards deleted</string>
+    <string name="batch_delete_none">No cards are checked</string>
+    <string name="batch_mode_exit">Batch</string>
     <string name="file_exist">file is exist</string>
     <string name="share_deck">Share Deck</string>
     <string name="no_share_app">no find share app</string>
@@ -195,7 +202,12 @@
     <string name="refresh">Refresh</string>
     <string name="select_deck">Click here to select Deck</string>
     <string name="solo_mode">Solo Mode</string>
+    <string name="bot_p2_deck_label">P2 Deck:</string>
+    <string name="bot_tag_max_select">TAG mode allows up to 3 AI opponents. Tap a selected item to cancel it before swapping.</string>
+    <string name="bot_favorite_added">Favorited %1$s, moved to the top of the list</string>
+    <string name="bot_favorite_removed">Removed %1$s from favorites, returned to its original position</string>
     <string name="quit_deck_tip">Deck has not been saved yet, quit App?</string>
+    <string name="deck_discard_switch_tip">This will discard the changes to the current deck, continue?</string>
     <string name="deck_delete_text">Drag here to delete</string>
     <string name="question_keep_cur_deck">keep current cards?</string>
     <string name="check_choose_file" formatted="false">Determine the choose %s \?</string>
@@ -263,9 +275,6 @@
     <string name="Join_QQ">QQ Group</string>
     <string name="about_Join_QQ">join QQ group to report problems</string>
     <string name="donatefor">your donation will be used for keeping severs updating, buying card to get artworks and purchasing new phone to adapt</string>
-    <string name="coverSelect">click covers and select files</string>
-    <string name="bgSelect">click background and select files</string>
-    <string name="avatarSelect">click avatar and select files</string>
     <string name="ClickLinkArrows">click link arrows</string>
     <string name="Already_Lastest">No new version available. Check the author\'s feed?</string>
     <string name="tip_no_permission" formatted="false">the permission %s is denied.</string>
@@ -281,6 +290,23 @@
     <string name="Download_Precard_Failed">Download pre-cards failed</string>
     <string name="Pre_Server_Name">Mycard Super-pre Server</string>
     <string name="Ask_to_Change_Other_Way">trying other way...</string>
+    <string name="superpre_inc_checking">Checking</string>
+    <string name="superpre_inc_comparing">Scanning</string>
+    <string name="superpre_inc_requesting">Fetching</string>
+    <string name="superpre_inc_downloading">%1$d%%</string>
+    <string name="superpre_inc_retry_network">Offline</string>
+    <string name="superpre_inc_retry_server">Srv busy</string>
+    <string name="superpre_inc_merging">Merging</string>
+    <string name="superpre_inc_start">Incremental update: downloading %1$d files (%2$s)</string>
+    <string name="superpre_inc_fallback">Incremental update is unavailable (server or data problem). Download the full package instead?</string>
+    <string name="superpre_inc_network_failed">Network failure. The %1$s downloaded so far is kept; tap Download again when the network is back</string>
+    <string name="superpre_inc_network_failed_nothing_kept">Network failure. Tap Download again when the network is back</string>
+    <string name="superpre_inc_try_later">A new pre-release version is being published. Please try again in a few minutes</string>
+    <string name="superpre_inc_long_press_tip">Long-press the download button to choose a full download.</string>
+    <string name="superpre_inc_choose_title">Choose how to download</string>
+    <string name="superpre_inc_choose_message">Incremental: download the files that changed.\nFull download: the whole pre-release package again, the original way.</string>
+    <string name="superpre_inc_choose_incremental">Incremental</string>
+    <string name="superpre_inc_choose_full">Full download</string>
     <string name="DuelAssistant">DuelAssiatant is On</string>
     <string name="masterrule">Master Rule</string>
     <string name="tutorial">Soft Tutorial</string>
@@ -299,6 +325,7 @@
     <string name="searchresult">Results</string>
     <string name="Pre_share">Prepare to Share</string>
     <string name="category_pack">Pack</string>
+    <string name="label_release_date">Release Date</string>
     <string name="category_windbot_deck">AI Decks</string>
     <string name="category_Uncategorized">Uncategorized</string>
 
@@ -310,6 +337,13 @@
     <string name="done">done\！</string>
     <string name="donot_edit_Deck">Do not change decks of this category</string>
     <string name="code_share">Code Share</string>
+    <string name="ask_idle_cmd_label">Ask before summon, set and Pendulum activation</string>
+    <string name="ask_cmd_summon_confirm" formatted="false">Summon [%s]?</string>
+    <string name="ask_cmd_set_confirm" formatted="false">Set [%s] face-down?</string>
+    <string name="ask_cmd_pendulum_confirm" formatted="false">Activate [%s] in the Pendulum Zone?</string>
+    <string name="settings_pendulum_activate_btn">Separate Pendulum Scale activation button</string>
+    <string name="cmd_pendulum_activate">Activate in Pendulum Zone</string>
+    <string name="cmd_activate_monster_effect">Activate Monster Effect</string>
     <string name="screenshoot">Share Art</string>
     <string name="ydk_share">File share</string>
     <string name="unable_to_edit_empty_deck">unable to edit empty deck</string>
@@ -350,7 +384,7 @@
     <string name="guide_search_result_count">here shows search result count</string>
     <string name="guide_button_search_result">click to see search result\n also here will shows favorite cards</string>
     <string name="guide_view_deck_manager">click to change Decks\n you can manage deck categories here</string>
-    <string name="guide_view_move_card">press a card to move it to other place\nlong-press this card to delete it</string>
+    <string name="guide_view_move_card">press a card to move it to other place\nlong-press a card to enter batch mode: move or delete as a group</string>
     <string name="guide_view_banner">Mycard News, you can click to see\only in Chinese now, Sorry</string>
     <string name="title_delete_ex">delete expansions</string>
     <string name="about_delete_ex">if you need to delete all expansion cards</string>
@@ -540,9 +574,100 @@
     <string name="resource_lflist">• Forbidden/Limited List</string>
     <string name="resource_strings">• String Configuration</string>
     <string name="resource_pics">• Card Images Pack</string>
+    <string name="resource_scripts">• Script Pack</string>
+
+    <string name="theme_apply_title">主题安装请求</string>
+    <string name="theme_apply_zip_message">%s 请求安装主题包：%s</string>
+    <string name="theme_apply_files_message">%s 请求更新以下主题资源：\n%s</string>
+    <string name="theme_applying">正在安装主题资源</string>
+    <string name="theme_unknown">未知主题</string>
+
+    <!--textures 素材文件名 -> 展示名映射-->
+    <string name="textures_act">可操作标识</string>
+    <string name="textures_attack">可攻击标识</string>
+    <string name="textures_bg_deck">卡组背景</string>
+    <string name="textures_bg_menu">菜单背景</string>
+    <string name="textures_bg">决斗背景</string>
+    <string name="textures_cardtype">卡片类型</string>
+    <string name="textures_chain">连锁标识</string>
+    <string name="textures_chaintarget">连锁目标标识</string>
+    <string name="textures_cover">自己卡背</string>
+    <string name="textures_cover2">对方卡背</string>
+    <string name="textures_equip">装备标识</string>
+    <string name="textures_f1">猜拳剪刀</string>
+    <string name="textures_f2">猜拳石头</string>
+    <string name="textures_f3">猜拳布</string>
+    <string name="textures_field_transparent2">大师规则2场地（无格子）</string>
+    <string name="textures_field_transparent3">新大师规则场地（无格子）</string>
+    <string name="textures_field2">大师规则2场地</string>
+    <string name="textures_field3">新大师规则场地</string>
+    <string name="textures_icon_lim">禁限图标</string>
+    <string name="textures_link_marker">连接标记 %d</string>
+    <string name="textures_lp3">生命值填充</string>
+    <string name="textures_lpbarf">生命值边框</string>
+    <string name="textures_mask">展示标识</string>
+    <string name="textures_me">我方头像</string>
+    <string name="textures_negated">无效标识</string>
+    <string name="textures_number">连锁数字</string>
+    <string name="textures_opponent">对方头像</string>
+    <string name="textures_ot">归属标识</string>
+    <string name="textures_selfield">场地格子选中</string>
+    <string name="textures_target">效果关联标识</string>
+    <string name="textures_tiktok">计时器</string>
+    <string name="textures_totalatk">总攻击力</string>
+    <string name="textures_unknown">未知卡图</string>
+    <string name="textures_emoticons">表情</string>
+    <string name="textures_gsc">gsc</string>
+    <string name="textures_lscale">左刻度 %d</string>
+    <string name="textures_rscale">右刻度 %d</string>
+    <string name="textures_sbutton_c">按钮C</string>
+    <string name="textures_sbutton_c_pressed">按钮C(按下)</string>
+    <string name="textures_sbutton_l">按钮L</string>
+    <string name="textures_sbutton_l_pressed">按钮L(按下)</string>
+    <string name="textures_sbutton_s">按钮S</string>
+    <string name="textures_sbutton_s_pressed">按钮S(按下)</string>
+    <string name="textures_sdialog_l">对话框背景(大)</string>
+    <string name="textures_sdialog_s">对话框背景(小)</string>
+    <string name="textures_swindow">窗口背景</string>
+    <string name="textures_swindow_v">窗口背景(竖)</string>
+    <string name="textures_stitlebar">标题栏</string>
+    <string name="textures_tclose">关闭按钮</string>
+    <string name="textures_tdoublex">倍速按钮</string>
+    <string name="textures_temoticon">表情按钮</string>
+    <string name="textures_tlogs">操作记录按钮</string>
+    <string name="textures_tmute">静音按钮</string>
+    <string name="textures_tonex">正常速度按钮</string>
+    <string name="textures_tplay">出音按钮</string>
+    <string name="textures_tsettings">设置按钮</string>
+    <string name="textures_tshut">输入框已关闭</string>
+    <string name="textures_ttalk">输入框已展开</string>
 
     <!-- System Strings for UI Localization (index 1740+) -->
     <string name="spectator_skip_to_current">to Current</string>
     <string name="refresh_lan_button">Refresh LAN</string>
     <string name="mode_single_duel_solo">Solo Mode</string>
+
+    <!-- 持续适用中效果提示（头像角金色感叹号徽标与其下拉列表） -->
+    <string name="applying_effects_title">Applying effects</string>
+    <string name="applying_effects_self">My applying effects</string>
+    <string name="applying_effects_opponent">Opponent\'s applying effects</string>
+    <string name="applying_effect_scope_turn">This turn</string>
+    <string name="applying_effect_scope_duel">Whole duel</string>
+    <!-- /ai 人机召唤 UI -->
+    <string name="btn_ai_summon">/ai (Call Bot)</string>
+    <string name="ai_deck_select_title">AI Decks for %1$s</string>
+    <string name="ai_deck_random">Random - Unspecified</string>
+    <string name="ai_deck_empty">No AI decks match the current banlist</string>
+    <string name="cancel">Cancel</string>
+    <string name="sort_rule_time">Time↓</string>
+    <!-- 搜索结果分段说明 -->
+    <string name="section_title_star">Lv%1$d</string>
+    <string name="section_title_link">LINK-%1$d</string>
+    <string name="section_title_spell">Spell</string>
+    <string name="section_title_trap">Trap</string>
+    <string name="section_title_other">Other</string>
+    <string name="section_title_digits">0-9</string>
+    <string name="section_title_year">%1$d</string>
+    <string name="section_title_unknown">Unknown</string>
+    <string name="section_title_with_count">%1$s · %2$d cards</string>
 </resources>

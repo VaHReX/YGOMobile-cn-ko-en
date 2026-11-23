@@ -60,7 +60,9 @@ final class DuelZoneRefresh {
             DuelAnalyzer.zeroRange(blocks, seg[0], seg[1] - 4);
         }
         byte[] masked = updateDataPayload(player, location, blocks, len);
-        analyzer.broadcaster.sendDualViewAndRecord(player, full, masked);
+        // Mzone/Szone 属队级公开信息：真 TAG 下本队两席位都收全量
+        //（对齐 tag_duel.cpp RefreshMzone/RefreshSzone 的 players[pid] 与 players[pid+1]）。
+        analyzer.broadcaster.sendTeamPairViewAndRecord(player, full, masked);
     }
 
     void refreshHand(int player) {
@@ -105,7 +107,8 @@ final class DuelZoneRefresh {
 
     void refreshExtra(int player, int flag, int useCache) {
         byte[] blocks = OcgDuelEngine.queryFieldCard(analyzer.pduel(), player, OcgDuelEngine.LOCATION_EXTRA, flag, useCache);
-        analyzer.sendToPlayer(analyzer.room.players[player],
+        // 额外卡组只给该队当前行动席位（对齐 tag_duel.cpp RefreshExtra L1703-1708）
+        analyzer.sendToPlayer(analyzer.room.duelPlayer(player),
                 updateDataPayload(player, OcgDuelEngine.LOCATION_EXTRA, blocks, blocks.length));
     }
 
@@ -123,6 +126,22 @@ final class DuelZoneRefresh {
         refreshMaskedZone(player, OcgDuelEngine.LOCATION_EXTRA, flag, useCache);
     }
 
+    /**
+     * 撤回重同步专用的除外区刷新：与 {@link #refreshExtraResync} 同法走
+     * {@link DuelViewBroadcaster#sendDualViewAndRecord} 双视角发送（本人全量、对手与观战收遮蔽版，
+     * 里侧除外段整块清零），遮蔽判据 {@link EngineMessage#shouldHideFacedownCode} 与
+     * {@link #refreshSingle} 对非场上区的口径一致。
+     * <p>必须有这一步：{@code query_field_info} 的 reload 载荷对五个堆叠区只写张数、不写姿态也不写卡码，
+     * 客户端重建出的除外占位卡因此既无卡码也无表侧姿态；而 ocgcore 从不为除外区发区域刷新消息
+     *（实况里卡片只靠进出除外区的 MSG_MOVE 逐张携带卡码与姿态），其余四区在重同步批里都有对应的
+     * refresh，唯独本区漏掉——于是撤回后我方表侧除外的卡一律退回卡背且点不出详情（用户反馈的
+     *「人机/单人局我方表侧除外显示成卡背」）。表侧除外是双方可见的公开信息，本包让双方都拿到
+     * 卡码与姿态，卡片随之恢复正面并可点开卡详。
+     */
+    void refreshRemovedResync(int player, int flag, int useCache) {
+        refreshMaskedZone(player, OcgDuelEngine.LOCATION_REMOVED, flag, useCache);
+    }
+
     void refreshSingle(int player, int location, int sequence) {
         refreshSingle(player, location, sequence, DuelAnalyzer.REFRESH_SINGLE_FLAG);
     }
@@ -131,7 +150,11 @@ final class DuelZoneRefresh {
         byte[] blocks = OcgDuelEngine.queryCard(analyzer.pduel(), player, location, sequence, flag, 0);
         int len = blocks.length;
         if (len <= EngineMessage.LEN_HEADER) {
-            analyzer.sendToPlayer(analyzer.room.players[player], updateCardPayload(player, location, sequence, blocks, len));
+            // 空查询：只给所属队的席位（真 TAG 两席），不发另一队与观战（对齐 tag_duel.cpp RefreshSingle L1719-1723）
+            byte[] payload = updateCardPayload(player, location, sequence, blocks, len);
+            for (ServerConnection c : analyzer.room.teamSeats(player)) {
+                analyzer.sendToPlayer(c, payload);
+            }
             return;
         }
         int position = EngineMessage.getPosition(blocks, 12);
@@ -153,7 +176,8 @@ final class DuelZoneRefresh {
             sendLen = 16;
         }
         byte[] masked = updateCardPayload(player, location, sequence, blocks, sendLen);
-        analyzer.broadcaster.sendDualViewAndRecord(player, full, masked);
+        // 场上/非场上单卡刷新同样属队级公开：本队两席位收全量（对齐 tag_duel.cpp L1730-1743）
+        analyzer.broadcaster.sendTeamPairViewAndRecord(player, full, masked);
     }
 
     static byte[] updateDataPayload(int player, int location, byte[] blocks, int len) {

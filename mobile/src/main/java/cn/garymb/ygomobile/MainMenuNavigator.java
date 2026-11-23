@@ -173,8 +173,11 @@ class MainMenuNavigator implements
     }
 
     @Override
-    public void onPlayerWaitingDeckUpdate(List<Integer> main, List<Integer> extra, List<Integer> side) {
+    public void onPlayerWaitingDeckUpdate(int seat, List<Integer> main, List<Integer> extra, List<Integer> side) {
         if (activity.engine != null) {
+            // 登记该席位“当前对局卡组”：solo 按 0..required-1 席位顺序，非 solo 恒为我方 0。
+            // match 换 side 时编辑器据此载入，避免第 2/3 局之间从磁盘 ydk 读到原始卡组
+            activity.engine.updateMatchDeck(seat, main, extra, side);
             activity.engine.sendDeckUpdate(main, extra, side);
         }
     }
@@ -219,6 +222,13 @@ class MainMenuNavigator implements
         if (seat < 0 || seat >= activity.engine.soloSeatDeckNames.length) return;
         activity.engine.soloSeatDeckNames[seat] = deckName == null ? "" : deckName;
         activity.engine.soloSeatDeckPaths[seat] = deckPath == null ? "" : deckPath;
+    }
+
+    @Override
+    public void onAiSummonRequested(String deckName) {
+        // “/ai”选出人机卡组：以聊天消息告知主机端拉起该人机；卡组名为空表示“随机-不指定”，发送纯 /ai
+        if (activity.engine == null) return;
+        activity.engine.sendChat(deckName == null || deckName.isEmpty() ? "/ai" : "/ai " + deckName);
     }
 
     // === 建主 / 玩家等待对话框显示入口 ===

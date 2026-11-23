@@ -44,6 +44,12 @@ public interface Constants {
     boolean PREF_DEF_START_SERVICEDUELASSISTANT = false;
     String PREF_LOCK_SCREEN = "pref_key_game_screen_orientation";
     boolean PREF_DEF_LOCK_SCREEN = false;
+    /**
+     * 游戏竖屏锁定：开启时游戏锁定竖屏（SENSOR_PORTRAIT）。与 {@link #PREF_LOCK_SCREEN}
+     * 互斥，由设置弹窗保证两者不会同时开启
+     */
+    String PREF_LOCK_PORTRAIT = "pref_key_game_portrait_orientation";
+    boolean PREF_DEF_LOCK_PORTRAIT = false;
     String PREF_IMMERSIVE_MODE = "pref_key_immersive_mode";
     boolean PREF_DEF_IMMERSIVE_MODE = false;
     String PREF_SENSOR_REFRESH = "pref_key_sensor_refresh";
@@ -66,6 +72,15 @@ public interface Constants {
      */
     String PREF_DECK_DELETE_DILAOG = "pref_key_deck_delete_dialog";
     boolean PREF_DEF_DECK_DELETE_DILAOG = false;
+
+    /***
+     * 搜索结果列的展现模式（0=列表，1=宫格），按用户规格三页各存各的开关：
+     * 决斗内卡组编辑器、卡查页、卡组编辑页互不影响，缺省 0 走原来的行列表
+     */
+    String PREF_DECK_EDITOR_RESULT_GRID = "pref_key_deck_editor_result_grid";
+    String PREF_CARD_SEARCH_RESULT_GRID = "pref_key_card_search_result_grid";
+    String PREF_DECK_MANAGE_RESULT_GRID = "pref_key_deck_manage_result_grid";
+    int PREF_DEF_RESULT_GRID = 0;
 
     String SETTINGS_COVER = "settings_game_diy_card_cover";
     String SETTINGS_AVATAR = "settings_game_avatar";
@@ -102,6 +117,12 @@ public interface Constants {
     String CORE_BG_PATH = CORE_SKIN_PATH + "/extra/bgs";
     String CORE_DECK_PATH = "deck";
     String CORE_PACK_PATH = "pack";
+    /**
+     * 卡包发售日期总表（来自 ygopro-card-list 的 pack.db.sql）的 asset 文件名，实际 asset 路径为
+     * {@link #ASSETS_PATH} + 本名。每行 {@code INSERT INTO pack VALUES(卡密,'包号','包名','稀有度','yyyy-MM-dd');}
+     * 提供每张卡的最初发售日期，比 pack 目录下 {@code xxxx-misc.ydk} 只知年份更精确。
+     */
+    String CORE_PACK_RELEASE_SQL = "pack.db.sql";
     String CORE_EXPANSIONS = "expansions";
     String CORE_SINGLE_PATH = "single";
     String CORE_IMAGE_PATH = "pics";
@@ -111,10 +132,9 @@ public interface Constants {
     String CORE_IMAGE_FIELD_PATH = "field";
     String CORE_SCRIPT_PATH = "script";
     /**
-     * 扩展卡包物化 cdb 目录名（位于 expansions/ 下）：薄 JNI 引擎只认实体文件，
-     * 卡包 zip/ypk 内的 *.cdb 由 NativeScriptBootstrap 解到 <root>/expansions/cdb/，
-     * 再按优先级纳入引擎卡数据库列表（对齐 C++ game.cpp LoadExpansions 读取
-     * 档案内 cdb 的语义；同名卡扩展覆盖主库）
+     * 旧版“卡包物化 cdb”落地目录名（位于 expansions/ 下）：包内 *.cdb 现由两套 C++
+     * 直接从 zip/ypk 档案里读（gframe LoadDB + sqlite3_deserialize；薄 JNI 引擎同构），
+     * 本目录不再生产，只用于 NativeScriptBootstrap 首次升级时回收历史残留
      */
     String CORE_PACK_CDB_DIR = "cdb";
     String CORE_REPLAY_PATH = "replay";
@@ -165,6 +185,12 @@ public interface Constants {
     String PREF_WINDOW_TOP_BOTTOM = "pref_settings_window_top_bottom";
     int DEF_PREF_WINDOW_TOP_BOTTOM = 0;
 
+    /*** 资源检查的并行路数（上限见 ResCheckTask.RES_CHECK_MAX_THREADS，共 9 个并行单元）：
+     * 存储快的机器可多路重叠 IO，老机/eMMC 上多路可能反而抢带宽，故留成可调参数
+     */
+    String PREF_RES_CHECK_THREADS = "pref_settings_res_check_threads";
+    int DEF_PREF_RES_CHECK_THREADS = 4;
+
     int REQUEST_CUT_IMG = 0x1000 + 0x10;
     int REQUEST_CHOOSE_FILE = 0x1000 + 0x20;
     int REQUEST_CHOOSE_IMG = 0x1000 + 0x21;
@@ -201,23 +227,24 @@ public interface Constants {
     int DECK_SIDE_MAX = 15;
     int DECK_EXTRA_COUNT = (DECK_SIDE_MAX / DECK_WIDTH_COUNT * DECK_WIDTH_COUNT < DECK_SIDE_MAX) ? DECK_WIDTH_COUNT * 2 : DECK_WIDTH_COUNT;
     int DECK_SIDE_COUNT = DECK_EXTRA_COUNT;
+    /** 卡组管理页搜索结果宫格的固定列数 */
+    int DECK_MANAGE_RESULT_GRID_SPAN = 5;
     String URL_HELP = "https://ygom.top/tutorial.html";
     String URL_DONATE = "https://ifdian.net/a/ygomobile";
     String URL_MASTER_RULE_CN = "https://ocg-rule.readthedocs.io/";
     String WIKI_SEARCH_URL = "https://ygocdb.com/card/";
     String URL_HOME_VERSION = "https://ygom.top/ver_code.json";
-    String URL_HOME_VERSION_ALT = "https://cdn02.moecube.com:444/ygom-site/ver_code.txt";
     String URL_BILIBILI_DYNAMIC = "https://m.bilibili.com/space/16033444/";
-    String ID1 = "[versionname]";
-    String ID2 = "[download_link]";
-    String ID3 = "#pre_release_code";
+    String URL_HOME_VERSION_ALT = "https://cdn02.moecube.com:444/ygom-site/ver_code.txt";
+    String URL_CARD_IMAGE_DOWNLOAD_LINK = "https://cdn02.moecube.com:444/ygomobile-images/";
     String URL_GENESYS_LFLIST_DOWNLOAD_LINK = "https://cdntx.moecube.com/ygopro-genesys/lflist.conf";
-    String URL_YGO233_ADVANCE = "";//"https://ygo233.com/pre#pre_release_cards";//关闭233先行卡服务器，但不要删除该字段，许多未调用的遗留代码使用该contant
     String URL_CN_DATAVER = "https://cdn02.moecube.com:444/ygopro-super-pre/data/version.txt";
     String URL_PRE_CARD = "https://cdn02.moecube.com:444/ygopro-super-pre/data/test-release.json";
     String URL_SUPERPRE_CN_FILE = "https://cdn02.moecube.com:444/ygopro-super-pre/archive/ygopro-super-pre.ypk";
-    String URL_SUPERPRE_CN_FILE_ALT = "https://cdn02.moecube.com:444/ygopro-super-pre/archive/ygopro-super-pre.ypk";
-    String URL_YGO233_BUG_REPORT = "https://ygo233.com/pre#faq";
+    //内容为当前版本带版本号的完整包地址（如 ygopro-super-pre-29.33.ypk），增量更新从中取版本号
+    String URL_SUPERPRE_LATEST_TAG = "https://cdn02.moecube.com:444/ygopro-super-pre/data/latest-tag.txt";
+    //MyCard 发布接口，与 MyCard 客户端相同：checksums/<app>/<版本>、update/<app>/<版本>
+    String URL_MYCARD_RELEASE_API = "https://sapi.moecube.com:444/release/update/";
     int PORT_Mycard_Super_Pre_Server = 888;
     String URL_Mycard_Super_Pre_Server = "mygo.superpre.pro";
     String URL_Mycard_Super_Pre_Server_2 = "mygo2.superpre.pro";
@@ -260,7 +287,7 @@ public interface Constants {
      */
     String ACTION_OPEN_GAME = "ygomobile.intent.action.GAME";
     /***
-     * 用于应用间分享ygo资源（cdb、lflist、strings、pics）
+     * 用于应用间分享ygo资源（cdb、lflist、strings、pics、scripts）
      * <p>
      * Intent intent = new Intent("ygomobile.intent.action.SHARE_RESOURCE");
      * intent.putExtra("resources", new int[]{Constants.RESOURCE_CDB, Constants.RESOURCE_PICS});
@@ -271,6 +298,10 @@ public interface Constants {
      * ARG_RESOURCE_URIS - Bundle, 包含各资源文件对应的Uri
      * ARG_VERSION_CODE - int, 分享方应用版本号
      * ARG_PACKAGE_NAME - String, 分享方包名
+     * <p>
+     * 当前支持的资源类型最大值可通过 application meta-data 查询：
+     * ApplicationInfo info = getPackageManager().getApplicationInfo("cn.garymb.ygomobile", PackageManager.GET_META_DATA);
+     * int maxType = info.metaData.getInt("ygomobile.intent.MAX_RESOURCE_TYPE");
      */
     String ACTION_SHARE_RESOURCE = "ygomobile.intent.action.SHARE_RESOURCE";
     String ARG_RESOURCES = "resources";
@@ -283,6 +314,7 @@ public interface Constants {
     int RESOURCE_LFLIST = 1;
     int RESOURCE_STRINGS = 2;
     int RESOURCE_PICS = 3;
+    int RESOURCE_SCRIPTS = 4;
 
     /***
      * 用于从其他应用接收并保存卡组文件
@@ -296,6 +328,43 @@ public interface Constants {
      */
     String ACTION_SAVE_DECK = "ygomobile.intent.action.SAVE_DECK";
     String ARG_DECK_NAME = "deck_name";
+
+    /***
+     * 从其他应用接收并安装主题资源（textures目录下的素材），安装形式通过 {@link #ARG_THEME_TYPE} 区分：
+     * <p>
+     * 1. 主题包(zip，{@link #THEME_TYPE_ZIP})：ClipData 中传入一个 zip 的 Uri，
+     *    zip 最外层目录为 textures，解压后直接覆盖资源目录下 textures 内的同名文件。
+     *    <br/>{@code intent.putExtra(Constants.ARG_THEME_NAME, "主题名");  // 可选，缺省"未知主题"}
+     * <p>
+     * 2. 多文件({@link #THEME_TYPE_FILES})：ClipData 中按顺序传入多个文件 Uri，
+     *    并通过 String[] 传每个文件在 textures 内的相对路径(含文件名)，如 "bg.jpg" 或 "/extra/tsettings.png"，
+     *    前导 "/" 有无均可，空目录即 textures 根目录。
+     *    <br/>{@code intent.putExtra(Constants.ARG_THEME_FILE_PATHS, new String[]{"bg.jpg", "/extra/tsettings.png"});}
+     */
+    String ACTION_SAVE_THEME = "ygomobile.intent.action.SAVE_THEME";
+    /**
+     * 主题包名字，仅安装zip时使用
+     */
+    String ARG_THEME_NAME = "theme_name";
+    /**
+     * 主题安装类型
+     */
+    String ARG_THEME_TYPE = "theme_type";
+    /**
+     * zip主题包，最外层目录为textures
+     */
+    int THEME_TYPE_ZIP = 0;
+    /**
+     * textures文件夹里面的具体文件
+     */
+    int THEME_TYPE_FILES = 1;
+    /**
+     * 主题文件相对路径列表
+     * 多文件模式下，每个元素是 textures 内的相对路径(含文件名)，如 "bg.jpg" 或 "/extra/tsettings.png"
+     */
+    String ARG_THEME_FILE_PATH_LIST = "theme_file_path_list";
+    String DEFAULT_THEME_NAME = "未知主题";
+
     String ACTION_RELOAD = "ygomobile.intent.action.RELOAD";
     String IMAGE_URL = "https://github.com/fallenstardust/YGOMobile-pics/master/pics/%s.jpg";
     String IMAGE_FIELD_URL = "https://github.com/fallenstardust/YGOMobile-pics/master/pics/field/%s.jpg";

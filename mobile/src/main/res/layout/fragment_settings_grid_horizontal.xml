@@ -482,13 +482,27 @@
                         android:orientation="horizontal"
                         android:padding="6dp">
 
-                        <TextView
+                        <LinearLayout
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
                             android:layout_weight="1"
-                            android:text="@string/title_use_ex"
-                            android:textColor="@color/item_title"
-                            android:textSize="12sp" />
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="@string/title_use_ex"
+                                android:textColor="@color/item_title"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="@string/ex_pack"
+                                android:textColor="@color/gray"
+                                android:textSize="9sp" />
+                        </LinearLayout>
 
                         <Switch
                             android:id="@+id/switch_read_ex"
@@ -604,6 +618,13 @@
                         android:layout_height="wrap_content" />
                 </LinearLayout>
 
+                <!-- JNI 设置组：与竖屏布局同名，开启实验室新游戏UI 时由 updateJniSettingsVisibility 整组隐藏 -->
+                <LinearLayout
+                    android:id="@+id/ll_ygopro_jni_settings"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
                 <!-- 原始比例 -->
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -658,6 +679,156 @@
                         app:tint="@color/holo_blue_bright" />
                 </LinearLayout>
 
+                <!-- 游戏图片质量 / 游戏横屏锁定：同一行分左右两半（均属 JNI 设置组，
+                     开启实验室新游戏UI 时整组隐藏；横屏锁定与游戏内竖屏锁定互斥） -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_margin="3dp"
+                    android:background="@drawable/dialogshort"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="6dp">
+
+                    <!-- 左半：游戏图片质量 -->
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_game_card_quality"
+                            android:textColor="@color/item_title"
+                            android:textSize="12sp" />
+
+                        <TextView
+                            android:id="@+id/btn_quality_low"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp"
+                            android:background="@drawable/radius_p"
+                            android:clickable="true"
+                            android:gravity="center"
+                            android:minWidth="48dp"
+                            android:paddingStart="12dp"
+                            android:paddingTop="6dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="6dp"
+                            android:text="@string/quality_low"
+                            android:textColor="@color/white"
+                            android:textSize="12sp" />
+
+                        <TextView
+                            android:id="@+id/btn_quality_high"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp"
+                            android:background="@drawable/radius_p"
+                            android:clickable="true"
+                            android:gravity="center"
+                            android:minWidth="48dp"
+                            android:paddingStart="12dp"
+                            android:paddingTop="6dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="6dp"
+                            android:text="@string/quality_high"
+                            android:textColor="@color/white"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+
+                    <!-- 右半：游戏横屏锁定 -->
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:gravity="center_vertical|end"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_game_screen_orientation"
+                            android:textColor="@color/item_title"
+                            android:textSize="12sp" />
+
+                        <Switch
+                            style="@style/SettingsSwitch"
+                            android:id="@+id/switch_lock_screen"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <!-- 字体抗锯齿 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_margin="3dp"
+                    android:background="@drawable/dialogshort"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="6dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_game_font_antialias"
+                            android:textColor="@color/item_title"
+                            android:textSize="12sp" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="@string/settings_game_font_antialias_summary"
+                            android:textColor="@color/gray"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/switch_font_antialias"
+                        style="@style/SettingsSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <!-- 灵摆数字 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_margin="3dp"
+                    android:background="@drawable/dialogshort"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:padding="6dp">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/settings_game_lab_pendulum_scale"
+                        android:textColor="@color/item_title"
+                        android:textSize="12sp" />
+
+                    <Switch
+                        android:id="@+id/switch_pendulum"
+                        style="@style/SettingsSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+                </LinearLayout>
+
                 <!-- 沉浸式 -->
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -668,13 +839,27 @@
                     android:orientation="horizontal"
                     android:padding="6dp">
 
-                    <TextView
+                    <LinearLayout
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="@string/settings_game_immersive_mode"
-                        android:textColor="@color/item_title"
-                        android:textSize="12sp" />
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/settings_game_immersive_mode"
+                            android:textColor="@color/item_title"
+                            android:textSize="12sp" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="@string/about_immersive_mode"
+                            android:textColor="@color/gray"
+                            android:textSize="9sp" />
+                    </LinearLayout>
 
                     <Switch
                         android:id="@+id/switch_immersive"
@@ -683,7 +868,7 @@
                         android:layout_height="wrap_content" />
                 </LinearLayout>
 
-                <!-- 游戏图片质量：独立一行，高/低两按钮 -->
+                <!-- 原生UI游戏模式开关 -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -693,177 +878,33 @@
                     android:orientation="horizontal"
                     android:padding="6dp">
 
-                    <TextView
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/settings_game_card_quality"
-                        android:textColor="@color/item_title"
-                        android:textSize="12sp" />
-
-                    <TextView
-                        android:id="@+id/btn_quality_low"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginEnd="6dp"
-                        android:background="@drawable/radius_p"
-                        android:clickable="true"
-                        android:gravity="center"
-                        android:minWidth="48dp"
-                        android:paddingStart="14dp"
-                        android:paddingTop="6dp"
-                        android:paddingEnd="14dp"
-                        android:paddingBottom="6dp"
-                        android:text="@string/quality_low"
-                        android:textColor="@color/white"
-                        android:textSize="12sp" />
-
-                    <TextView
-                        android:id="@+id/btn_quality_high"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:background="@drawable/radius_p"
-                        android:clickable="true"
-                        android:gravity="center"
-                        android:minWidth="48dp"
-                        android:paddingStart="14dp"
-                        android:paddingTop="6dp"
-                        android:paddingEnd="14dp"
-                        android:paddingBottom="6dp"
-                        android:text="@string/quality_high"
-                        android:textColor="@color/white"
-                        android:textSize="12sp" />
-                </LinearLayout>
-
-                <!-- 三个开关宫格 -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:baselineAligned="false"
-                    android:orientation="horizontal">
-
                     <LinearLayout
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:layout_margin="3dp"
                         android:layout_weight="1"
-                        android:background="@drawable/dialogshort"
-                        android:gravity="center"
-                        android:orientation="vertical"
-                        android:padding="6dp">
+                        android:orientation="vertical">
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:gravity="center"
-                            android:text="@string/settings_game_screen_orientation"
-                            android:textColor="@color/item_title"
-                            android:textSize="10sp" />
-
-                        <Switch
-                            android:id="@+id/switch_lock_screen"
-                            style="@style/SettingsSwitch"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="4dp" />
-                    </LinearLayout>
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_margin="3dp"
-                        android:layout_weight="1"
-                        android:background="@drawable/dialogshort"
-                        android:gravity="center"
-                        android:orientation="vertical"
-                        android:padding="6dp">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:gravity="center"
-                            android:text="@string/settings_game_font_antialias"
-                            android:textColor="@color/item_title"
-                            android:textSize="10sp" />
-
-                        <Switch
-                            android:id="@+id/switch_font_antialias"
-                            style="@style/SettingsSwitch"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="4dp" />
-                    </LinearLayout>
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_margin="3dp"
-                        android:layout_weight="1"
-                        android:background="@drawable/dialogshort"
-                        android:gravity="center"
-                        android:orientation="vertical"
-                        android:padding="6dp">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:gravity="center"
-                            android:text="@string/settings_game_lab_pendulum_scale"
-                            android:textColor="@color/item_title"
-                            android:textSize="10sp" />
-
-                        <Switch
-                            android:id="@+id/switch_pendulum"
-                            style="@style/SettingsSwitch"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="4dp" />
-                    </LinearLayout>
-                </LinearLayout>
-
-                <!-- 原生UI游戏模式开关 -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:baselineAligned="false"
-                    android:orientation="horizontal">
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_margin="3dp"
-                        android:layout_weight="1"
-                        android:background="@drawable/dialogshort"
-                        android:gravity="center"
-                        android:orientation="vertical"
-                        android:padding="6dp">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:gravity="center"
                             android:text="@string/settings_native_game_mode"
                             android:textColor="@color/item_title"
-                            android:textSize="10sp" />
+                            android:textSize="12sp" />
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:gravity="center"
                             android:text="@string/settings_native_game_mode_summary"
                             android:textColor="@color/gray"
-                            android:textSize="8sp" />
-
-                        <Switch
-                            android:id="@+id/switch_native_game"
-                            style="@style/SettingsSwitch"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="4dp" />
+                            android:textSize="9sp" />
                     </LinearLayout>
+
+                    <Switch
+                        android:id="@+id/switch_native_game"
+                        style="@style/SettingsSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
                 </LinearLayout>
 
                 <!-- OpenGL / 瀑布屏边距 -->
@@ -986,6 +1027,19 @@
                             android:textSize="11sp" />
 
                         <TextView
+                            android:id="@+id/lang_4"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_margin="2dp"
+                            android:layout_weight="1"
+                            android:background="@drawable/radius_p"
+                            android:clickable="true"
+                            android:gravity="center"
+                            android:text="@string/data_language_jp"
+                            android:textColor="@color/white"
+                            android:textSize="11sp" />
+
+                        <TextView
                             android:id="@+id/lang_1"
                             android:layout_width="0dp"
                             android:layout_height="match_parent"
@@ -997,6 +1051,12 @@
                             android:text="@string/data_language_kr"
                             android:textColor="@color/white"
                             android:textSize="11sp" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
 
                         <TextView
                             android:id="@+id/lang_2"
@@ -1010,12 +1070,6 @@
                             android:text="@string/data_language_en"
                             android:textColor="@color/white"
                             android:textSize="11sp" />
-                    </LinearLayout>
-
-                    <LinearLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="horizontal">
 
                         <TextView
                             android:id="@+id/lang_3"
@@ -1027,19 +1081,6 @@
                             android:clickable="true"
                             android:gravity="center"
                             android:text="@string/data_language_es"
-                            android:textColor="@color/white"
-                            android:textSize="11sp" />
-
-                        <TextView
-                            android:id="@+id/lang_4"
-                            android:layout_width="0dp"
-                            android:layout_height="match_parent"
-                            android:layout_margin="2dp"
-                            android:layout_weight="1"
-                            android:background="@drawable/radius_p"
-                            android:clickable="true"
-                            android:gravity="center"
-                            android:text="@string/data_language_jp"
                             android:textColor="@color/white"
                             android:textSize="11sp" />
 

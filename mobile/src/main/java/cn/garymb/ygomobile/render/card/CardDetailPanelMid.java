@@ -74,12 +74,9 @@ abstract class CardDetailPanelMid extends CardDetailPanelBase {
             Bitmap bmp = tl.getEmoticonTexture();
             if (bmp != null) btnEmote.setImageBitmap(bmp);
         }
-        if (btnChat != null) {
-            // 对齐 gframe game.cpp L1319：初始图标跟随停用聊天设置（chkDisableChatting），停用显示 tShut、启用显示 tTalk
-            boolean ignored = AppsSettings.get().getIntSettings("chkDisableChatting", 0) == 1;
-            Bitmap bmp = ignored ? tl.getShutTexture() : tl.getTalkTexture();
-            if (bmp != null) btnChat.setImageBitmap(bmp);
-        }
+        // 初始聊天图标同样跟随停用聊天设置（chkDisableChatting，对齐 gframe game.cpp L1319）：
+        // 启用显示 tTalk，停用显示搜索图标（输入框已转卡片关键词检索态）
+        updateChatIcon(AppsSettings.get().getIntSettings("chkDisableChatting", 0) == 1);
     }
 
     public void closeGameButtons() {
@@ -382,10 +379,14 @@ abstract class CardDetailPanelMid extends CardDetailPanelBase {
     }
 
     /**
-     * 统一关闭当前打开的选择/确认/展示对话框（断线或决斗结束时清理），
-     * 避免残留弹窗遮挡重新显示的局域网主界面
+     * 统一关闭当前打开的选择/确认/展示对话框（断线、决斗结束或撤回瞬间清理），
+     * 避免残留弹窗遮挡重新显示的局域网主界面。
+     *
+     * @return 本次是否真的关掉了选卡窗（MSG_SELECT_CARD/解放/合计/弃牌等询问的应答窗）：
+     *         撤回路径据此决定走「按询问快照重建」还是「恢复询问窗旧实例」（用户规格）
      */
-    public void dismissOpenDialogs() {
+    public boolean dismissOpenDialogs() {
+        boolean selectDialogClosed = cardSelectDialog != null && cardSelectDialog.isShowing();
         if (currentDialog != null) currentDialog.dismiss();
         if (cardSelectDialog != null) cardSelectDialog.dismiss();
         if (cardDisplayDialog != null) cardDisplayDialog.dismiss();
@@ -394,6 +395,7 @@ abstract class CardDetailPanelMid extends CardDetailPanelBase {
         cardDisplayDialog = null;
         currentSelectType = -1;
         hideCancelOrFinishButton();
+        return selectDialogClosed;
     }
 
     // === 卡组编辑器模式 ===
